@@ -253,6 +253,64 @@ func TestStartKeepsLeaseAliveWhileJobRuns(t *testing.T) {
 	h.stop(t)
 }
 
+func TestHeartbeatOutlivesCancellationUntilTheDrainFinishes(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	mem := memdriver.New()
+	release := make(chan struct{})
+	started := make(chan struct{})
+	ws := NewWorkers()
+	Register(ws, &funcWorker{fn: func(context.Context, *Job[greetArgs]) error {
+		close(started)
+		<-release
+		return nil
+	}})
+	h := startLoopWith(t, mem, mem, ws, func(cfg *Config) {
+		cfg.LeaseDuration = 60 * time.Millisecond
+		cfg.HeartbeatInterval = 15 * time.Millisecond
+	})
+
+	row, err := h.client.Insert(context.Background(), greetArgs{Name: "slow"})
+	if err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	<-started
+
+	// Shutting down does not kill the in-flight job — the loop drains it.
+	// A heartbeat that stopped here would let the draining job's lease
+	// lapse, and every clean shutdown would hand a duplicate to another
+	// worker: the most routine event in the system's life (AD-018).
+	h.cancel()
+	atCancel, _ := mem.Row(row.ID)
+	leaseAtCancel := *atCancel.LeasedUntil
+
+	waitFor(t, func() bool {
+		current, ok := mem.Row(row.ID)
+		return ok && current.LeasedUntil != nil && current.LeasedUntil.After(leaseAtCancel)
+	}, "the lease to keep being renewed after cancellation")
+
+	// Well past the original lease, still draining, still leased.
+	time.Sleep(100 * time.Millisecond)
+	draining, _ := mem.Row(row.ID)
+	if draining.State != "running" {
+		t.Fatalf("State = %q mid-drain, want running", draining.State)
+	}
+	if draining.LeasedUntil == nil || draining.LeasedUntil.Before(time.Now()) {
+		t.Errorf("LeasedUntil = %v at %v — the lease lapsed while the job was draining",
+			draining.LeasedUntil, time.Now())
+	}
+
+	close(release)
+	select {
+	case err := <-h.done:
+		if err != nil {
+			t.Fatalf("Start returned %v, want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Start did not return after the drained job finished")
+	}
+	waitFor(t, h.rowInState(row.ID, "completed"), "drained job to be finalized")
+}
+
 func TestInflightSetTracksJobsConcurrently(t *testing.T) {
 	t.Parallel()
 	set := newInflightSet()
