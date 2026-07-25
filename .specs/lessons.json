@@ -1,0 +1,27 @@
+{
+  "schema": 1,
+  "promote_threshold": 2,
+  "window_days": 45,
+  "quarantine_threshold": 2,
+  "next_id": 2,
+  "lessons": [
+    {
+      "id": "L-001",
+      "key": "surviving_mutant::interval timing acs need a bounded count or fake clock assertion a lower bound only count passes under a busy loop and discriminates nothing",
+      "text": "Interval/timing ACs need a bounded-count (or fake-clock) assertion; a lower-bound-only count passes under a busy loop and discriminates nothing.",
+      "signal": "surviving_mutant",
+      "scope": "testing/timing",
+      "status": "candidate",
+      "features": [
+        "cycle-a-walking-skeleton"
+      ],
+      "recurrence": 1,
+      "harmful": 0,
+      "evidence": [
+        "loop.go:120 M5 / CORE-03 AC7 (testing/timing)"
+      ],
+      "created": "2026-07-25T14:42:47Z",
+      "last_seen": "2026-07-25T14:42:47Z"
+    }
+  ]
+}
