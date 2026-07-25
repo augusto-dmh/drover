@@ -85,6 +85,35 @@ func TestRescueReturnsAbandonedJobToTheQueue(t *testing.T) {
 	}
 }
 
+func TestRescueSchedulesFromTheConfiguredRetryPolicy(t *testing.T) {
+	t.Parallel()
+	mem := memdriver.New()
+	row := abandon(t, mem, "greet")
+	// A distinctive answer, deliberately not "now": the other rescue tests
+	// use an immediate policy whose answer is indistinguishable from a
+	// rescue that skipped the policy altogether and made the job claimable
+	// straight away. That regression would put a job whose worker keeps
+	// dying into a fetch-speed spin with no backoff at all.
+	want := time.Now().Add(72 * time.Hour).Round(0)
+	c := rescueClient(mem, func(cfg *Config) {
+		cfg.RetryPolicy = atTimePolicy{at: want}
+	})
+
+	if _, err := c.rescueOnce(context.Background()); err != nil {
+		t.Fatalf("rescueOnce: %v", err)
+	}
+
+	stored, _ := mem.Row(row.ID)
+	if stored.State != "retryable" {
+		t.Fatalf("State = %q, want retryable", stored.State)
+	}
+	if !stored.ScheduledAt.Equal(want) {
+		t.Errorf("ScheduledAt = %v, want the retry policy's answer %v — a rescued job "+
+			"must wait out a backoff, not become claimable immediately",
+			stored.ScheduledAt, want)
+	}
+}
+
 func TestRescueKillsAbandonedJobAtItsAttemptCeiling(t *testing.T) {
 	t.Parallel()
 	mem := memdriver.New()
