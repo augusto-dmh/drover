@@ -65,7 +65,7 @@ func (c *Client) runJob(ctx context.Context, row *driver.JobRow) {
 		return
 	}
 
-	err, stack := runProtected(ctx, fn, row)
+	stack, err := runProtected(ctx, fn, row)
 	if err != nil {
 		c.markDead(ctx, row, err, stack)
 		c.logger.Error("drover: job failed",
@@ -86,14 +86,14 @@ func (c *Client) runJob(ctx context.Context, row *driver.JobRow) {
 
 // runProtected calls the worker and converts a panic into an error
 // carrying the stack, so one misbehaving job never kills the loop.
-func runProtected(ctx context.Context, fn workFunc, row *driver.JobRow) (err error, stack []byte) {
+func runProtected(ctx context.Context, fn workFunc, row *driver.JobRow) (stack []byte, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("job panicked: %v", r)
 			stack = debug.Stack()
 		}
 	}()
-	return fn(ctx, row), nil
+	return nil, fn(ctx, row)
 }
 
 func (c *Client) markDead(ctx context.Context, row *driver.JobRow, jobErr error, stack []byte) {
