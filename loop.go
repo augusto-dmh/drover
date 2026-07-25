@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"runtime/debug"
+	"slices"
 	"time"
 
 	"github.com/augusto-dmh/drover/internal/driver"
@@ -14,8 +15,8 @@ import (
 // execute its registered worker, finalize the row, repeat. On
 // cancellation it stops fetching, lets the in-flight job finish, and
 // returns nil. A worker killed mid-job (crash, SIGKILL) leaves its job
-// running until lease-based rescue lands in a later version; clean
-// shutdown loses nothing.
+// running until its lease expires and the rescuer returns it to the
+// queue; clean shutdown loses nothing.
 func (c *Client) Start(ctx context.Context) error {
 	c.logger.Info("drover: worker loop started",
 		"queue", defaultQueue, "poll_interval", c.pollInterval)
@@ -45,7 +46,7 @@ func (c *Client) Start(ctx context.Context) error {
 			continue
 		}
 		// The in-flight job is never interrupted by loop shutdown; the
-		// loop exits only after finalize (drain, CORE-03 AC6).
+		// loop exits only after finalize.
 		c.runJob(context.WithoutCancel(ctx), rows[0])
 	}
 }
@@ -57,26 +58,23 @@ func (c *Client) runJob(ctx context.Context, row *driver.JobRow) {
 
 	fn, registered := c.workers.handler(row.Kind)
 	if !registered {
+		// A kind this binary does not know is an ordinary failure, not a
+		// death sentence: mid-deploy, workers on the old build
+		// legitimately claim kinds only the new build registers, and the
+		// job has to survive until one of those runs it (AD-014).
 		err := fmt.Errorf("no worker registered for kind %q", row.Kind)
-		c.markDead(ctx, row, err, nil)
-		c.logger.Warn("drover: unregistered job kind",
-			"job_id", row.ID, "kind", row.Kind, "attempt", row.Attempt,
-			"duration", time.Since(start), "error", err)
+		c.dispose(ctx, row, err, nil, "duration", time.Since(start))
 		return
 	}
 
 	stack, err := runProtected(ctx, fn, row)
 	if err != nil {
-		c.markDead(ctx, row, err, stack)
-		c.logger.Error("drover: job failed",
-			"job_id", row.ID, "kind", row.Kind, "attempt", row.Attempt,
-			"duration", time.Since(start), "error", err)
+		c.dispose(ctx, row, err, stack, "duration", time.Since(start))
 		return
 	}
 
 	if err := c.drv.MarkCompleted(ctx, row.ID); err != nil {
-		c.logger.Error("drover: finalize job",
-			"job_id", row.ID, "kind", row.Kind, "error", err)
+		c.writeFailed(row, err)
 		return
 	}
 	c.logger.Info("drover: job completed",
@@ -96,7 +94,37 @@ func runProtected(ctx context.Context, fn workFunc, row *driver.JobRow) (stack [
 	return nil, fn(ctx, row)
 }
 
-func (c *Client) markDead(ctx context.Context, row *driver.JobRow, jobErr error, stack []byte) {
+// dispose ends an attempt that did not succeed, deciding what becomes of
+// the job: cancelled if the handler declared it hopeless, deferred if it
+// asked to be called back, dead once its attempts are spent, and
+// otherwise queued for another try after the retry policy's wait.
+//
+// It is the only place that decision is made. The worker loop and the
+// rescuer both come through here, which is what makes a job abandoned by
+// a dead worker and a job whose handler returned an error reach exactly
+// the same fate rather than merely similar ones.
+func (c *Client) dispose(ctx context.Context, row *driver.JobRow, jobErr error, stack []byte, extra ...any) {
+	attrs := func(rest ...any) []any {
+		return slices.Concat(
+			[]any{"job_id", row.ID, "kind", row.Kind, "attempt", row.Attempt},
+			rest, extra)
+	}
+
+	outcome, snooze := classifyOutcome(jobErr)
+
+	// A snooze is not a failure: nothing is recorded against the attempt,
+	// and the driver gives back the attempt the claim consumed (AD-011),
+	// so a handler waiting on a precondition can ask again indefinitely.
+	if outcome == outcomeSnoozed {
+		runAt := time.Now().Add(snooze)
+		if err := c.drv.MarkSnoozed(ctx, row.ID, runAt); err != nil {
+			c.writeFailed(row, err)
+			return
+		}
+		c.logger.Info("drover: job snoozed", attrs("run_at", runAt)...)
+		return
+	}
+
 	detail, err := json.Marshal(driver.AttemptError{
 		Attempt: row.Attempt,
 		At:      time.Now().UTC(),
@@ -104,14 +132,46 @@ func (c *Client) markDead(ctx context.Context, row *driver.JobRow, jobErr error,
 		Trace:   string(stack),
 	})
 	if err != nil {
-		c.logger.Error("drover: encode job error",
-			"job_id", row.ID, "error", err)
+		// Nothing is written, so the job stays running until its lease
+		// lapses and the rescuer collects it — the same backstop that
+		// covers a worker dying outright.
+		c.logger.Error("drover: encode job error", attrs("error", err)...)
 		return
 	}
-	if err := c.drv.MarkDead(ctx, row.ID, detail); err != nil {
-		c.logger.Error("drover: finalize job",
-			"job_id", row.ID, "kind", row.Kind, "error", err)
+
+	switch {
+	case outcome == outcomeCancelled:
+		if err := c.drv.MarkCancelled(ctx, row.ID, detail); err != nil {
+			c.writeFailed(row, err)
+			return
+		}
+		c.logger.Warn("drover: job cancelled", attrs("error", jobErr)...)
+
+	case row.Attempt >= row.MaxAttempts:
+		if err := c.drv.MarkDead(ctx, row.ID, detail); err != nil {
+			c.writeFailed(row, err)
+			return
+		}
+		c.logger.Error("drover: job dead",
+			attrs("max_attempts", row.MaxAttempts, "error", jobErr)...)
+
+	default:
+		at := retryAt(c.logger, c.retryPolicy, rowFromDriver(row), time.Now())
+		if err := c.drv.MarkRetryable(ctx, row.ID, at, detail); err != nil {
+			c.writeFailed(row, err)
+			return
+		}
+		c.logger.Warn("drover: job failed, retry scheduled",
+			attrs("max_attempts", row.MaxAttempts, "retry_at", at, "error", jobErr)...)
 	}
+}
+
+// writeFailed reports a state change that did not land. The job is still
+// running with a lease that will lapse, so the rescuer picks it up
+// later; the loop keeps going either way.
+func (c *Client) writeFailed(row *driver.JobRow, err error) {
+	c.logger.Error("drover: finalize job",
+		"job_id", row.ID, "kind", row.Kind, "error", err)
 }
 
 // sleep waits one poll interval; it returns false when ctx was
