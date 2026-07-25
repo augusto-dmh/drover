@@ -35,7 +35,9 @@ func (ExponentialRetryPolicy) NextRetry(job *JobRow) time.Time {
 // with no caller outside a test.
 func exponentialDelay(attempt int) time.Duration {
 	n := float64(attempt)
-	seconds := n * n * n * n * (0.9 + 0.2*rand.Float64())
+	// Jitter spreads retries apart; it guards nothing and predicting it
+	// grants nothing, so a cryptographic source would buy only cost.
+	seconds := n * n * n * n * (0.9 + 0.2*rand.Float64()) //nolint:gosec // scheduling jitter, not a secret
 	return time.Duration(seconds * float64(time.Second))
 }
 
