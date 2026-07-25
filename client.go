@@ -38,11 +38,12 @@ type JobRow struct {
 
 // Config configures a Client. Zero values get defaults: slog.Default()
 // for Logger, one second for PollInterval, an empty registry for
-// Workers.
+// Workers, and ExponentialRetryPolicy for RetryPolicy.
 type Config struct {
 	Workers      *Workers
 	Logger       *slog.Logger
 	PollInterval time.Duration
+	RetryPolicy  RetryPolicy
 }
 
 // Client enqueues jobs and runs the worker loop.
@@ -51,6 +52,7 @@ type Client struct {
 	workers      *Workers
 	logger       *slog.Logger
 	pollInterval time.Duration
+	retryPolicy  RetryPolicy
 }
 
 // NewClient returns a Client backed by the given PostgreSQL pool.
@@ -69,6 +71,7 @@ func newClient(drv driver.Driver, cfg Config) *Client {
 		workers:      cfg.Workers,
 		logger:       cfg.Logger,
 		pollInterval: cfg.PollInterval,
+		retryPolicy:  cfg.RetryPolicy,
 	}
 	if c.workers == nil {
 		c.workers = NewWorkers()
@@ -78,6 +81,9 @@ func newClient(drv driver.Driver, cfg Config) *Client {
 	}
 	if c.pollInterval <= 0 {
 		c.pollInterval = defaultPollInterval
+	}
+	if c.retryPolicy == nil {
+		c.retryPolicy = ExponentialRetryPolicy{}
 	}
 	return c
 }
