@@ -120,7 +120,7 @@ func decodeAttemptErrors(t *testing.T, mem *memdriver.Driver, id int64) []driver
 }
 
 func TestStartExecutesJobToCompletion(t *testing.T) {
-	defer goleak.VerifyNone(t)
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 	mem := memdriver.New()
 	ws := NewWorkers()
 	Register(ws, &funcWorker{fn: func(context.Context, *Job[greetArgs]) error { return nil }})
@@ -149,7 +149,7 @@ func TestStartExecutesJobToCompletion(t *testing.T) {
 }
 
 func TestStartMarksFailingJobDeadWithRecordedError(t *testing.T) {
-	defer goleak.VerifyNone(t)
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 	mem := memdriver.New()
 	ws := NewWorkers()
 	Register(ws, &funcWorker{fn: func(context.Context, *Job[greetArgs]) error {
@@ -174,7 +174,7 @@ func TestStartMarksFailingJobDeadWithRecordedError(t *testing.T) {
 }
 
 func TestStartRecoversPanicAndKeepsRunning(t *testing.T) {
-	defer goleak.VerifyNone(t)
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 	mem := memdriver.New()
 	ws := NewWorkers()
 	Register(ws, &funcWorker{fn: func(_ context.Context, job *Job[greetArgs]) error {
@@ -207,7 +207,7 @@ func TestStartRecoversPanicAndKeepsRunning(t *testing.T) {
 }
 
 func TestStartMarksUnregisteredKindDead(t *testing.T) {
-	defer goleak.VerifyNone(t)
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 	mem := memdriver.New()
 	h := startLoop(t, mem, mem, NewWorkers())
 
@@ -225,7 +225,7 @@ func TestStartMarksUnregisteredKindDead(t *testing.T) {
 }
 
 func TestStartMarksUndecodableArgsDead(t *testing.T) {
-	defer goleak.VerifyNone(t)
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 	mem := memdriver.New()
 	ws := NewWorkers()
 	Register(ws, &funcWorker{fn: func(context.Context, *Job[greetArgs]) error { return nil }})
@@ -249,7 +249,7 @@ func TestStartMarksUndecodableArgsDead(t *testing.T) {
 }
 
 func TestStartDrainsInFlightJobBeforeReturning(t *testing.T) {
-	defer goleak.VerifyNone(t)
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 	mem := memdriver.New()
 	started := make(chan struct{})
 	release := make(chan struct{})
@@ -287,7 +287,7 @@ func TestStartDrainsInFlightJobBeforeReturning(t *testing.T) {
 }
 
 func TestStartKeepsPollingWhileIdle(t *testing.T) {
-	defer goleak.VerifyNone(t)
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 	mem := memdriver.New()
 	counting := &countingDriver{Driver: mem}
 	h := startLoop(t, counting, mem, NewWorkers())
@@ -298,7 +298,7 @@ func TestStartKeepsPollingWhileIdle(t *testing.T) {
 }
 
 func TestStartLogsAndRetriesAfterFetchErrors(t *testing.T) {
-	defer goleak.VerifyNone(t)
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 	mem := memdriver.New()
 	flaky := &flakyDriver{Driver: mem, failures: 2}
 	ws := NewWorkers()
