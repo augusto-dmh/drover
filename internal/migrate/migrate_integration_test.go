@@ -4,9 +4,13 @@ package migrate_test
 
 import (
 	"context"
+	"maps"
 	"os"
 	"slices"
+	"strings"
 	"testing"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/augusto-dmh/drover/internal/migrate"
 	"github.com/augusto-dmh/drover/internal/testdb"
@@ -14,7 +18,61 @@ import (
 
 func TestMain(m *testing.M) { os.Exit(testdb.RunMain(m)) }
 
-func TestMigrateFreshDatabaseCreatesSchemaAtVersionOne(t *testing.T) {
+// latestVersion is the highest embedded migration; the schema is only
+// correct once every one of them has been applied.
+const latestVersion = 2
+
+// indexDefs returns each index on drover_jobs by name, with the
+// definition PostgreSQL reconstructed from the catalog.
+func indexDefs(t *testing.T, pool *pgxpool.Pool) map[string]string {
+	t.Helper()
+	rows, err := pool.Query(context.Background(),
+		`SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'drover_jobs'`)
+	if err != nil {
+		t.Fatalf("read indexes: %v", err)
+	}
+	defer rows.Close()
+	defs := make(map[string]string)
+	for rows.Next() {
+		var name, def string
+		if err := rows.Scan(&name, &def); err != nil {
+			t.Fatalf("scan index: %v", err)
+		}
+		defs[name] = def
+	}
+	return defs
+}
+
+// assertFetchAndLeaseIndexes checks that the fetch index covers all
+// three states a job can wait in, and that the rescuer's sweep has an
+// index on the lease of running jobs.
+func assertFetchAndLeaseIndexes(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	defs := indexDefs(t, pool)
+
+	fetch, ok := defs["drover_jobs_fetch_idx"]
+	if !ok {
+		t.Fatalf("drover_jobs_fetch_idx missing; indexes present: %v", slices.Sorted(maps.Keys(defs)))
+	}
+	for _, state := range []string{"available", "retryable", "scheduled"} {
+		if !strings.Contains(fetch, state) {
+			t.Errorf("fetch index does not cover waiting state %q: %s", state, fetch)
+		}
+	}
+	if strings.Contains(fetch, "running") {
+		t.Errorf("fetch index covers running jobs, which are never claimable: %s", fetch)
+	}
+
+	lease, ok := defs["drover_jobs_lease_idx"]
+	if !ok {
+		t.Fatalf("drover_jobs_lease_idx missing; indexes present: %v", slices.Sorted(maps.Keys(defs)))
+	}
+	if !strings.Contains(lease, "leased_until") || !strings.Contains(lease, "running") {
+		t.Errorf("lease index does not serve a sweep of expired running leases: %s", lease)
+	}
+}
+
+func TestMigrateFreshDatabaseCreatesSchemaAtLatestVersion(t *testing.T) {
 	pool := testdb.NewDB(t)
 	ctx := context.Background()
 
@@ -27,9 +85,11 @@ func TestMigrateFreshDatabaseCreatesSchemaAtVersionOne(t *testing.T) {
 		`SELECT MAX(version) FROM drover_schema_version`).Scan(&version); err != nil {
 		t.Fatalf("read version: %v", err)
 	}
-	if version != 1 {
-		t.Errorf("schema version = %d, want 1", version)
+	if version != latestVersion {
+		t.Errorf("schema version = %d, want %d", version, latestVersion)
 	}
+
+	assertFetchAndLeaseIndexes(t, pool)
 
 	rows, err := pool.Query(ctx, `
 		SELECT column_name FROM information_schema.columns
@@ -113,7 +173,9 @@ func TestMigrateIsIdempotent(t *testing.T) {
 		`SELECT COUNT(*) FROM drover_schema_version`).Scan(&applied); err != nil {
 		t.Fatalf("count versions: %v", err)
 	}
-	if applied != 1 {
-		t.Errorf("recorded migrations = %d, want 1 (no re-apply)", applied)
+	if applied != latestVersion {
+		t.Errorf("recorded migrations = %d, want %d (no re-apply)", applied, latestVersion)
 	}
+
+	assertFetchAndLeaseIndexes(t, pool)
 }

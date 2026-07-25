@@ -72,13 +72,41 @@ func (d *Driver) FetchAvailable(ctx context.Context, queue string, limit int) ([
 	if err != nil {
 		return nil, fmt.Errorf("fetch available jobs from queue %q: %w", queue, err)
 	}
-	rows := make([]*driver.JobRow, len(jobs))
-	for i, job := range jobs {
-		rows[i] = rowFromDB(job)
+	return sortedRows(jobs), nil
+}
+
+// FetchExpired re-claims up to limit running jobs whose lease has
+// passed, taking ownership with a lease that runs to leaseUntil. FOR
+// UPDATE SKIP LOCKED is what makes concurrent sweeps disposition each
+// row exactly once; attempt is left alone.
+func (d *Driver) FetchExpired(ctx context.Context, leaseUntil time.Time, limit int) ([]*driver.JobRow, error) {
+	if limit < 0 || limit > math.MaxInt32 {
+		return nil, fmt.Errorf("fetch limit %d out of range", limit)
 	}
-	// UPDATE ... RETURNING has no guaranteed order; the contract is FIFO.
-	slices.SortFunc(rows, func(a, b *driver.JobRow) int { return int(a.ID - b.ID) })
-	return rows, nil
+	jobs, err := d.queries.FetchExpired(ctx, dbsqlc.FetchExpiredParams{
+		LeasedUntil: leaseUntil,
+		MaxJobs:     int32(limit),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("fetch expired jobs: %w", err)
+	}
+	return sortedRows(jobs), nil
+}
+
+// ExtendLeases pushes the lease of every running job in ids out to
+// until. Ids that no longer qualify are skipped, not reported: the job
+// finalized first, which is a routine race, not a fault.
+func (d *Driver) ExtendLeases(ctx context.Context, ids []int64, until time.Time) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	if err := d.queries.ExtendLeases(ctx, dbsqlc.ExtendLeasesParams{
+		LeasedUntil: until,
+		Ids:         ids,
+	}); err != nil {
+		return fmt.Errorf("extend leases of %d jobs: %w", len(ids), err)
+	}
+	return nil
 }
 
 // MarkCompleted finalizes a running job as completed.
@@ -87,10 +115,21 @@ func (d *Driver) MarkCompleted(ctx context.Context, id int64) error {
 	if err != nil {
 		return fmt.Errorf("mark job %d completed: %w", id, err)
 	}
-	if affected == 0 {
-		return d.finalizeFailure(ctx, id)
+	return d.explain(ctx, id, affected)
+}
+
+// MarkRetryable returns a running job to the queue at retryAt without
+// finalizing it, appending errDetail to its errors array.
+func (d *Driver) MarkRetryable(ctx context.Context, id int64, retryAt time.Time, errDetail []byte) error {
+	affected, err := d.queries.MarkRetryable(ctx, dbsqlc.MarkRetryableParams{
+		ID:      id,
+		RetryAt: retryAt,
+		Error:   errDetail,
+	})
+	if err != nil {
+		return fmt.Errorf("mark job %d retryable: %w", id, err)
 	}
-	return nil
+	return d.explain(ctx, id, affected)
 }
 
 // MarkDead finalizes a running job as dead, appending errDetail to its
@@ -100,6 +139,33 @@ func (d *Driver) MarkDead(ctx context.Context, id int64, errDetail []byte) error
 	if err != nil {
 		return fmt.Errorf("mark job %d dead: %w", id, err)
 	}
+	return d.explain(ctx, id, affected)
+}
+
+// MarkCancelled finalizes a running job as cancelled, appending
+// errDetail as the reason it will never be retried.
+func (d *Driver) MarkCancelled(ctx context.Context, id int64, errDetail []byte) error {
+	affected, err := d.queries.MarkCancelled(ctx, dbsqlc.MarkCancelledParams{ID: id, Error: errDetail})
+	if err != nil {
+		return fmt.Errorf("mark job %d cancelled: %w", id, err)
+	}
+	return d.explain(ctx, id, affected)
+}
+
+// MarkSnoozed defers a running job to runAt, giving back the attempt the
+// claim consumed and recording no error.
+func (d *Driver) MarkSnoozed(ctx context.Context, id int64, runAt time.Time) error {
+	affected, err := d.queries.MarkSnoozed(ctx, dbsqlc.MarkSnoozedParams{ID: id, RunAt: runAt})
+	if err != nil {
+		return fmt.Errorf("mark job %d snoozed: %w", id, err)
+	}
+	return d.explain(ctx, id, affected)
+}
+
+// explain turns the row count of a guarded transition UPDATE into an
+// error: zero rows means the job was not running, and finalizeFailure
+// says whether it is missing or merely in the wrong state.
+func (d *Driver) explain(ctx context.Context, id int64, affected int64) error {
 	if affected == 0 {
 		return d.finalizeFailure(ctx, id)
 	}
@@ -117,6 +183,17 @@ func (d *Driver) finalizeFailure(ctx context.Context, id int64) error {
 		return fmt.Errorf("inspect job %d: %w", id, err)
 	}
 	return fmt.Errorf("job %d is %s, want running: %w", id, job.State, driver.ErrInvalidTransition)
+}
+
+// sortedRows converts claimed jobs to driver rows in id order: UPDATE
+// ... RETURNING has no guaranteed order, but the contract is FIFO.
+func sortedRows(jobs []dbsqlc.DroverJob) []*driver.JobRow {
+	rows := make([]*driver.JobRow, len(jobs))
+	for i, job := range jobs {
+		rows[i] = rowFromDB(job)
+	}
+	slices.SortFunc(rows, func(a, b *driver.JobRow) int { return int(a.ID - b.ID) })
+	return rows
 }
 
 func insertParams(params driver.InsertParams) dbsqlc.InsertJobParams {
