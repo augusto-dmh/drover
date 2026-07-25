@@ -34,7 +34,8 @@ Durable, cross-cycle. Architecture-level decisions live in `docs/adr/`; entries 
 
 ## Handoff
 
-- **Active feature**: `cycle-b-reliability-core` — spec, context, design and tasks written; Execute pending
-- **Branch**: `feat/retries-leases-and-rescue`
-- **Next**: execute T1–T9 (four phases), then the mandatory fresh Verifier, then publish
-- **After this cycle**: Cycle C — concurrency (per-queue worker pools, fetcher→workers channels, `Start`/`Stop` graceful shutdown). Cycle B's in-flight set, heartbeat and supervisor are built to accept N concurrent jobs unchanged.
+- **Active feature**: `cycle-b-reliability-core` — **COMPLETE, validation PASS** (iteration 2: the rescue path's backoff had no sensor; fixed in 211dd78, 17/17 mutants killed)
+- **Branch**: `feat/retries-leases-and-rescue`, 10 commits `e813748..211dd78`; 106 tests (was 44), unit + integration + lint green
+- **Deviation this cycle**: phase 3 (loop, heartbeat, rescuer, supervisor) was executed inline by the orchestrator rather than a phase worker, at the user's request. The Verifier was still an independent fresh agent, so author ≠ verifier held.
+- **Next**: publish the PR, then review and merge
+- **After this cycle**: Cycle C — concurrency (per-queue worker pools, fetcher→workers channels, `Start`/`Stop` graceful shutdown). Cycle B's in-flight set, heartbeat and supervisor are built to accept N concurrent jobs unchanged, so the pool changes who calls `add`/`remove`, not what they mean.
