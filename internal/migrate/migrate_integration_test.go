@@ -78,6 +78,23 @@ func TestMigrateFreshDatabaseCreatesSchemaAtVersionOne(t *testing.T) {
 	if !slices.Equal(states, wantStates) {
 		t.Errorf("drover_job_state labels = %v, want %v", states, wantStates)
 	}
+
+	columnMeta := func(column string) (dataType, colDefault string) {
+		if err := pool.QueryRow(ctx, `
+			SELECT data_type, COALESCE(column_default, '')
+			FROM information_schema.columns
+			WHERE table_name = 'drover_jobs' AND column_name = $1`, column).
+			Scan(&dataType, &colDefault); err != nil {
+			t.Fatalf("read %s column metadata: %v", column, err)
+		}
+		return dataType, colDefault
+	}
+	if dataType, colDefault := columnMeta("queue"); dataType != "text" || colDefault != "'default'::text" {
+		t.Errorf("queue column = %s default %s, want text default 'default'::text", dataType, colDefault)
+	}
+	if dataType, colDefault := columnMeta("args"); dataType != "jsonb" || colDefault != "'{}'::jsonb" {
+		t.Errorf("args column = %s default %s, want jsonb default '{}'::jsonb", dataType, colDefault)
+	}
 }
 
 func TestMigrateIsIdempotent(t *testing.T) {

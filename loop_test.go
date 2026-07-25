@@ -168,8 +168,14 @@ func TestStartMarksFailingJobDeadWithRecordedError(t *testing.T) {
 	if len(recorded) != 1 || recorded[0].Error != "boom" || recorded[0].Attempt != 1 {
 		t.Errorf("errors = %+v, want one entry {Attempt:1 Error:boom}", recorded)
 	}
-	if !strings.Contains(h.logs.String(), `msg="drover: job failed"`) {
-		t.Error("logs missing job failed record")
+	logs := h.logs.String()
+	for _, want := range []string{
+		`msg="drover: job failed"`, "job_id=" + fmt.Sprint(row.ID),
+		"kind=greet", "attempt=1", "duration=", "error=boom",
+	} {
+		if !strings.Contains(logs, want) {
+			t.Errorf("failure log missing %q\nlogs:\n%s", want, logs)
+		}
 	}
 }
 
@@ -288,13 +294,37 @@ func TestStartDrainsInFlightJobBeforeReturning(t *testing.T) {
 
 func TestStartKeepsPollingWhileIdle(t *testing.T) {
 	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
-	mem := memdriver.New()
-	counting := &countingDriver{Driver: mem}
-	h := startLoop(t, counting, mem, NewWorkers())
+	counting := &countingDriver{Driver: memdriver.New()}
+	c := newClient(counting, Config{
+		Logger:       slog.New(slog.NewTextHandler(&syncWriter{}, nil)),
+		PollInterval: 30 * time.Millisecond,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- c.Start(ctx) }()
 
-	waitFor(t, func() bool { return counting.fetches.Load() >= 3 },
-		"loop to poll repeatedly while idle")
-	h.stop(t)
+	const window = 150 * time.Millisecond
+	time.Sleep(window)
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Start returned %v, want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Start did not return after cancellation")
+	}
+
+	fetches := counting.fetches.Load()
+	if fetches < 2 {
+		t.Fatalf("loop fetched %d times in %v, want repeated polling", fetches, window)
+	}
+	// 150ms / 30ms ≈ 5 fetches; a loop that skips the sleep fetches
+	// thousands of times. Generous bound to stay timing-tolerant.
+	if fetches > 20 {
+		t.Fatalf("loop fetched %d times in %v with a 30ms interval — polling without sleeping",
+			fetches, window)
+	}
 }
 
 func TestStartLogsAndRetriesAfterFetchErrors(t *testing.T) {
@@ -312,8 +342,9 @@ func TestStartLogsAndRetriesAfterFetchErrors(t *testing.T) {
 	waitFor(t, h.rowInState(row.ID, "completed"), "loop to recover from fetch errors")
 	h.stop(t)
 
-	if !strings.Contains(h.logs.String(), `msg="drover: fetch jobs"`) {
-		t.Error("logs missing fetch-error record")
+	logs := h.logs.String()
+	if !strings.Contains(logs, `level=ERROR msg="drover: fetch jobs"`) {
+		t.Errorf("logs missing ERROR-level fetch-error record\nlogs:\n%s", logs)
 	}
 }
 

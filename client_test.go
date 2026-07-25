@@ -88,6 +88,20 @@ func TestInsertWrapsMarshalFailure(t *testing.T) {
 	assertNothingPersisted(t, mem)
 }
 
+func TestInsertTxValidatesBeforeTouchingTransaction(t *testing.T) {
+	t.Parallel()
+	mem := memdriver.New()
+	c := newClient(mem, Config{})
+
+	if _, err := c.InsertTx(context.Background(), nil, emptyKindArgs{}); !errors.Is(err, ErrInvalidKind) {
+		t.Fatalf("InsertTx empty kind: %v, want ErrInvalidKind", err)
+	}
+	if _, err := c.InsertTx(context.Background(), nil, badArgs{}); err == nil || !strings.Contains(err.Error(), `kind "bad"`) {
+		t.Fatalf("InsertTx marshal failure: %v, want wrapped error naming the kind", err)
+	}
+	assertNothingPersisted(t, mem)
+}
+
 func TestNewClientRejectsNilPool(t *testing.T) {
 	t.Parallel()
 
