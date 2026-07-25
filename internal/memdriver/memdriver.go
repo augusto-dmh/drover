@@ -65,8 +65,8 @@ func waiting(state string) bool {
 }
 
 // FetchAvailable claims up to limit due jobs in id order: each becomes
-// running with an incremented attempt and a fresh lease.
-func (d *Driver) FetchAvailable(_ context.Context, queue string, limit int) ([]*driver.JobRow, error) {
+// running with an incremented attempt and a lease running to leaseUntil.
+func (d *Driver) FetchAvailable(_ context.Context, queue string, leaseUntil time.Time, limit int) ([]*driver.JobRow, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
@@ -82,7 +82,7 @@ func (d *Driver) FetchAvailable(_ context.Context, queue string, limit int) ([]*
 		}
 		row.State = "running"
 		row.Attempt++
-		lease := now.Add(driver.DefaultLeaseDuration)
+		lease := leaseUntil
 		row.LeasedUntil = &lease
 		claimed = append(claimed, copyRow(row))
 	}

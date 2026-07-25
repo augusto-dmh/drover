@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"runtime/debug"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/augusto-dmh/drover/internal/driver"
@@ -19,29 +20,51 @@ import (
 // queue; clean shutdown loses nothing.
 func (c *Client) Start(ctx context.Context) error {
 	c.logger.Info("drover: worker loop started",
-		"queue", defaultQueue, "poll_interval", c.pollInterval)
+		"queue", defaultQueue, "poll_interval", c.pollInterval,
+		"lease_duration", c.leaseDuration, "heartbeat_interval", c.heartbeatInterval)
+
+	// The heartbeat is stopped by closing a channel after the fetch loop
+	// returns, rather than by cancelling ctx: a cancelled loop is still
+	// draining its last job, and dropping that job's lease mid-drain
+	// would invite the rescuer to hand out a duplicate on every clean
+	// shutdown (AD-018).
+	stopHeartbeat := make(chan struct{})
+	var background sync.WaitGroup
+	background.Add(1)
+	go func() {
+		defer background.Done()
+		c.heartbeat(stopHeartbeat)
+	}()
+
+	c.fetchLoop(ctx)
+
+	close(stopHeartbeat)
+	background.Wait()
+
+	c.logger.Info("drover: worker loop stopped")
+	return nil
+}
+
+// fetchLoop claims and runs one job at a time until ctx is cancelled.
+func (c *Client) fetchLoop(ctx context.Context) {
 	for {
 		if ctx.Err() != nil {
-			c.logger.Info("drover: worker loop stopped")
-			return nil
+			return
 		}
-		rows, err := c.drv.FetchAvailable(ctx, defaultQueue, 1)
+		rows, err := c.drv.FetchAvailable(ctx, defaultQueue, time.Now().Add(c.leaseDuration), 1)
 		if err != nil {
 			if ctx.Err() != nil {
-				c.logger.Info("drover: worker loop stopped")
-				return nil
+				return
 			}
 			c.logger.Error("drover: fetch jobs", "error", err)
 			if !c.sleep(ctx) {
-				c.logger.Info("drover: worker loop stopped")
-				return nil
+				return
 			}
 			continue
 		}
 		if len(rows) == 0 {
 			if !c.sleep(ctx) {
-				c.logger.Info("drover: worker loop stopped")
-				return nil
+				return
 			}
 			continue
 		}
@@ -55,6 +78,11 @@ func (c *Client) runJob(ctx context.Context, row *driver.JobRow) {
 	start := time.Now()
 	c.logger.Info("drover: job started",
 		"job_id", row.ID, "kind", row.Kind, "attempt", row.Attempt)
+
+	// Tracked from claim to finalize, which is exactly the window in
+	// which this job's lease must not lapse.
+	c.inflight.add(row.ID)
+	defer c.inflight.remove(row.ID)
 
 	fn, registered := c.workers.handler(row.Kind)
 	if !registered {

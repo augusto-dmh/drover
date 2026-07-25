@@ -60,12 +60,12 @@ func (d *Driver) InsertTx(ctx context.Context, tx any, params driver.InsertParam
 
 // FetchAvailable claims up to limit due jobs with FOR UPDATE SKIP
 // LOCKED, returning them in id order as running with a fresh lease.
-func (d *Driver) FetchAvailable(ctx context.Context, queue string, limit int) ([]*driver.JobRow, error) {
+func (d *Driver) FetchAvailable(ctx context.Context, queue string, leaseUntil time.Time, limit int) ([]*driver.JobRow, error) {
 	if limit < 0 || limit > math.MaxInt32 {
 		return nil, fmt.Errorf("fetch limit %d out of range", limit)
 	}
 	jobs, err := d.queries.FetchAvailable(ctx, dbsqlc.FetchAvailableParams{
-		LeasedUntil: time.Now().Add(driver.DefaultLeaseDuration),
+		LeasedUntil: leaseUntil,
 		Queue:       queue,
 		MaxJobs:     int32(limit),
 	})

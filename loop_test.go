@@ -70,8 +70,8 @@ type cappedDriver struct {
 	max int
 }
 
-func (d *cappedDriver) FetchAvailable(ctx context.Context, queue string, limit int) ([]*driver.JobRow, error) {
-	rows, err := d.Driver.FetchAvailable(ctx, queue, limit)
+func (d *cappedDriver) FetchAvailable(ctx context.Context, queue string, leaseUntil time.Time, limit int) ([]*driver.JobRow, error) {
+	rows, err := d.Driver.FetchAvailable(ctx, queue, leaseUntil, limit)
 	for _, row := range rows {
 		row.MaxAttempts = d.max
 	}
@@ -679,9 +679,9 @@ type countingDriver struct {
 	fetches atomic.Int64
 }
 
-func (d *countingDriver) FetchAvailable(ctx context.Context, queue string, limit int) ([]*driver.JobRow, error) {
+func (d *countingDriver) FetchAvailable(ctx context.Context, queue string, leaseUntil time.Time, limit int) ([]*driver.JobRow, error) {
 	d.fetches.Add(1)
-	return d.Driver.FetchAvailable(ctx, queue, limit)
+	return d.Driver.FetchAvailable(ctx, queue, leaseUntil, limit)
 }
 
 type flakyDriver struct {
@@ -690,11 +690,11 @@ type flakyDriver struct {
 	calls    atomic.Int32
 }
 
-func (d *flakyDriver) FetchAvailable(ctx context.Context, queue string, limit int) ([]*driver.JobRow, error) {
+func (d *flakyDriver) FetchAvailable(ctx context.Context, queue string, leaseUntil time.Time, limit int) ([]*driver.JobRow, error) {
 	if d.calls.Add(1) <= d.failures {
 		return nil, errors.New("connection refused")
 	}
-	return d.Driver.FetchAvailable(ctx, queue, limit)
+	return d.Driver.FetchAvailable(ctx, queue, leaseUntil, limit)
 }
 
 // blockedRetryDriver refuses every attempt to queue a retry, standing in

@@ -18,6 +18,11 @@ import (
 const (
 	defaultQueue        = "default"
 	defaultPollInterval = time.Second
+
+	// heartbeatsPerLease is how many renewals fit in one lease by
+	// default. Three leaves two beats of slack: a job survives a missed
+	// renewal without the rescuer taking it away.
+	heartbeatsPerLease = 3
 )
 
 // JobRow is the persisted representation of a job.
@@ -38,21 +43,37 @@ type JobRow struct {
 
 // Config configures a Client. Zero values get defaults: slog.Default()
 // for Logger, one second for PollInterval, an empty registry for
-// Workers, and ExponentialRetryPolicy for RetryPolicy.
+// Workers, ExponentialRetryPolicy for RetryPolicy, one minute for
+// LeaseDuration, and a third of the lease for HeartbeatInterval.
 type Config struct {
 	Workers      *Workers
 	Logger       *slog.Logger
 	PollInterval time.Duration
 	RetryPolicy  RetryPolicy
+
+	// LeaseDuration is how long a claimed job may run before the rescuer
+	// treats its worker as dead. It bounds how long work sits idle after
+	// a crash, so a shorter lease recovers faster and a longer one
+	// tolerates more heartbeat trouble.
+	LeaseDuration time.Duration
+
+	// HeartbeatInterval is how often a running job's lease is renewed.
+	// It must be shorter than LeaseDuration or every job outliving one
+	// lease would be rescued while still running; a value that is not is
+	// replaced with a third of the lease.
+	HeartbeatInterval time.Duration
 }
 
 // Client enqueues jobs and runs the worker loop.
 type Client struct {
-	drv          driver.Driver
-	workers      *Workers
-	logger       *slog.Logger
-	pollInterval time.Duration
-	retryPolicy  RetryPolicy
+	drv               driver.Driver
+	workers           *Workers
+	logger            *slog.Logger
+	pollInterval      time.Duration
+	retryPolicy       RetryPolicy
+	leaseDuration     time.Duration
+	heartbeatInterval time.Duration
+	inflight          *inflightSet
 }
 
 // NewClient returns a Client backed by the given PostgreSQL pool.
@@ -67,11 +88,14 @@ func NewClient(pool *pgxpool.Pool, cfg Config) (*Client, error) {
 // memdriver.
 func newClient(drv driver.Driver, cfg Config) *Client {
 	c := &Client{
-		drv:          drv,
-		workers:      cfg.Workers,
-		logger:       cfg.Logger,
-		pollInterval: cfg.PollInterval,
-		retryPolicy:  cfg.RetryPolicy,
+		drv:               drv,
+		workers:           cfg.Workers,
+		logger:            cfg.Logger,
+		pollInterval:      cfg.PollInterval,
+		retryPolicy:       cfg.RetryPolicy,
+		leaseDuration:     cfg.LeaseDuration,
+		heartbeatInterval: cfg.HeartbeatInterval,
+		inflight:          newInflightSet(),
 	}
 	if c.workers == nil {
 		c.workers = NewWorkers()
@@ -84,6 +108,15 @@ func newClient(drv driver.Driver, cfg Config) *Client {
 	}
 	if c.retryPolicy == nil {
 		c.retryPolicy = ExponentialRetryPolicy{}
+	}
+	if c.leaseDuration <= 0 {
+		c.leaseDuration = driver.DefaultLeaseDuration
+	}
+	// A heartbeat at or beyond the lease it renews can only ever renew
+	// too late, so every job outliving one lease would be rescued while
+	// still running. Treat such a setting as unconfigured.
+	if c.heartbeatInterval <= 0 || c.heartbeatInterval >= c.leaseDuration {
+		c.heartbeatInterval = c.leaseDuration / heartbeatsPerLease
 	}
 	return c
 }

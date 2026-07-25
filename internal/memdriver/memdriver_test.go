@@ -26,7 +26,7 @@ func mustInsert(t *testing.T, d *Driver, kind, queue string) *driver.JobRow {
 
 func claimOne(t *testing.T, d *Driver, queue string) *driver.JobRow {
 	t.Helper()
-	rows, err := d.FetchAvailable(context.Background(), queue, 1)
+	rows, err := d.FetchAvailable(context.Background(), queue, time.Now().Add(time.Minute), 1)
 	if err != nil {
 		t.Fatalf("FetchAvailable: %v", err)
 	}
@@ -175,7 +175,7 @@ func TestFetchAvailableFilters(t *testing.T) {
 			d := New()
 			tt.setup(t, d)
 
-			rows, err := d.FetchAvailable(context.Background(), "default", 1)
+			rows, err := d.FetchAvailable(context.Background(), "default", time.Now().Add(time.Minute), 1)
 			if err != nil {
 				t.Fatalf("FetchAvailable: %v", err)
 			}
@@ -388,7 +388,7 @@ func TestFetchAvailableClaimsEveryDueWaitingState(t *testing.T) {
 			d := New()
 			parked := park(t, d, tt.state, time.Now().Add(tt.offset))
 
-			claimed, err := d.FetchAvailable(context.Background(), "default", 1)
+			claimed, err := d.FetchAvailable(context.Background(), "default", time.Now().Add(time.Minute), 1)
 			if err != nil {
 				t.Fatalf("FetchAvailable: %v", err)
 			}
@@ -666,7 +666,7 @@ func TestConcurrentFetchExpiredReclaimsEachJobExactlyOnce(t *testing.T) {
 	for range jobs {
 		mustInsert(t, d, "k", "default")
 	}
-	claimed, err := d.FetchAvailable(context.Background(), "default", jobs)
+	claimed, err := d.FetchAvailable(context.Background(), "default", time.Now().Add(time.Minute), jobs)
 	if err != nil || len(claimed) != jobs {
 		t.Fatalf("claim all: %v (%d rows)", err, len(claimed))
 	}
@@ -724,7 +724,7 @@ func TestConcurrentFetchClaimsEachJobExactlyOnce(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for {
-				rows, err := d.FetchAvailable(context.Background(), "default", 1)
+				rows, err := d.FetchAvailable(context.Background(), "default", time.Now().Add(time.Minute), 1)
 				if err != nil {
 					t.Errorf("FetchAvailable: %v", err)
 					return

@@ -71,10 +71,15 @@ type Driver interface {
 
 	// FetchAvailable claims up to limit due jobs from queue: each waiting
 	// job whose scheduled time has passed becomes running with an
-	// incremented attempt and a fresh lease. A job waits in one of three
-	// states — available (never run), retryable (failed, waiting out its
-	// backoff) or scheduled (snoozed) — and all three are claimed alike.
-	FetchAvailable(ctx context.Context, queue string, limit int) ([]*JobRow, error)
+	// incremented attempt and a lease running to leaseUntil. A job waits
+	// in one of three states — available (never run), retryable (failed,
+	// waiting out its backoff) or scheduled (snoozed) — and all three are
+	// claimed alike.
+	//
+	// The lease comes from the caller rather than the driver because the
+	// caller is what renews it: a claim lease the caller did not choose
+	// could not be kept in step with its heartbeat.
+	FetchAvailable(ctx context.Context, queue string, leaseUntil time.Time, limit int) ([]*JobRow, error)
 
 	// FetchExpired re-claims up to limit running jobs whose lease has
 	// passed, writing leaseUntil as the new lease so the caller owns

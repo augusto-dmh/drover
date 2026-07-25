@@ -109,7 +109,7 @@ func TestEndToEndConcurrentLoopsExecuteEachJobExactlyOnce(t *testing.T) {
 	}
 }
 
-func TestEndToEndFailedJobIsDeadWithRecordedErrorInPostgres(t *testing.T) {
+func TestEndToEndFailedJobIsQueuedForRetryInPostgres(t *testing.T) {
 	pool := testdb.NewDB(t)
 	ctx := context.Background()
 	if err := Migrate(ctx, pool); err != nil {
@@ -129,10 +129,26 @@ func TestEndToEndFailedJobIsDeadWithRecordedErrorInPostgres(t *testing.T) {
 	loopCtx, cancel := context.WithCancel(ctx)
 	done := make(chan error, 1)
 	go func() { done <- c.Start(loopCtx) }()
-	waitFor(t, func() bool { return countInState(t, pool, "dead") == 1 }, "job to be marked dead")
+	// An unreachable mail server is the archetypal transient failure: the
+	// job waits out its backoff rather than dying on the first attempt.
+	waitFor(t, func() bool { return countInState(t, pool, "retryable") == 1 }, "job to be queued for retry")
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatalf("Start returned %v, want nil", err)
+	}
+
+	var state string
+	var finalizedAt *time.Time
+	if err := pool.QueryRow(ctx,
+		`SELECT state, finalized_at FROM drover_jobs WHERE id = $1`, row.ID).
+		Scan(&state, &finalizedAt); err != nil {
+		t.Fatalf("read job: %v", err)
+	}
+	if state != "retryable" {
+		t.Errorf("state = %q, want retryable", state)
+	}
+	if finalizedAt != nil {
+		t.Errorf("finalized_at = %v, want unset on a job awaiting retry", finalizedAt)
 	}
 
 	var rawErrors []byte

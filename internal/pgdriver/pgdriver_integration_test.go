@@ -77,7 +77,7 @@ func decodeErrors(t *testing.T, raw []byte) []driver.AttemptError {
 
 func claimOne(t *testing.T, d *pgdriver.Driver) *driver.JobRow {
 	t.Helper()
-	rows, err := d.FetchAvailable(context.Background(), "default", 1)
+	rows, err := d.FetchAvailable(context.Background(), "default", time.Now().Add(time.Minute), 1)
 	if err != nil {
 		t.Fatalf("FetchAvailable: %v", err)
 	}
@@ -211,7 +211,7 @@ func TestFetchAvailableClaimSemantics(t *testing.T) {
 		t.Fatalf("push job to the future: %v", err)
 	}
 
-	claimed, err := d.FetchAvailable(ctx, "default", 1)
+	claimed, err := d.FetchAvailable(ctx, "default", time.Now().Add(time.Minute), 1)
 	if err != nil {
 		t.Fatalf("FetchAvailable: %v", err)
 	}
@@ -225,7 +225,7 @@ func TestFetchAvailableClaimSemantics(t *testing.T) {
 		t.Errorf("LeasedUntil = %v, want a future lease", claimed[0].LeasedUntil)
 	}
 
-	claimed, err = d.FetchAvailable(ctx, "default", 10)
+	claimed, err = d.FetchAvailable(ctx, "default", time.Now().Add(time.Minute), 10)
 	if err != nil {
 		t.Fatalf("second FetchAvailable: %v", err)
 	}
@@ -234,7 +234,7 @@ func TestFetchAvailableClaimSemantics(t *testing.T) {
 			len(claimed), second.ID)
 	}
 
-	claimed, err = d.FetchAvailable(ctx, "default", 1)
+	claimed, err = d.FetchAvailable(ctx, "default", time.Now().Add(time.Minute), 1)
 	if err != nil {
 		t.Fatalf("third FetchAvailable: %v", err)
 	}
@@ -251,7 +251,7 @@ func TestFetchAvailableReturnsBatchInIDOrder(t *testing.T) {
 	}
 	mustInsert(t, d, "k", "default")
 
-	claimed, err := d.FetchAvailable(context.Background(), "default", 3)
+	claimed, err := d.FetchAvailable(context.Background(), "default", time.Now().Add(time.Minute), 3)
 	if err != nil {
 		t.Fatalf("FetchAvailable: %v", err)
 	}
@@ -280,7 +280,7 @@ func TestConcurrentClaimersNeverDoubleClaim(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for {
-				rows, err := d.FetchAvailable(context.Background(), "default", 1)
+				rows, err := d.FetchAvailable(context.Background(), "default", time.Now().Add(time.Minute), 1)
 				if err != nil {
 					t.Errorf("FetchAvailable: %v", err)
 					return
@@ -310,7 +310,7 @@ func TestMarkCompletedFinalizesRunningJob(t *testing.T) {
 	d, pool := newDriver(t)
 	ctx := context.Background()
 	mustInsert(t, d, "k", "default")
-	claimed, err := d.FetchAvailable(ctx, "default", 1)
+	claimed, err := d.FetchAvailable(ctx, "default", time.Now().Add(time.Minute), 1)
 	if err != nil || len(claimed) != 1 {
 		t.Fatalf("claim: %v (%d rows)", err, len(claimed))
 	}
@@ -335,7 +335,7 @@ func TestMarkDeadAppendsErrorDetail(t *testing.T) {
 	d, pool := newDriver(t)
 	ctx := context.Background()
 	mustInsert(t, d, "k", "default")
-	claimed, err := d.FetchAvailable(ctx, "default", 1)
+	claimed, err := d.FetchAvailable(ctx, "default", time.Now().Add(time.Minute), 1)
 	if err != nil || len(claimed) != 1 {
 		t.Fatalf("claim: %v (%d rows)", err, len(claimed))
 	}
@@ -447,7 +447,7 @@ func TestFetchAvailableClaimsEveryDueWaitingState(t *testing.T) {
 			id := park(t, d, pool, tt.state, time.Now().Add(tt.offset))
 			parked := readJob(t, pool, id)
 
-			claimed, err := d.FetchAvailable(context.Background(), "default", 1)
+			claimed, err := d.FetchAvailable(context.Background(), "default", time.Now().Add(time.Minute), 1)
 			if err != nil {
 				t.Fatalf("FetchAvailable: %v", err)
 			}
@@ -721,7 +721,7 @@ func TestConcurrentFetchExpiredReclaimsEachJobExactlyOnce(t *testing.T) {
 	for range jobs {
 		mustInsert(t, d, "k", "default")
 	}
-	claimed, err := d.FetchAvailable(context.Background(), "default", jobs)
+	claimed, err := d.FetchAvailable(context.Background(), "default", time.Now().Add(time.Minute), jobs)
 	if err != nil || len(claimed) != jobs {
 		t.Fatalf("claim all: %v (%d rows)", err, len(claimed))
 	}

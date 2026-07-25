@@ -23,7 +23,7 @@ func (emptyKindArgs) Kind() string { return "" }
 
 func assertNothingPersisted(t *testing.T, mem *memdriver.Driver) {
 	t.Helper()
-	rows, err := mem.FetchAvailable(context.Background(), "default", 1)
+	rows, err := mem.FetchAvailable(context.Background(), "default", time.Now().Add(time.Minute), 1)
 	if err != nil {
 		t.Fatalf("FetchAvailable: %v", err)
 	}
