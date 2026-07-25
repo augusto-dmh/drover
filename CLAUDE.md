@@ -24,6 +24,7 @@ Never re-litigate these without a superseding ADR:
 
 - Research fleets write dated reports to `docs/research/YYYY-MM-DD/` (per-question files + `synthesis.md`); durable conclusions are always promoted into ADRs/RFCs — the research archive is evidence, read only when recovering it.
 - One roadmap cycle = one PR = one `tlc-spec-driven` cycle. The skill creates `.specs/` per feature; do not create `.specs/` structure upfront.
+- To ship a roadmap cycle end-to-end (plan → build → PR → review → triage → fix → cleanup → gated merge), use `drover-ship-cycle`; check `.specs/.ship-status` first and resume a mid-stage cycle instead of starting fresh. For standalone PR reviews on explicit request, use `pr-review`.
 - Conventional Commits; one atomic commit per spec task; branch names describe the change, not planning labels. Load `drover-finalize` for all commit/PR publishing: it enforces self-contained history — no internal artifact names (task IDs, requirement/decision IDs, cycle letters, `.specs/` paths) in commit messages, PR titles, or PR bodies, and no AI/tooling attribution anywhere in git history or PRs.
 - Tests: table-driven, `t.Parallel`, `-race` in CI always; testcontainers-go for Postgres integration tests; `testing/synctest` for time-dependent scheduler/retry tests; goleak on lifecycle tests. The unit suite must run without Docker via the in-memory adapter.
 - Lint: golangci-lint v2; vulnerability scanning via govulncheck in CI.
