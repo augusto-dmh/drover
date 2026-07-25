@@ -62,6 +62,13 @@ type Config struct {
 	// lease would be rescued while still running; a value that is not is
 	// replaced with a third of the lease.
 	HeartbeatInterval time.Duration
+
+	// RescueInterval is how often the client sweeps for jobs whose
+	// workers died. Together with LeaseDuration it bounds how long
+	// abandoned work sits idle. It defaults to LeaseDuration, so
+	// shortening the lease to recover faster does not leave the sweep
+	// running on the old, slower cadence.
+	RescueInterval time.Duration
 }
 
 // Client enqueues jobs and runs the worker loop.
@@ -73,6 +80,7 @@ type Client struct {
 	retryPolicy       RetryPolicy
 	leaseDuration     time.Duration
 	heartbeatInterval time.Duration
+	rescueInterval    time.Duration
 	inflight          *inflightSet
 }
 
@@ -95,6 +103,7 @@ func newClient(drv driver.Driver, cfg Config) *Client {
 		retryPolicy:       cfg.RetryPolicy,
 		leaseDuration:     cfg.LeaseDuration,
 		heartbeatInterval: cfg.HeartbeatInterval,
+		rescueInterval:    cfg.RescueInterval,
 		inflight:          newInflightSet(),
 	}
 	if c.workers == nil {
@@ -117,6 +126,9 @@ func newClient(drv driver.Driver, cfg Config) *Client {
 	// still running. Treat such a setting as unconfigured.
 	if c.heartbeatInterval <= 0 || c.heartbeatInterval >= c.leaseDuration {
 		c.heartbeatInterval = c.leaseDuration / heartbeatsPerLease
+	}
+	if c.rescueInterval <= 0 {
+		c.rescueInterval = c.leaseDuration
 	}
 	return c
 }

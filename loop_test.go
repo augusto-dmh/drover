@@ -49,6 +49,12 @@ func (w *syncWriter) String() string {
 	return w.buf.String()
 }
 
+// newTestLogger writes structured records into w so a test can assert on
+// what the client reported.
+func newTestLogger(w *syncWriter) *slog.Logger {
+	return slog.New(slog.NewTextHandler(w, nil))
+}
+
 // immediatePolicy retries with no wait, so a test can watch a job walk
 // its whole attempt ladder without waiting out the real backoff.
 type immediatePolicy struct{}
@@ -72,10 +78,21 @@ type cappedDriver struct {
 
 func (d *cappedDriver) FetchAvailable(ctx context.Context, queue string, leaseUntil time.Time, limit int) ([]*driver.JobRow, error) {
 	rows, err := d.Driver.FetchAvailable(ctx, queue, leaseUntil, limit)
+	return capRows(rows, d.max), err
+}
+
+// Both claim paths are capped: a job reaches the rescuer carrying the
+// same ceiling it would have carried into the worker loop.
+func (d *cappedDriver) FetchExpired(ctx context.Context, leaseUntil time.Time, limit int) ([]*driver.JobRow, error) {
+	rows, err := d.Driver.FetchExpired(ctx, leaseUntil, limit)
+	return capRows(rows, d.max), err
+}
+
+func capRows(rows []*driver.JobRow, max int) []*driver.JobRow {
 	for _, row := range rows {
-		row.MaxAttempts = d.max
+		row.MaxAttempts = max
 	}
-	return rows, err
+	return rows
 }
 
 // loopHarness wires a client to a fast-polling loop over drv and
@@ -100,7 +117,7 @@ func startLoopWith(t *testing.T, drv driver.Driver, mem *memdriver.Driver, worke
 	logs := &syncWriter{}
 	cfg := Config{
 		Workers:      workers,
-		Logger:       slog.New(slog.NewTextHandler(logs, nil)),
+		Logger:       newTestLogger(logs),
 		PollInterval: 3 * time.Millisecond,
 	}
 	if tune != nil {

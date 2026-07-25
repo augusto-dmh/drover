@@ -21,7 +21,8 @@ import (
 func (c *Client) Start(ctx context.Context) error {
 	c.logger.Info("drover: worker loop started",
 		"queue", defaultQueue, "poll_interval", c.pollInterval,
-		"lease_duration", c.leaseDuration, "heartbeat_interval", c.heartbeatInterval)
+		"lease_duration", c.leaseDuration, "heartbeat_interval", c.heartbeatInterval,
+		"rescue_interval", c.rescueInterval)
 
 	// The heartbeat is stopped by closing a channel after the fetch loop
 	// returns, rather than by cancelling ctx: a cancelled loop is still
@@ -30,10 +31,16 @@ func (c *Client) Start(ctx context.Context) error {
 	// shutdown (AD-018).
 	stopHeartbeat := make(chan struct{})
 	var background sync.WaitGroup
-	background.Add(1)
+	background.Add(2)
 	go func() {
 		defer background.Done()
 		c.heartbeat(stopHeartbeat)
+	}()
+	// The rescuer holds no work of its own, so cancellation stops it
+	// outright while the fetch loop is still draining.
+	go func() {
+		defer background.Done()
+		c.rescueLoop(ctx)
 	}()
 
 	c.fetchLoop(ctx)

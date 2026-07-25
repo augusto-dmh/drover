@@ -3,7 +3,6 @@ package drover
 import (
 	"context"
 	"errors"
-	"log/slog"
 	"slices"
 	"strings"
 	"sync"
@@ -155,7 +154,7 @@ func TestHeartbeatKeepsBeatingAfterAFailedExtension(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		rec := &leaseRecorder{Driver: memdriver.New(), fail: errors.New("connection refused")}
 		c := newClient(rec, Config{
-			Logger:            slog.New(slog.NewTextHandler(logs, nil)),
+			Logger:            newTestLogger(logs),
 			LeaseDuration:     30 * time.Second,
 			HeartbeatInterval: 10 * time.Second,
 		})
