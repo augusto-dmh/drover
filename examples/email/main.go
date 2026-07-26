@@ -118,8 +118,10 @@ func run() error {
 	shutdown, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := client.Stop(shutdown); err != nil {
-		log.Printf("shutdown incomplete: %v", err)
-		return nil
+		// Reported through the exit code, not just the log. This is the
+		// one shutdown an operator most needs to notice, and a process
+		// that exits 0 here tells its orchestrator everything went fine.
+		return fmt.Errorf("shutdown incomplete: %w", err)
 	}
 	log.Print("shutdown complete: every in-flight job finished and recorded its outcome")
 	return nil

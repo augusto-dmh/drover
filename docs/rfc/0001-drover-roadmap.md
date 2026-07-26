@@ -22,7 +22,7 @@ The founding research fleet (`docs/research/2026-07-22/`, synthesized in `synthe
 |---|---|---|
 | **A — Walking skeleton** | `jobs` table + migrations; `Client.Insert`/`InsertTx` with typed args (`JobArgs`, `Worker[T]`, registry); single worker loop with `FOR UPDATE SKIP LOCKED`; job states | Transactional enqueue, generics API, sqlc/pgx |
 | **B — Reliability core** | Retries with `attempt^4` ±10% jitter; `max_attempts` → dead state; lease/heartbeat + rescuer; `Cancel`/`Snooze` sentinels | Crash recovery, error classification |
-| **C — Concurrency** | Per-queue worker pools; fetcher→workers via channels; `Start(ctx)`/`Stop(ctx)` graceful shutdown (stop-fetch → drain → cancel → requeue); `-race` CI; example app | Goroutine topology, cancellation hierarchies |
+| **C — Concurrency** | Worker pool (one pool, shaped so a per-queue split is an extension — named queues arrive in D); fetcher→workers via channels; `Start(ctx)`/`Stop(ctx)` graceful shutdown (stop-fetch → drain → cancel → requeue); `-race` CI; example app | Goroutine topology, cancellation hierarchies |
 | **D — Middleware + scheduling** | `func(Handler) Handler` chain; logging + timeout middleware; `ScheduledAt`; named queues with weighted priorities | Decorator chain, weighted fetch |
 | **E — Observability** | Prometheus: oldest-job-age + depth gauges, processed/failed counters, duration histograms; `/healthz`, `/readyz`; ops port | Metrics that don't hammer the DB |
 | **F — CLI + introspection** | `drover` binary: `stats`, `jobs list`, `retry`, `cancel`, `enqueue`; exported `Inspector` API; GoReleaser | CLI-first operability |

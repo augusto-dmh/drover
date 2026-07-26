@@ -42,12 +42,12 @@ func (SendEmail) Kind() string { return "send_email" }
 // Worker
 drover.Register(workers, &EmailWorker{}) // implements drover.Worker[SendEmail]
 
-// Enqueue atomically with your own writes
-err := client.InsertTx(ctx, tx, SendEmail{To: user.Email, Template: "welcome"})
-
-// Concurrency sizes the worker pool; it defaults to 10 and may safely
-// exceed the database pool's connection count.
+// Concurrency sizes the worker pool; it defaults to 10. A running job
+// holds no connection, so it need not match the database pool's size.
 client, err := drover.NewClient(pool, drover.Config{Workers: workers, Concurrency: 8})
+
+// Enqueue atomically with your own writes
+err = client.InsertTx(ctx, tx, SendEmail{To: user.Email, Template: "welcome"})
 
 // Start returns once the pool is running. Stop stops claiming, drains
 // in-flight jobs within the given budget, and returns nil once every

@@ -32,8 +32,10 @@ DATABASE_URL="postgres://postgres:drover@localhost:5432/postgres" \
 - **Concurrent delivery**: with `Concurrency: 4`, delivered lines for
   different recipients interleave rather than appearing one at a time.
 - **Retries**: a flaky recipient's job fails once, drover schedules a
-  retry roughly a second later (`ExponentialRetryPolicy`'s attempt¹
-  wait), and a `delivered ... attempt 2` line follows shortly after the
+  retry roughly a second later (`ExponentialRetryPolicy` waits attempt⁴
+  seconds, so one second after the first attempt — the second retry
+  would wait sixteen), and a `delivered ... attempt 2` line follows
+  shortly after the
   matching failure log.
 - **Shutdown**: press Ctrl-C. The program stops claiming new jobs
   immediately, waits up to 30 seconds for whatever is already running to

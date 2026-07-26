@@ -66,13 +66,22 @@ type Config struct {
 	// Concurrency is how many jobs this client executes at once. It
 	// defaults to ten; a value of zero or less is treated as unset.
 	//
-	// It may safely exceed the connection count of the pool the client
-	// was built with. A running job holds no connection: drover takes one
-	// to claim the job and one to record its outcome, and the handler's
-	// own work happens in between, holding nothing. What a high
-	// concurrency does cost is handler-side resources — sockets, memory,
-	// load on whatever the handler talks to — so size it against those
-	// rather than against the database.
+	// It need not match the connection count of the pool the client was
+	// built with. A running job holds no connection: drover takes one to
+	// claim the job and one to record its outcome, and the handler's own
+	// work happens in between, holding nothing.
+	//
+	// That is not the same as the pool size being irrelevant. Claims and
+	// finalizations arrive in bursts — up to Concurrency workers can want
+	// a connection at the same instant — and the heartbeat competes for
+	// the same connections on a deadline of HeartbeatInterval. A renewal
+	// that cannot get a connection in time lets a lease lapse, which is
+	// how a slow database turns into a duplicated job. Leave the
+	// connection pool some headroom above the fetch loop, the heartbeat
+	// and the rescuer rather than sizing it to Concurrency exactly.
+	//
+	// The other cost of a high concurrency is handler-side: sockets,
+	// memory, and load on whatever the handler talks to.
 	Concurrency int
 
 	// LeaseDuration is how long a claimed job may run before the rescuer
