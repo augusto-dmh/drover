@@ -33,11 +33,12 @@ Durable, cross-cycle. Architecture-level decisions live in `docs/adr/`; entries 
 |---|---|---|---|
 | A — Walking skeleton | `cycle-a-walking-skeleton` | #1 | 2026-07-25 |
 | B — Reliability core | `cycle-b-reliability-core` | #3 | 2026-07-26 |
+| B — Lease ownership hardening (from #3 review) | — | #4 | 2026-07-26 |
 
 ## Handoff
 
-- **Active feature**: `cycle-b-reliability-core` — **COMPLETE, validation PASS**, review triaged (21 findings, none rejected; 19 fixed, 2 deferred by decision)
-- **Branch**: `feat/retries-leases-and-rescue`; unit + integration + lint green
-- **Deviation this cycle**: the loop/heartbeat/rescuer/supervisor phase was executed inline by the orchestrator rather than a phase worker, at the user's request. Verification and review were both independent fresh agents, so author ≠ verifier and author ≠ reviewer both held.
-- **Next**: the lease-ownership hardening work (`review-triage.md` findings 20 and 21) is on `fix/lease-ownership-and-clock`; once merged, Cycle C — concurrency — is next.
-- **After this cycle**: Cycle C — concurrency (per-queue worker pools, fetcher→workers channels, `Start`/`Stop` graceful shutdown). Cycle B's in-flight set, heartbeat and supervisor are built to accept N concurrent jobs unchanged, so the pool changes who calls `add`/`remove`, not what they mean.
+- **Last shipped**: the reliability core (#3) and its ownership hardening (#4). `main` is green: build, vet, unit, integration and lint, 113 test functions.
+- **How #3 went**: verification PASS after one fix iteration; review by six independent agents produced 21 findings, **none rejected** — 19 fixed in-cycle, 2 promoted to #4. The reasoning behind every verdict is in `features/cycle-b-reliability-core/review-triage.md`, which outlives the PR comments.
+- **Deviations to remember**: the loop/heartbeat/rescuer/supervisor phase of #3 was written inline by the orchestrator rather than a phase worker, at the user's request — but verification and review were both independent fresh agents, so author ≠ verifier and author ≠ reviewer held. #4 skipped the independent review stage entirely at the user's direction; its only adversarial check was orchestrator-run mutation testing of both fences.
+- **Known weak sensor** (worth strengthening if the area is touched again): the test asserting lease deadlines come from the database clock cannot prove skew handling, because the client and the test container share a host clock. A real sensor needs a container with a deliberately skewed clock.
+- **Next**: Cycle C — concurrency (per-queue worker pools, fetcher→workers channels, `Start`/`Stop` graceful shutdown). The in-flight set, heartbeat and supervisor already accept N concurrent jobs unchanged, so the pool changes who calls `add`/`remove`, not what they mean — and the ownership fence from #4 is what makes adding more concurrent workers safe.
