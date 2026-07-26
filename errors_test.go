@@ -49,6 +49,25 @@ func TestClassifyOutcomeReadsSentinelsThroughWrapping(t *testing.T) {
 			wantOutcome:  outcomeSnoozed,
 			wantDuration: 5 * time.Minute,
 		},
+		{
+			// A handler with nothing more specific to say still gets a
+			// cancellation, not an ordinary failure that burns attempts.
+			name:        "bare cancel is a cancellation",
+			err:         Cancel(nil),
+			wantOutcome: outcomeCancelled,
+		},
+		{
+			name:        "wrapped bare cancel is a cancellation",
+			err:         fmt.Errorf("giving up: %w", Cancel(nil)),
+			wantOutcome: outcomeCancelled,
+		},
+		{
+			// The exported sentinel is usable on its own; it just carries
+			// no wait, so the job comes back immediately.
+			name:        "bare snooze sentinel is a snooze with no wait",
+			err:         ErrSnoozed,
+			wantOutcome: outcomeSnoozed,
+		},
 	}
 
 	for _, tc := range tests {
@@ -81,6 +100,32 @@ func TestCancelRecordsTheReason(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "bad input") {
 		t.Errorf("message = %q, want it to state the reason", err)
+	}
+
+	// A worker with no more specific reason still produces something
+	// readable, since dispose writes this string into the job's errors.
+	bare := Cancel(nil)
+	if !errors.Is(bare, ErrCancelled) {
+		t.Errorf("Cancel(nil) = %v is not recognized as a cancellation", bare)
+	}
+	if !strings.Contains(bare.Error(), "drover:") {
+		t.Errorf("Cancel(nil) message = %q, want the package prefix", bare)
+	}
+}
+
+func TestSnoozeIsClassifiableFromOutsideThePackage(t *testing.T) {
+	t.Parallel()
+
+	// A user's middleware or wrapper handler can only meter or log
+	// outcomes if a deferral is recognizable without the unexported type,
+	// the way a cancellation already is.
+	err := fmt.Errorf("waiting on upstream: %w", Snooze(time.Minute))
+
+	if !errors.Is(err, ErrSnoozed) {
+		t.Errorf("error %v is not recognized as a snooze", err)
+	}
+	if errors.Is(err, ErrCancelled) {
+		t.Errorf("error %v was mistaken for a cancellation", err)
 	}
 }
 

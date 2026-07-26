@@ -114,6 +114,42 @@ func TestRescueSchedulesFromTheConfiguredRetryPolicy(t *testing.T) {
 	}
 }
 
+func TestStartSupervisesTheRescueSweep(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	mem := memdriver.New()
+	// Parked as a crashed worker would leave it, *before* the loop runs:
+	// nothing but a supervised sweep can move it on. Without this, every
+	// unit-level rescue test drives the sweep directly, and the only test
+	// that starts a real loop asserts a job is *not* rescued — which
+	// passes trivially if Start never launches the rescuer at all.
+	row := abandon(t, mem, "greet")
+
+	var runs atomic.Int32
+	ws := NewWorkers()
+	Register(ws, &funcWorker{fn: func(context.Context, *Job[greetArgs]) error {
+		runs.Add(1)
+		return nil
+	}})
+	h := startLoopWith(t, mem, mem, ws, func(cfg *Config) {
+		cfg.RetryPolicy = immediatePolicy{}
+		cfg.LeaseDuration = time.Minute
+		cfg.RescueInterval = 10 * time.Millisecond
+	})
+
+	waitFor(t, h.rowInState(row.ID, "completed"), "abandoned job to be rescued and re-run by the loop")
+	h.stop(t)
+
+	if got := runs.Load(); got != 1 {
+		t.Errorf("handler ran %d times, want 1", got)
+	}
+	stored, _ := mem.Row(row.ID)
+	// One attempt spent by the worker that died, one by the run that
+	// finished it — the rescue itself spends none.
+	if stored.Attempt != 2 {
+		t.Errorf("Attempt = %d, want 2", stored.Attempt)
+	}
+}
+
 func TestRescueKillsAbandonedJobAtItsAttemptCeiling(t *testing.T) {
 	t.Parallel()
 	mem := memdriver.New()

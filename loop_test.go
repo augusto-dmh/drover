@@ -59,7 +59,7 @@ func newTestLogger(w *syncWriter) *slog.Logger {
 // its whole attempt ladder without waiting out the real backoff.
 type immediatePolicy struct{}
 
-func (immediatePolicy) NextRetry(*JobRow) time.Time { return time.Now() }
+func (immediatePolicy) NextRetry(context.Context, *JobRow) time.Time { return time.Now() }
 
 // atTimePolicy always answers with the same instant, so a test can prove
 // the loop scheduled a retry from the configured policy and not from the
@@ -67,7 +67,7 @@ func (immediatePolicy) NextRetry(*JobRow) time.Time { return time.Now() }
 // consult it without a data race.
 type atTimePolicy struct{ at time.Time }
 
-func (p atTimePolicy) NextRetry(*JobRow) time.Time { return p.at }
+func (p atTimePolicy) NextRetry(context.Context, *JobRow) time.Time { return p.at }
 
 // cappedDriver hands out claimed rows with a lowered attempt ceiling, so
 // exhaustion is reachable in a test without burning 25 attempts.
@@ -556,6 +556,73 @@ func TestStartSchedulesRetryFromConfiguredPolicy(t *testing.T) {
 	stored, _ := mem.Row(row.ID)
 	if !stored.ScheduledAt.Equal(want) {
 		t.Errorf("ScheduledAt = %v, want the configured policy's answer %v", stored.ScheduledAt, want)
+	}
+}
+
+// recordingPolicy captures the row it was handed, so a test can assert
+// what the loop actually passes a user-supplied policy rather than only
+// what it does with the answer.
+type recordingPolicy struct {
+	mu   sync.Mutex
+	seen *JobRow
+}
+
+func (p *recordingPolicy) NextRetry(_ context.Context, job *JobRow) time.Time {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	clone := *job
+	p.seen = &clone
+	return time.Now().Add(time.Hour)
+}
+
+func (p *recordingPolicy) row() *JobRow {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.seen
+}
+
+func TestStartHandsTheFailedJobRowToTheRetryPolicy(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	mem := memdriver.New()
+	policy := &recordingPolicy{}
+	ws := NewWorkers()
+	Register(ws, &funcWorker{fn: func(context.Context, *Job[greetArgs]) error {
+		return errors.New("boom")
+	}})
+	h := startLoopWith(t, mem, mem, ws, func(cfg *Config) {
+		cfg.RetryPolicy = policy
+	})
+
+	row, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"})
+	if err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	waitFor(t, h.rowInState(row.ID, "retryable"), "failed job to be queued for retry")
+	h.stop(t)
+
+	// NextRetry's contract says the whole row is in scope so a policy can
+	// branch on it. Nothing else in the suite would notice if the loop
+	// passed a differently-shaped row.
+	seen := policy.row()
+	if seen == nil {
+		t.Fatal("retry policy was never consulted")
+	}
+	if seen.ID != row.ID {
+		t.Errorf("policy saw ID %d, want %d", seen.ID, row.ID)
+	}
+	if seen.Kind != "greet" {
+		t.Errorf("policy saw Kind %q, want greet", seen.Kind)
+	}
+	if seen.Queue != "default" {
+		t.Errorf("policy saw Queue %q, want default", seen.Queue)
+	}
+	if seen.MaxAttempts != 25 {
+		t.Errorf("policy saw MaxAttempts %d, want 25", seen.MaxAttempts)
+	}
+	// The attempt being scheduled for, not the one before it — a policy
+	// computing a backoff curve reads this directly.
+	if seen.Attempt != 1 {
+		t.Errorf("policy saw Attempt %d, want 1", seen.Attempt)
 	}
 }
 

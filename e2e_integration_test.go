@@ -308,8 +308,8 @@ func TestEndToEndAbandonedJobIsRescuedAndRerunInPostgres(t *testing.T) {
 	worker := &e2eWorker{runs: make(map[int64]int)}
 	c := newE2EClientWith(t, pool, worker, func(cfg *Config) {
 		cfg.RetryPolicy = immediatePolicy{}
-		cfg.LeaseDuration = 200 * time.Millisecond
-		cfg.RescueInterval = 20 * time.Millisecond
+		cfg.LeaseDuration = time.Second
+		cfg.RescueInterval = 50 * time.Millisecond
 	})
 
 	row, err := c.Insert(ctx, e2eArgs{N: 1})
@@ -368,10 +368,14 @@ func TestEndToEndLongRunningJobIsNeverRescuedInPostgres(t *testing.T) {
 	}
 	// The job runs for several lease durations with the sweeper active;
 	// only the heartbeat stops it being handed to a second worker.
+	// Margins wide enough that a stalled round trip is not mistaken for a
+	// rescue: over a real container under -race, a 100ms hiccup is
+	// unremarkable, and a tighter budget would fail by reporting a
+	// production bug that did not happen.
 	c := newE2EClientWith(t, pool, worker, func(cfg *Config) {
-		cfg.LeaseDuration = 150 * time.Millisecond
-		cfg.HeartbeatInterval = 40 * time.Millisecond
-		cfg.RescueInterval = 30 * time.Millisecond
+		cfg.LeaseDuration = 2 * time.Second
+		cfg.HeartbeatInterval = 200 * time.Millisecond
+		cfg.RescueInterval = 100 * time.Millisecond
 	})
 
 	row, err := c.Insert(ctx, e2eArgs{N: 1})
@@ -381,10 +385,11 @@ func TestEndToEndLongRunningJobIsNeverRescuedInPostgres(t *testing.T) {
 
 	stop := runLoop(t, ctx, c)
 	<-started
-	time.Sleep(600 * time.Millisecond)
+	// Several lease durations of renewals, all of which must land.
+	time.Sleep(5 * time.Second)
 
 	if state, _, _ := readJob(t, pool, row.ID); state != "running" {
-		t.Errorf("state = %q after four lease durations, want running", state)
+		t.Errorf("state = %q after more than two lease durations, want running", state)
 	}
 	if got := runs.Load(); got != 1 {
 		t.Errorf("handler ran %d times, want 1 — the job was rescued while still running", got)

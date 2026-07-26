@@ -1,6 +1,7 @@
 package drover
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -17,7 +18,7 @@ type fixedPolicy struct {
 	calls int
 }
 
-func (p *fixedPolicy) NextRetry(*JobRow) time.Time {
+func (p *fixedPolicy) NextRetry(context.Context, *JobRow) time.Time {
 	p.calls++
 	return p.at
 }
@@ -25,7 +26,7 @@ func (p *fixedPolicy) NextRetry(*JobRow) time.Time {
 // panicPolicy stands in for an adopter's policy with a bug in it.
 type panicPolicy struct{}
 
-func (panicPolicy) NextRetry(*JobRow) time.Time { panic("policy exploded") }
+func (panicPolicy) NextRetry(context.Context, *JobRow) time.Time { panic("policy exploded") }
 
 func discardLogger() *slog.Logger { return slog.New(slog.DiscardHandler) }
 
@@ -47,7 +48,7 @@ func sampleDelays(attempt, n int) (over, under []time.Duration) {
 	job := &JobRow{Attempt: attempt}
 	for range n {
 		before := time.Now()
-		at := ExponentialRetryPolicy{}.NextRetry(job)
+		at := ExponentialRetryPolicy{}.NextRetry(context.Background(), job)
 		after := time.Now()
 		over = append(over, at.Sub(before))
 		under = append(under, at.Sub(after))
@@ -146,7 +147,7 @@ func TestRetryAtSchedulesAtThePolicysAnswer(t *testing.T) {
 			t.Parallel()
 			policy := &fixedPolicy{at: tc.answer}
 
-			got := retryAt(discardLogger(), policy, &JobRow{ID: 7, Attempt: 3}, now)
+			got := retryAt(context.Background(), discardLogger(), policy, &JobRow{ID: 7, Attempt: 3}, now)
 
 			if !got.Equal(tc.want) {
 				t.Errorf("retryAt = %v, want %v", got, tc.want)
@@ -168,7 +169,7 @@ func TestRetryAtFallsBackToDefaultWhenPolicyPanics(t *testing.T) {
 	job := &JobRow{ID: 7, Kind: "greet", Attempt: 3}
 
 	now := time.Now()
-	got := retryAt(slog.New(slog.NewTextHandler(logs, nil)), panicPolicy{}, job, now)
+	got := retryAt(context.Background(), slog.New(slog.NewTextHandler(logs, nil)), panicPolicy{}, job, now)
 	after := time.Now()
 
 	lower, upper := jitterBounds(job.Attempt)
@@ -200,7 +201,7 @@ func TestSuppliedRetryPolicyReplacesTheDefault(t *testing.T) {
 
 	c := newClient(memdriver.New(), Config{RetryPolicy: policy})
 
-	if c.retryPolicy != policy {
+	if c.retryPolicy != RetryPolicy(policy) {
 		t.Fatalf("retry policy = %v, want the supplied policy", c.retryPolicy)
 	}
 }
