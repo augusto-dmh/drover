@@ -13,7 +13,13 @@ WHERE id IN (
     WHERE j.state IN ('available', 'retryable', 'scheduled')
       AND j.queue = sqlc.arg(queue)
       AND j.scheduled_at <= now()
-    ORDER BY j.id
+    -- Ordered by the index's own key, not by id: with queue as an
+    -- equality and scheduled_at as a range, the index yields rows in
+    -- (scheduled_at, id) order, so ordering by id alone would force
+    -- every due row to be read and sorted before LIMIT could take one.
+    -- Due-time order is also the more correct claim order — a retry that
+    -- came due first should be picked up first.
+    ORDER BY j.scheduled_at, j.id
     LIMIT sqlc.arg(max_jobs)
     FOR UPDATE SKIP LOCKED
 )
@@ -30,7 +36,10 @@ WHERE id IN (
     SELECT j.id FROM drover_jobs j
     WHERE j.state = 'running'
       AND j.leased_until <= now()
-    ORDER BY j.id
+    -- Oldest lease first, matching the lease index so the batch is taken
+    -- without sorting every abandoned row — and recovering the
+    -- longest-stranded jobs first.
+    ORDER BY j.leased_until, j.id
     LIMIT sqlc.arg(max_jobs)
     FOR UPDATE SKIP LOCKED
 )

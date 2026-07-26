@@ -6,6 +6,7 @@
 package memdriver
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -64,14 +65,15 @@ func waiting(state string) bool {
 	return state == "available" || state == "retryable" || state == "scheduled"
 }
 
-// FetchAvailable claims up to limit due jobs in id order: each becomes
-// running with an incremented attempt and a lease running to leaseUntil.
+// FetchAvailable claims up to limit due jobs, earliest due time first:
+// each becomes running with an incremented attempt and a lease running
+// to leaseUntil.
 func (d *Driver) FetchAvailable(_ context.Context, queue string, leaseUntil time.Time, limit int) ([]*driver.JobRow, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
 	now := time.Now()
-	due := d.selectRows(func(row *driver.JobRow) bool {
+	due := d.selectRows(byScheduledAt, func(row *driver.JobRow) bool {
 		return waiting(row.State) && row.Queue == queue && !row.ScheduledAt.After(now)
 	})
 
@@ -90,14 +92,15 @@ func (d *Driver) FetchAvailable(_ context.Context, queue string, leaseUntil time
 }
 
 // FetchExpired re-claims up to limit running jobs whose lease has
-// passed, giving each a fresh lease that runs to leaseUntil. attempt is
-// deliberately left alone: the attempt that stranded the row was spent.
+// passed, oldest lease first, giving each a fresh lease that runs to
+// leaseUntil. attempt is deliberately left alone: the attempt that
+// stranded the row was spent.
 func (d *Driver) FetchExpired(_ context.Context, leaseUntil time.Time, limit int) ([]*driver.JobRow, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
 	now := time.Now()
-	expired := d.selectRows(func(row *driver.JobRow) bool {
+	expired := d.selectRows(byLeasedUntil, func(row *driver.JobRow) bool {
 		return row.State == "running" && row.LeasedUntil != nil && !row.LeasedUntil.After(now)
 	})
 
@@ -130,9 +133,15 @@ func (d *Driver) ExtendLeases(_ context.Context, ids []int64, until time.Time) e
 	return nil
 }
 
-// selectRows returns the stored rows matching keep, in id order. The
-// caller must hold d.mu; the rows are live pointers, not copies.
-func (d *Driver) selectRows(keep func(*driver.JobRow) bool) []*driver.JobRow {
+// selectRows returns the stored rows matching keep, ordered by order and
+// then by id. The caller must hold d.mu; the rows are live pointers, not
+// copies.
+//
+// The order matters for parity, not for tidiness: it decides which rows
+// a limited fetch picks, so it has to be the order the Postgres driver's
+// query asks for, or the two drivers claim different jobs from the same
+// queue and the in-memory suite stops proving anything about production.
+func (d *Driver) selectRows(order func(*driver.JobRow) time.Time, keep func(*driver.JobRow) bool) []*driver.JobRow {
 	var rows []*driver.JobRow
 	for _, row := range d.jobs {
 		if keep(row) {
@@ -140,9 +149,25 @@ func (d *Driver) selectRows(keep func(*driver.JobRow) bool) []*driver.JobRow {
 		}
 	}
 	slices.SortFunc(rows, func(a, b *driver.JobRow) int {
-		return int(a.ID - b.ID)
+		if c := order(a).Compare(order(b)); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.ID, b.ID)
 	})
 	return rows
+}
+
+// byScheduledAt orders waiting jobs the way the claim does: due time
+// first, ties broken by id.
+func byScheduledAt(row *driver.JobRow) time.Time { return row.ScheduledAt }
+
+// byLeasedUntil orders running jobs oldest-lease-first, the way the
+// rescue sweep does. A row reaches the sweep only with a lease set.
+func byLeasedUntil(row *driver.JobRow) time.Time {
+	if row.LeasedUntil == nil {
+		return time.Time{}
+	}
+	return *row.LeasedUntil
 }
 
 // MarkCompleted finalizes a running job as completed.

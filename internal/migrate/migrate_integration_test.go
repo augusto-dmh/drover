@@ -50,9 +50,9 @@ func assertFetchAndLeaseIndexes(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
 	defs := indexDefs(t, pool)
 
-	fetch, ok := defs["drover_jobs_fetch_idx"]
+	fetch, ok := defs["drover_jobs_fetch_v2_idx"]
 	if !ok {
-		t.Fatalf("drover_jobs_fetch_idx missing; indexes present: %v", slices.Sorted(maps.Keys(defs)))
+		t.Fatalf("drover_jobs_fetch_v2_idx missing; indexes present: %v", slices.Sorted(maps.Keys(defs)))
 	}
 	for _, state := range []string{"available", "retryable", "scheduled"} {
 		if !strings.Contains(fetch, state) {
@@ -62,6 +62,16 @@ func assertFetchAndLeaseIndexes(t *testing.T, pool *pgxpool.Pool) {
 	if strings.Contains(fetch, "running") {
 		t.Errorf("fetch index covers running jobs, which are never claimable: %s", fetch)
 	}
+	// The claim orders by due time, so the index has to lead with it or
+	// the LIMIT cannot stop the scan early.
+	if !strings.Contains(fetch, "queue, scheduled_at, id") {
+		t.Errorf("fetch index key does not match the claim's ordering: %s", fetch)
+	}
+	// The superseded index must be gone, or every write pays to maintain
+	// an index nothing reads.
+	if _, stale := defs["drover_jobs_fetch_idx"]; stale {
+		t.Errorf("superseded fetch index still present: %v", slices.Sorted(maps.Keys(defs)))
+	}
 
 	lease, ok := defs["drover_jobs_lease_idx"]
 	if !ok {
@@ -69,6 +79,11 @@ func assertFetchAndLeaseIndexes(t *testing.T, pool *pgxpool.Pool) {
 	}
 	if !strings.Contains(lease, "leased_until") || !strings.Contains(lease, "running") {
 		t.Errorf("lease index does not serve a sweep of expired running leases: %s", lease)
+	}
+	// The sweep takes its batch oldest-lease-first; carrying id lets that
+	// come from the index alone.
+	if !strings.Contains(lease, "leased_until, id") {
+		t.Errorf("lease index key does not match the sweep's ordering: %s", lease)
 	}
 }
 
