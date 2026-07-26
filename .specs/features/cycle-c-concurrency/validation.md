@@ -2,7 +2,9 @@
 
 **Date**: 2026-07-26
 **Spec**: `.specs/features/cycle-c-concurrency/spec.md`
-**Diff range**: `main..HEAD` on `feat/worker-pool-and-graceful-shutdown` (13 commits, `4772040`..`3461797`)
+**Diff range**: `main..HEAD` on `feat/worker-pool-and-graceful-shutdown`, verified at `4772040`..`3461797` (13 commits).
+
+> **Scope note (added after the fact).** Commits landing after that verification are *not* covered by the PASS above: `cf88ddb` (this report), `2a5c4b4` (a dependency bump clearing a published advisory), and the commits answering the independent review of PR #6. Their evidence is the review triage in `review-triage.md` plus a re-run of every gate; the mutation results below were not re-derived for them.
 **Verifier**: independent sub-agent (author ≠ verifier), read-only over the implementation
 **Iteration**: 3 (final pass, focused on the one open Major finding)
 
@@ -121,7 +123,7 @@ sensor.
 | AC2 Migrates, registers, enqueues, pool > 1 | `examples/email/main.go:88,93,103,35` — inspection only | ⚠️ Within the spec's stated bar |
 | AC3 Simulated failure → ordinary retry, visible in output | `examples/email/delivery_test.go:103`; `main.go:57,142` | ✅ PASS |
 | AC4 SIGINT → bounded `Stop`, reports what drained | `examples/email/main.go:112-124` — inspection only | ⚠️ Within the spec's stated bar |
-| AC5 No new module dependency | `git diff main...HEAD -- go.mod go.sum` empty | ✅ PASS |
+| AC5 No new module dependency | The example adds none. Evidence restated: `go.mod` was untouched as of `3461797`; it later gained version bumps of two already-required *indirect* packages (`golang.org/x/text` for a published advisory, `golang.org/x/sync` carried along by `go mod tidy`). No new direct dependency, and nothing the example imports. | ✅ PASS |
 
 **Status**: **34/34 ACs matched their spec-defined outcome.** 0 hard gaps; 2 inspection-only P2
 criteria, explicitly within the spec's own Independent Test bar.
