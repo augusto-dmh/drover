@@ -10,6 +10,20 @@ import (
 // returns an empty string.
 var ErrInvalidKind = errors.New("drover: job kind must be non-empty")
 
+// ErrAlreadyStarted is returned by Start when the client is already
+// running or has already been stopped. A client's lifecycle runs once.
+var ErrAlreadyStarted = errors.New("drover: client already started")
+
+// ErrNotStarted is returned by Stop when the client was never started.
+var ErrNotStarted = errors.New("drover: client not started")
+
+// ErrDrainIncomplete is wrapped by the error Stop returns when its
+// budget ran out before every job finished. The jobs it names were
+// returned to the queue and may run again elsewhere while the handlers
+// this process abandoned are still running — the at-least-once contract
+// showing through at the one moment it is most visible.
+var ErrDrainIncomplete = errors.New("drover: shutdown deadline reached")
+
 // ErrCancelled is wrapped by every error Cancel returns. Workers do
 // not return it directly; drover recognizes a cancellation with
 // errors.Is, so a worker may add its own context with %w and still be

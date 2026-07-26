@@ -126,21 +126,27 @@ func startLoopWith(t *testing.T, drv driver.Driver, mem *memdriver.Driver, worke
 	c := newClient(drv, cfg)
 	ctx, cancel := context.WithCancel(context.Background())
 	h := &loopHarness{mem: mem, client: c, logs: logs, cancel: cancel, done: make(chan error, 1)}
-	go func() { h.done <- c.Start(ctx) }()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	// Start no longer blocks for the pool's lifetime, so the harness
+	// mirrors the shutdown onto done: a test cancels, then watches the
+	// shutdown finish, exactly as it did when Start returned at the end.
+	go func() { <-ctx.Done(); h.done <- c.Stop(context.WithoutCancel(ctx)) }()
 	return h
 }
 
-// stop cancels the loop and asserts it returns nil promptly.
+// stop cancels the pool and asserts the shutdown completes cleanly.
 func (h *loopHarness) stop(t *testing.T) {
 	t.Helper()
 	h.cancel()
 	select {
 	case err := <-h.done:
 		if err != nil {
-			t.Fatalf("Start returned %v, want nil", err)
+			t.Fatalf("shutdown returned %v, want nil", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("Start did not return after cancellation")
+		t.Fatal("shutdown did not complete after cancellation")
 	}
 }
 
@@ -787,19 +793,15 @@ func TestStartKeepsPollingWhileIdle(t *testing.T) {
 		PollInterval: 30 * time.Millisecond,
 	})
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- c.Start(ctx) }()
+	defer cancel()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
 
 	const window = 150 * time.Millisecond
 	time.Sleep(window)
-	cancel()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("Start returned %v, want nil", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("Start did not return after cancellation")
+	if err := c.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop returned %v, want nil", err)
 	}
 
 	fetches := counting.fetches.Load()

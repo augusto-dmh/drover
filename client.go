@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -106,6 +107,13 @@ type Client struct {
 	rescueInterval    time.Duration
 	concurrency       int
 	inflight          *inflightSet
+
+	// mu guards runner, which is nil until Start and holds the running
+	// pool thereafter. It is the whole of the client's lifecycle state:
+	// everything else above is configuration and is never written after
+	// construction.
+	mu     sync.Mutex
+	runner *runner
 }
 
 // NewClient returns a Client backed by the given PostgreSQL pool.

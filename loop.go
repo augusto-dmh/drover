@@ -7,79 +7,73 @@ import (
 	"fmt"
 	"runtime/debug"
 	"slices"
-	"sync"
 	"time"
 
 	"github.com/augusto-dmh/drover/internal/driver"
 )
 
-// Start runs the worker loop until ctx is cancelled: claim one due job,
-// execute its registered worker, finalize the row, repeat. On
-// cancellation it stops fetching, lets the in-flight job finish, and
-// returns nil. A worker killed mid-job (crash, SIGKILL) leaves its job
-// running until its lease expires and the rescuer returns it to the
-// queue; clean shutdown loses nothing.
+// Start begins working the queue and returns as soon as the pool is
+// running — it does not block for the lifetime of the client. Jobs are
+// executed by a fixed pool of Config.Concurrency goroutines fed by a
+// single fetch loop, which claims only as many jobs as there are idle
+// workers.
+//
+// Shutdown is Stop's job. Cancelling ctx performs the same shutdown on
+// its own, with no deadline, so a client wired to a cancellable context
+// still drains cleanly without anyone calling Stop; what Stop adds is
+// the ability to bound the wait and to learn what did not finish.
+//
+// A client's lifecycle runs once. Calling Start on a client that is
+// already running, or that has already been stopped, returns
+// ErrAlreadyStarted.
+//
+// A worker killed mid-job (crash, SIGKILL) leaves its job running until
+// its lease expires and the rescuer returns it to the queue. That is the
+// backstop for the paths no shutdown code survives; a clean shutdown
+// loses nothing.
 func (c *Client) Start(ctx context.Context) error {
-	c.logger.Info("drover: worker loop started",
-		"queue", defaultQueue, "poll_interval", c.pollInterval,
-		"lease_duration", c.leaseDuration, "heartbeat_interval", c.heartbeatInterval,
-		"rescue_interval", c.rescueInterval)
+	c.mu.Lock()
+	if c.runner != nil {
+		c.mu.Unlock()
+		return ErrAlreadyStarted
+	}
+	r := newRunner(ctx, c)
+	c.runner = r
+	c.mu.Unlock()
 
-	// The heartbeat is stopped by closing a channel after the fetch loop
-	// returns, rather than by cancelling ctx: a cancelled loop is still
-	// draining its last job, and dropping that job's lease mid-drain
-	// would invite the rescuer to hand out a duplicate on every clean
-	// shutdown (AD-018).
-	stopHeartbeat := make(chan struct{})
-	var background sync.WaitGroup
-	background.Add(2)
-	go func() {
-		defer background.Done()
-		c.heartbeat(stopHeartbeat)
-	}()
-	// The rescuer holds no work of its own, so cancellation stops it
-	// outright while the fetch loop is still draining.
-	go func() {
-		defer background.Done()
-		c.rescueLoop(ctx)
-	}()
+	c.logger.Info("drover: worker pool started",
+		"queue", r.queue, "concurrency", r.concurrency,
+		"poll_interval", c.pollInterval, "lease_duration", c.leaseDuration,
+		"heartbeat_interval", c.heartbeatInterval, "rescue_interval", c.rescueInterval)
 
-	c.fetchLoop(ctx)
-
-	close(stopHeartbeat)
-	background.Wait()
-
-	c.logger.Info("drover: worker loop stopped")
+	r.start(ctx)
 	return nil
 }
 
-// fetchLoop claims and runs one job at a time until ctx is cancelled.
-func (c *Client) fetchLoop(ctx context.Context) {
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-		rows, err := c.drv.FetchAvailable(ctx, defaultQueue, c.leaseDuration, 1)
-		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			c.logger.Error("drover: fetch jobs", "error", err)
-			if !c.sleep(ctx) {
-				return
-			}
-			continue
-		}
-		if len(rows) == 0 {
-			if !c.sleep(ctx) {
-				return
-			}
-			continue
-		}
-		// The in-flight job is never interrupted by loop shutdown; the
-		// loop exits only after finalize.
-		c.runJob(context.WithoutCancel(ctx), rows[0])
+// Stop shuts the pool down and waits for it, in that order: it stops
+// claiming new work, then waits for everything already claimed to finish
+// and record its outcome. It returns nil when all of it did.
+//
+// ctx bounds the wait. When that budget runs out, Stop cancels the
+// contexts the running handlers were given, returns the jobs it could
+// not finish to the queue so another worker can take them, and reports
+// how many there were. Handlers that ignore cancellation keep running
+// regardless — Go offers no way to stop a goroutine — which is why the
+// answer is a count rather than a guarantee. Those jobs are at-least-once
+// delivery working as documented: they were returned to the queue and may
+// well run twice.
+//
+// A ctx with no deadline waits as long as it takes. Stop before Start
+// returns ErrNotStarted; calling it again returns the first call's
+// verdict.
+func (c *Client) Stop(ctx context.Context) error {
+	c.mu.Lock()
+	r := c.runner
+	c.mu.Unlock()
+	if r == nil {
+		return ErrNotStarted
 	}
+	return r.stop(ctx)
 }
 
 // runJob executes one claimed job and records what became of it.
@@ -244,17 +238,4 @@ func (c *Client) writeFailed(row *driver.JobRow, err error) {
 	}
 	c.logger.Error("drover: finalize job",
 		"job_id", row.ID, "kind", row.Kind, "error", err)
-}
-
-// sleep waits one poll interval; it returns false when ctx was
-// cancelled instead.
-func (c *Client) sleep(ctx context.Context) bool {
-	timer := time.NewTimer(c.pollInterval)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return false
-	case <-timer.C:
-		return true
-	}
 }
