@@ -49,9 +49,9 @@
 // the job was already spent.
 //
 // The lease therefore bounds how long abandoned work sits idle after a
-// SIGKILL or a lost node. Clean shutdown does not rely on it: cancelling
-// the context passed to Start stops fetching and drains the in-flight
-// job first, keeping its lease alive until it finishes.
+// SIGKILL or a lost node. Clean shutdown does not rely on it: Stop stops
+// fetching and drains in-flight jobs first, keeping their leases alive
+// until they finish.
 //
 // A claim is held under a lease naming both the job and the attempt, and
 // every state change is checked against it. A worker starved of
@@ -66,10 +66,38 @@
 // lease means the same thing to every worker regardless of what their
 // own clocks say.
 //
+// # Concurrency and shutdown
+//
+// Jobs run on a fixed pool of Config.Concurrency goroutines, fed by a
+// single fetch loop that claims no more rows than there are idle
+// workers. The pool may safely be sized well above the database
+// connection count: a job holds a connection only while it is claimed
+// and while its outcome is recorded, not for the work in between.
+//
+// Start(ctx) returns as soon as the pool is running rather than
+// blocking for the client's lifetime. Calling it twice, or calling it
+// again after Stop, returns ErrAlreadyStarted — a client's lifecycle
+// runs once. Cancelling ctx begins the same shutdown Stop performs, with
+// no deadline, so a client wired to a cancellable context still drains
+// cleanly with nobody calling Stop.
+//
+// Stop(ctx) stops claiming new work, then waits for everything already
+// claimed to finish and record its outcome, returning nil once all of
+// it has. ctx bounds that wait. When the budget runs out, Stop cancels
+// the contexts running handlers were given, returns the jobs it could
+// not finish to the queue so another worker can pick them up, and
+// returns an error wrapping ErrDrainIncomplete naming how many there
+// were. A non-nil Stop error is at-least-once delivery showing through
+// at its most visible: those jobs are claimable again immediately — the
+// requeue does not spend their attempt — and because Go offers no way to
+// force a goroutine to stop, the handler this process abandoned may
+// still be running, so the job can genuinely execute twice. Stop before
+// Start returns ErrNotStarted; calling it again returns the first call's
+// verdict without blocking.
+//
 // # Current limitations
 //
-// This version runs a single worker goroutine per Start call; pooled
-// concurrency, a Stop method with a drain deadline, named queues and
-// caller-supplied schedules arrive in the next cycles of docs/rfc/0001
-// in the repository.
+// Named queues, weighted per-queue priorities, per-job timeout
+// middleware, and metrics are not implemented yet; they arrive in later
+// cycles of docs/rfc/0001 in the repository.
 package drover
