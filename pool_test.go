@@ -45,7 +45,7 @@ func insertN(t *testing.T, c *Client, n int) []int64 {
 	return ids
 }
 
-func countInState(t *testing.T, mem *memdriver.Driver, ids []int64, state string) int {
+func countMemRows(t *testing.T, mem *memdriver.Driver, ids []int64, state string) int {
 	t.Helper()
 	n := 0
 	for _, id := range ids {
@@ -137,7 +137,7 @@ func TestPoolClaimsNoMoreJobsThanItCanRun(t *testing.T) {
 	// Every worker is now blocked. Give the fetch loop ample opportunity
 	// to over-claim, then prove it did not.
 	time.Sleep(50 * time.Millisecond)
-	if running := countInState(t, mem, ids, "running"); running != concurrency {
+	if running := countMemRows(t, mem, ids, "running"); running != concurrency {
 		t.Errorf("running rows = %d, want %d — the pool claimed jobs it had no worker for", running, concurrency)
 	}
 
@@ -172,7 +172,7 @@ func TestPoolRunsEachJobExactlyOnce(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 	waitFor(t, func() bool {
-		return countInState(t, mem, ids, "completed") == queued
+		return countMemRows(t, mem, ids, "completed") == queued
 	}, "every job to complete")
 	if err := c.Stop(context.Background()); err != nil {
 		t.Fatalf("Stop returned %v, want nil", err)
@@ -354,7 +354,7 @@ func TestCancellingStartsContextShutsThePoolDownOnItsOwn(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("job never ran")
 	}
-	waitFor(t, func() bool { return countInState(t, mem, ids, "completed") == 1 }, "the job to be finalized")
+	waitFor(t, func() bool { return countMemRows(t, mem, ids, "completed") == 1 }, "the job to be finalized")
 
 	// Nothing calls Stop from here on.
 	cancel()
@@ -709,7 +709,7 @@ func TestSurplusClaimedJobsAreReturnedImmediately(t *testing.T) {
 	// The driver claimed all three; only one has a worker. Give the pool
 	// every chance to sit on the other two, then prove it did not.
 	time.Sleep(50 * time.Millisecond)
-	if running := countInState(t, mem, ids, "running"); running != 1 {
+	if running := countMemRows(t, mem, ids, "running"); running != 1 {
 		t.Errorf("running rows = %d, want 1 — the pool is holding jobs no worker can run", running)
 	}
 	for _, id := range ids {
