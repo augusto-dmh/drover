@@ -19,6 +19,12 @@ const (
 	defaultQueue        = "default"
 	defaultPollInterval = time.Second
 
+	// defaultConcurrency is how many jobs one client runs at once when
+	// the caller does not say. It is deliberately not one: a queue that
+	// executes serially by default makes throughput a property of the
+	// slowest handler rather than a choice.
+	defaultConcurrency = 10
+
 	// heartbeatsPerLease is how many renewals fit in one lease by
 	// default. Three leaves two beats of slack: a job survives a missed
 	// renewal without the rescuer taking it away.
@@ -56,6 +62,18 @@ type Config struct {
 	PollInterval time.Duration
 	RetryPolicy  RetryPolicy
 
+	// Concurrency is how many jobs this client executes at once. It
+	// defaults to ten; a value of zero or less is treated as unset.
+	//
+	// It may safely exceed the connection count of the pool the client
+	// was built with. A running job holds no connection: drover takes one
+	// to claim the job and one to record its outcome, and the handler's
+	// own work happens in between, holding nothing. What a high
+	// concurrency does cost is handler-side resources — sockets, memory,
+	// load on whatever the handler talks to — so size it against those
+	// rather than against the database.
+	Concurrency int
+
 	// LeaseDuration is how long a claimed job may run before the rescuer
 	// treats its worker as dead. It bounds how long work sits idle after
 	// a crash, so a shorter lease recovers faster and a longer one
@@ -86,6 +104,7 @@ type Client struct {
 	leaseDuration     time.Duration
 	heartbeatInterval time.Duration
 	rescueInterval    time.Duration
+	concurrency       int
 	inflight          *inflightSet
 }
 
@@ -109,6 +128,7 @@ func newClient(drv driver.Driver, cfg Config) *Client {
 		leaseDuration:     cfg.LeaseDuration,
 		heartbeatInterval: cfg.HeartbeatInterval,
 		rescueInterval:    cfg.RescueInterval,
+		concurrency:       cfg.Concurrency,
 		inflight:          newInflightSet(),
 	}
 	if c.workers == nil {
@@ -146,6 +166,9 @@ func newClient(drv driver.Driver, cfg Config) *Client {
 	}
 	if c.rescueInterval <= 0 {
 		c.rescueInterval = c.leaseDuration
+	}
+	if c.concurrency <= 0 {
+		c.concurrency = defaultConcurrency
 	}
 	return c
 }

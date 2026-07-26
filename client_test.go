@@ -140,6 +140,36 @@ func TestConfigZeroValuesGetDefaults(t *testing.T) {
 	if c.inflight == nil {
 		t.Error("in-flight set is nil, want an empty set")
 	}
+	if c.concurrency != 10 {
+		t.Errorf("Concurrency default = %d, want 10", c.concurrency)
+	}
+}
+
+func TestConcurrencyConfigFallsBackToTheDefault(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		cfg  Config
+		want int
+	}{
+		{name: "zero is treated as unset", cfg: Config{Concurrency: 0}, want: 10},
+		{name: "negative is treated as unset", cfg: Config{Concurrency: -4}, want: 10},
+		{name: "one is honoured, not mistaken for unset", cfg: Config{Concurrency: 1}, want: 1},
+		{name: "an explicit value is kept", cfg: Config{Concurrency: 64}, want: 64},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			c := newClient(memdriver.New(), tt.cfg)
+
+			if c.concurrency != tt.want {
+				t.Errorf("concurrency = %d, want %d", c.concurrency, tt.want)
+			}
+		})
+	}
 }
 
 func TestTimingConfigFallsBackToUsableValues(t *testing.T) {
