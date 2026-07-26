@@ -82,7 +82,18 @@ func (c *Client) fetchLoop(ctx context.Context) {
 	}
 }
 
-func (c *Client) runJob(ctx context.Context, row *driver.JobRow) {
+// runJob executes one claimed job and records what became of it.
+//
+// jobCtx is the handler's context and may be cancelled: that is how a
+// shutdown that has run out of patience reaches a job already running.
+// The context every state change is written under is derived from it
+// with cancellation stripped, and the distinction is load-bearing.
+// Finalizing on a cancelled context would fail every write the moment
+// shutdown escalated, leaving each of those rows running until its lease
+// lapsed — turning the one path that is supposed to end cleanly into the
+// crash path. The handler's context may be cancelled; the context that
+// records an outcome never is (AD-027).
+func (c *Client) runJob(jobCtx context.Context, row *driver.JobRow) {
 	start := time.Now()
 	c.logger.Info("drover: job started",
 		"job_id", row.ID, "kind", row.Kind, "attempt", row.Attempt)
@@ -92,6 +103,12 @@ func (c *Client) runJob(ctx context.Context, row *driver.JobRow) {
 	lease := driver.Lease{ID: row.ID, Attempt: row.Attempt}
 	c.inflight.add(lease)
 	defer c.inflight.remove(lease)
+
+	// Bounded so a wedged database cannot hold a worker forever; the
+	// lease is the natural bound, because a write that takes longer than
+	// that has already lost the row to the rescuer.
+	ctx, cancelFinalize := context.WithTimeout(context.WithoutCancel(jobCtx), c.leaseDuration)
+	defer cancelFinalize()
 
 	fn, registered := c.workers.handler(row.Kind)
 	if !registered {
@@ -104,7 +121,7 @@ func (c *Client) runJob(ctx context.Context, row *driver.JobRow) {
 		return
 	}
 
-	stack, err := runProtected(ctx, fn, row)
+	stack, err := runProtected(jobCtx, fn, row)
 	if err != nil {
 		c.dispose(ctx, row, err, stack, time.Since(start))
 		return

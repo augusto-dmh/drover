@@ -176,6 +176,83 @@ func decodeAttemptErrors(t *testing.T, mem *memdriver.Driver, id int64) []driver
 	return recorded
 }
 
+// ctxDriver refuses writes on a cancelled context, the way a real
+// database driver does. memdriver ignores context entirely, so a test
+// that used it directly could not tell a finalization deliberately
+// protected from cancellation from one that merely never noticed.
+type ctxDriver struct{ *memdriver.Driver }
+
+func (d *ctxDriver) MarkCompleted(ctx context.Context, lease driver.Lease) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return d.Driver.MarkCompleted(ctx, lease)
+}
+
+func (d *ctxDriver) MarkRetryable(ctx context.Context, lease driver.Lease, retryAt time.Time, errDetail []byte) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return d.Driver.MarkRetryable(ctx, lease, retryAt, errDetail)
+}
+
+// A cancelled job context is what shutdown escalation looks like from
+// inside a worker. The handler must see it — otherwise cancellation is
+// decorative — and the outcome must still be recorded, because a job
+// left running after a clean shutdown is a job nobody can touch until
+// its lease lapses.
+func TestJobOutcomeIsRecordedEvenWhenItsContextWasCancelled(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		handler   error
+		wantState string
+	}{
+		{name: "a job that succeeds is still completed", handler: nil, wantState: "completed"},
+		{name: "a job that fails is still scheduled to retry", handler: errors.New("send failed"), wantState: "retryable"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			mem := memdriver.New()
+			ws := NewWorkers()
+			sawCancellation := make(chan bool, 1)
+			Register(ws, &funcWorker{fn: func(ctx context.Context, _ *Job[greetArgs]) error {
+				sawCancellation <- ctx.Err() != nil
+				return tt.handler
+			}})
+			c := newClient(&ctxDriver{mem}, Config{Workers: ws, Logger: newTestLogger(&syncWriter{})})
+
+			row, err := c.Insert(context.Background(), greetArgs{Name: "ada"})
+			if err != nil {
+				t.Fatalf("Insert: %v", err)
+			}
+			claimed, err := mem.FetchAvailable(context.Background(), defaultQueue, time.Minute, 1)
+			if err != nil {
+				t.Fatalf("FetchAvailable: %v", err)
+			}
+
+			jobCtx, cancel := context.WithCancel(context.Background())
+			cancel()
+			c.runJob(jobCtx, claimed[0])
+
+			if !<-sawCancellation {
+				t.Error("handler ran on an uncancelled context, so shutdown could never reach a running job")
+			}
+			stored, ok := mem.Row(row.ID)
+			if !ok {
+				t.Fatalf("job %d not found", row.ID)
+			}
+			if stored.State != tt.wantState {
+				t.Errorf("state = %q, want %q", stored.State, tt.wantState)
+			}
+		})
+	}
+}
+
 func TestStartExecutesJobToCompletion(t *testing.T) {
 	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 	mem := memdriver.New()
