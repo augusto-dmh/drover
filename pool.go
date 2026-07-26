@@ -209,11 +209,22 @@ var errShutdownRequeued = errors.New("drover: worker shut down before this attem
 // handler later tries to record an outcome, the fence refuses it
 // (AD-019).
 func (r *runner) escalate() error {
+	// Checked before anything else. The budget can expire at the very
+	// moment the last worker finishes, and when both channels are ready
+	// the runtime picks between them at random — so arriving here is not
+	// by itself evidence that anything was left running. A shutdown in
+	// which every job recorded its outcome is a clean one however the
+	// race fell, and reporting it as a failure would have callers who
+	// exit non-zero on error failing perfectly good deploys.
+	stranded := r.client.inflight.snapshot()
+	if len(stranded) == 0 {
+		return nil
+	}
+
 	// The one place a handler's context is cancelled. Everything else
 	// about shutdown is cooperative; this is not.
 	r.cancelJobs()
 
-	stranded := r.client.inflight.snapshot()
 	r.client.logger.Warn("drover: shutdown deadline reached with jobs still running",
 		"queue", r.queue, "jobs", len(stranded))
 	r.requeueAll(stranded)
@@ -255,20 +266,31 @@ func (r *runner) requeueAll(leases []driver.Lease) {
 		return
 	}
 
-	// Deliberately not the job context, which escalate has just
-	// cancelled: these writes are how the shutdown keeps its promise, and
-	// they have to outlive the cancellation that prompted them.
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.jobCtx), r.client.leaseDuration)
-	defer cancel()
-
 	for _, lease := range leases {
-		if err := r.client.requeue(ctx, lease); err != nil {
+		// A bound per hand-back rather than one for the batch. This runs
+		// after the caller's budget is already spent, so a single shared
+		// allowance would let one wedged write consume what the rest of
+		// the slice needed and leave the tail unattempted — and the
+		// slower the database, the likelier both that the drain overran
+		// and that the tail is the part that matters.
+		//
+		// Deliberately not derived from the job context, which escalate
+		// has just cancelled: these writes are how the shutdown keeps its
+		// promise, and they have to outlive the cancellation that
+		// prompted them.
+		if err := r.requeueOne(lease); err != nil {
 			r.requeueFailed(lease, err)
 			continue
 		}
 		r.client.logger.Warn("drover: returned an unfinished job to the queue",
 			"job_id", lease.ID, "attempt", lease.Attempt)
 	}
+}
+
+func (r *runner) requeueOne(lease driver.Lease) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.jobCtx), r.client.heartbeatInterval)
+	defer cancel()
+	return r.client.requeue(ctx, lease)
 }
 
 // requeueFailed reports a job that would not go back.

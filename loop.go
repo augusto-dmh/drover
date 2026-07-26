@@ -39,6 +39,15 @@ func (c *Client) Start(ctx context.Context) error {
 	}
 	r := newRunner(ctx, c)
 	c.runner = r
+	// Launched under the lock, not after it. Publishing the runner and
+	// then starting it in two steps leaves a window in which Stop sees a
+	// runnable client and drains a pool with no goroutines in it: every
+	// wait returns at once, Stop reports a clean shutdown, and the
+	// goroutines this call is about to spawn then find the stop signal
+	// already closed and exit immediately. Both calls would report
+	// success and no job would ever run. Nothing start spawns takes this
+	// lock, so holding it across the call cannot deadlock.
+	r.start(ctx)
 	c.mu.Unlock()
 
 	c.logger.Info("drover: worker pool started",
@@ -46,7 +55,6 @@ func (c *Client) Start(ctx context.Context) error {
 		"poll_interval", c.pollInterval, "lease_duration", c.leaseDuration,
 		"heartbeat_interval", c.heartbeatInterval, "rescue_interval", c.rescueInterval)
 
-	r.start(ctx)
 	return nil
 }
 
@@ -62,6 +70,11 @@ func (c *Client) Start(ctx context.Context) error {
 // answer is a count rather than a guarantee. Those jobs are at-least-once
 // delivery working as documented: they were returned to the queue and may
 // well run twice.
+//
+// ctx bounds the waiting, not quite the whole call: handing the
+// unfinished jobs back happens after that budget is spent, and each
+// hand-back is allowed one HeartbeatInterval of its own. Budget the
+// caller's side of a shutdown accordingly.
 //
 // A ctx with no deadline waits as long as it takes. Stop before Start
 // returns ErrNotStarted; calling it again returns the first call's
@@ -244,8 +257,24 @@ func (c *Client) dispose(ctx context.Context, row *driver.JobRow, jobErr error, 
 // the row running with a lease that will lapse, so the rescuer collects
 // it later.
 func (c *Client) writeFailed(row *driver.JobRow, err error) {
-	if errors.Is(err, driver.ErrLeaseLost) {
-		c.logger.Warn("drover: job taken over by another worker, discarding this outcome",
+	// Two ways this attempt can no longer be this worker's to record, and
+	// neither is a fault.
+	//
+	// ErrLeaseLost is the rescuer's doing: the job was re-claimed while
+	// this attempt ran, and a later attempt now owns the outcome.
+	//
+	// ErrInvalidTransition is usually this process's own doing. A
+	// shutdown that ran out of budget hands its unfinished jobs back to
+	// the queue, which leaves the row waiting rather than running; the
+	// handler that ignored its cancelled context then finishes and
+	// arrives here. Both drivers check state before attempt, so that
+	// lands as an invalid transition rather than a lost lease. Reporting
+	// the expected consequence of a deliberate shutdown as a write
+	// failure would put an error in the log for every job a bounded
+	// shutdown returned — teaching operators to ignore the line that
+	// matters when a write genuinely does fail.
+	if errors.Is(err, driver.ErrLeaseLost) || errors.Is(err, driver.ErrInvalidTransition) {
+		c.logger.Warn("drover: job is no longer this worker's to finish, discarding this outcome",
 			"job_id", row.ID, "kind", row.Kind, "attempt", row.Attempt, "error", err)
 		return
 	}
