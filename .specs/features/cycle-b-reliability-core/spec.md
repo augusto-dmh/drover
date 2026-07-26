@@ -12,14 +12,14 @@ and a rescuer; this cycle builds that machinery.
 
 ## Goals
 
-- [ ] A failing job retries on an `attempt^4`-seconds schedule with ±10% jitter and only becomes
+- [x] A failing job retries on an `attempt^4`-seconds schedule with ±10% jitter and only becomes
       `dead` once its attempts are exhausted.
-- [ ] A job whose worker dies is returned to the queue by a rescuer sweep within a bounded,
+- [x] A job whose worker dies is returned to the queue by a rescuer sweep within a bounded,
       configurable time — no row stays `running` indefinitely.
-- [ ] A long-running job is not falsely rescued: its lease is extended by a heartbeat while it runs.
-- [ ] A handler can classify its own outcome: `Cancel` ends a job permanently without retrying,
+- [x] A long-running job is not falsely rescued: its lease is extended by a heartbeat while it runs.
+- [x] A handler can classify its own outcome: `Cancel` ends a job permanently without retrying,
       `Snooze` defers it without consuming an attempt.
-- [ ] Retry timing is pluggable, so an adopter can replace the schedule without forking.
+- [x] Retry timing is pluggable, so an adopter can replace the schedule without forking.
 
 ## Out of Scope
 
@@ -51,7 +51,7 @@ rationale live in `context.md`.
 | Whether a rescue consumes an attempt | No — the claim that stranded the row already consumed one | Counting it twice would halve the effective `max_attempts` for every crash | y (auto, D-4) |
 | Whether a panic is retryable | Yes — a recovered panic is classified exactly like a returned error | A panic is as likely to be transient (a nil map on one malformed payload) as a returned error; the old dead-on-panic branch was part of the AD-003 placeholder | y (auto, D-5) |
 | Whether an unregistered job kind is retryable | Yes — it fails and retries like any other error | During a rolling deploy old workers legitimately see kinds they do not know yet; the backoff curve makes the wait cheap and the job survives to be run by a new worker | y (auto, D-6) |
-| Retry policy surface | `RetryPolicy` interface with a single `NextRetry(job *JobRow) time.Time` method, defaulting to the exponential policy | One method, full row context, absolute time — matches the pluggable-`RetryPolicy` commitment in ADR-0003 without a knob-bag config struct | y (auto, D-7) |
+| Retry policy surface | `RetryPolicy` interface with a single `NextRetry(ctx, job *JobRow) time.Time` method, defaulting to the exponential policy | One method, full row context, absolute time — matches the pluggable-`RetryPolicy` commitment in ADR-0003 without a knob-bag config struct | y (auto, D-7) |
 | How the rescuer avoids racing another rescuer or a live worker | It re-claims expired rows with `FOR UPDATE SKIP LOCKED` and a fresh lease before disposing of them | Re-claiming makes rescue reuse the ordinary `running` → terminal transitions instead of needing a second set of lease-guarded finalizers | y (auto, D-8) |
 | Jitter randomness source | `math/rand/v2` top-level functions; not injectable | Tests assert the documented bound over many samples rather than an exact value, so a seam would exist only for the test | y (auto, D-9) |
 | Heartbeat lifetime relative to shutdown | The heartbeat outlives context cancellation and stops only after the last in-flight job has finalized | The loop deliberately runs the in-flight job on an uncancelled context; a heartbeat that stopped at cancellation would let that job's lease expire mid-drain and invite a duplicate | y (auto, D-10) |
@@ -239,21 +239,21 @@ worker and observe state `cancelled` with one recorded error and no retry schedu
 
 | Requirement ID | Story | Phase | Status |
 | --- | --- | --- | --- |
-| RETRY-01 | P1: Transient failures retry | Design | Pending |
-| RETRY-02 | P1: Transient failures retry | Design | Pending |
-| RETRY-03 | P1: Transient failures retry | Design | Pending |
-| RETRY-04 | P1: Transient failures retry | Design | Pending |
-| POLICY-01 | P1: Default backoff | Design | Pending |
-| POLICY-02 | P1: Default backoff | Design | Pending |
-| RESCUE-01 | P1: Crashed worker rescued | Design | Pending |
-| RESCUE-02 | P1: Crashed worker rescued | Design | Pending |
-| RESCUE-03 | P1: Crashed worker rescued | Design | Pending |
-| LEASE-01 | P1: Long-running job keeps lease | Design | Pending |
-| LEASE-02 | P1: Long-running job keeps lease | Design | Pending |
-| LEASE-03 | P1: Long-running job keeps lease | Design | Pending |
-| SENT-01 | P2: Handlers classify outcome | Design | Pending |
-| SENT-02 | P2: Handlers classify outcome | Design | Pending |
-| SENT-03 | P2: Handlers classify outcome | Design | Pending |
+| RETRY-01 | P1: Transient failures retry | Verified | Done |
+| RETRY-02 | P1: Transient failures retry | Verified | Done |
+| RETRY-03 | P1: Transient failures retry | Verified | Done |
+| RETRY-04 | P1: Transient failures retry | Verified | Done |
+| POLICY-01 | P1: Default backoff | Verified | Done |
+| POLICY-02 | P1: Default backoff | Verified | Done |
+| RESCUE-01 | P1: Crashed worker rescued | Verified | Done |
+| RESCUE-02 | P1: Crashed worker rescued | Verified | Done |
+| RESCUE-03 | P1: Crashed worker rescued | Verified | Done |
+| LEASE-01 | P1: Long-running job keeps lease | Verified | Done |
+| LEASE-02 | P1: Long-running job keeps lease | Verified | Done |
+| LEASE-03 | P1: Long-running job keeps lease | Verified | Done |
+| SENT-01 | P2: Handlers classify outcome | Verified | Done |
+| SENT-02 | P2: Handlers classify outcome | Verified | Done |
+| SENT-03 | P2: Handlers classify outcome | Verified | Done |
 
 **Requirement detail:**
 
@@ -292,10 +292,10 @@ worker and observe state `cancelled` with one recorded error and no retry schedu
 
 ## Success Criteria
 
-- [ ] A worker failing twice then succeeding reaches `completed` with `attempt` = 3 and two recorded
+- [x] A worker failing twice then succeeding reaches `completed` with `attempt` = 3 and two recorded
       errors, with no manual intervention.
-- [ ] A job abandoned in `running` with an expired lease is back in `retryable` after one sweep, with
+- [x] A job abandoned in `running` with an expired lease is back in `retryable` after one sweep, with
       its `attempt` unchanged.
-- [ ] A job running four times longer than its lease duration completes without ever being rescued.
-- [ ] `dead` is reachable only by exhausting `max_attempts` — no single failure produces it.
-- [ ] The unit suite still runs without Docker; lifecycle tests report no leaked goroutines.
+- [x] A job running four times longer than its lease duration completes without ever being rescued.
+- [x] `dead` is reachable only by exhausting `max_attempts` — no single failure produces it.
+- [x] The unit suite still runs without Docker; lifecycle tests report no leaked goroutines.

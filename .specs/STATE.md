@@ -20,7 +20,7 @@ Durable, cross-cycle. Architecture-level decisions live in `docs/adr/`; entries 
 | AD-012 | Rescue never changes `attempt`: the attempt that stranded the row was really spent | cycle-b D-4 |
 | AD-013 | A recovered panic is a retryable failure, with its stack trace retained | cycle-b D-5 |
 | AD-014 | An unregistered job kind is a retryable failure, so rolling deploys do not destroy jobs | cycle-b D-6 |
-| AD-015 | `RetryPolicy` is a one-method interface `NextRetry(job *JobRow) time.Time`, defaulting to the exponential policy; a past answer means "claimable now" | cycle-b D-7 |
+| AD-015 | `RetryPolicy` is a one-method interface `NextRetry(ctx, job *JobRow) time.Time`, defaulting to the exponential policy; a past answer means "claimable now" | cycle-b D-7, context added at review |
 | AD-016 | The rescuer re-claims expired rows with `FOR UPDATE SKIP LOCKED` and a fresh lease, then reuses the ordinary `running` → terminal transitions | cycle-b D-8 |
 | AD-017 | Jitter uses `math/rand/v2` directly and is not injectable; tests assert the documented bound over many samples | cycle-b D-9 |
 | AD-018 | The heartbeat stops only after the fetch loop returns, not at context cancellation, so a draining job never loses its lease | cycle-b D-10 |
@@ -30,12 +30,12 @@ Durable, cross-cycle. Architecture-level decisions live in `docs/adr/`; entries 
 | Cycle | Feature | PR | Merged |
 |---|---|---|---|
 | A — Walking skeleton | `cycle-a-walking-skeleton` | #1 | 2026-07-25 |
-| B — Reliability core | `cycle-b-reliability-core` | — | in progress |
+| B — Reliability core | `cycle-b-reliability-core` | #3 | pending merge |
 
 ## Handoff
 
-- **Active feature**: `cycle-b-reliability-core` — **COMPLETE, validation PASS** (iteration 2: the rescue path's backoff had no sensor; fixed in 211dd78, 17/17 mutants killed)
-- **Branch**: `feat/retries-leases-and-rescue`, 10 commits `e813748..211dd78`; 106 tests (was 44), unit + integration + lint green
-- **Deviation this cycle**: phase 3 (loop, heartbeat, rescuer, supervisor) was executed inline by the orchestrator rather than a phase worker, at the user's request. The Verifier was still an independent fresh agent, so author ≠ verifier held.
-- **Next**: publish the PR, then review and merge
+- **Active feature**: `cycle-b-reliability-core` — **COMPLETE, validation PASS**, review triaged (21 findings, none rejected; 19 fixed, 2 deferred by decision)
+- **Branch**: `feat/retries-leases-and-rescue`; unit + integration + lint green
+- **Deviation this cycle**: the loop/heartbeat/rescuer/supervisor phase was executed inline by the orchestrator rather than a phase worker, at the user's request. Verification and review were both independent fresh agents, so author ≠ verifier and author ≠ reviewer both held.
+- **Next**: merge, then immediately open the lease-ownership hardening PR (see `review-triage.md` findings 20 and 21) **before** starting the concurrency cycle — the worker pool multiplies the number of workers that can reach the ownership window.
 - **After this cycle**: Cycle C — concurrency (per-queue worker pools, fetcher→workers channels, `Start`/`Stop` graceful shutdown). Cycle B's in-flight set, heartbeat and supervisor are built to accept N concurrent jobs unchanged, so the pool changes who calls `add`/`remove`, not what they mean.

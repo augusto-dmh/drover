@@ -8,19 +8,19 @@ activated, STOP.
 
 **Spec**: `.specs/features/cycle-b-reliability-core/spec.md`
 **Design**: `.specs/features/cycle-b-reliability-core/design.md`
-**Status**: Ready
+**Status**: Done — all tasks committed; verification in `validation.md`, review triage in `review-triage.md`
 
 | Task | Commit | Status |
 |---|---|---|
-| T1 retry policy | | ⬜ |
-| T2 sentinels | | ⬜ |
-| T3 driver contract + memdriver transitions | | ⬜ |
-| T4 migration 002 + sqlc queries + pgdriver | | ⬜ |
-| T5 loop disposition (retry / die / cancel / snooze) | | ⬜ |
-| T6 in-flight set + heartbeat | | ⬜ |
-| T7 rescuer | | ⬜ |
-| T8 supervisor lifecycle + config defaults | | ⬜ |
-| T9 end-to-end integration + docs | | ⬜ |
+| T1 retry policy | 297b3fc | ✅ |
+| T2 sentinels | 508f99a | ✅ |
+| T3 driver contract + memdriver transitions | 1a9cd64 | ✅ |
+| T4 migration 002 + sqlc queries + pgdriver | 383f236 | ✅ |
+| T5 loop disposition (retry / die / cancel / snooze) | 579eb78 | ✅ |
+| T6 in-flight set + heartbeat | f364460 | ✅ |
+| T7 rescuer | 91cf006 | ✅ |
+| T8 supervisor lifecycle + config defaults | a043ac4 | ✅ |
+| T9 end-to-end integration + docs | 265d979 | ✅ |
 
 ## Test Coverage Matrix
 

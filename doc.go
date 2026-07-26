@@ -35,7 +35,8 @@
 // remaining attempts, for work that can never succeed. Returning Snooze
 // defers the job without consuming an attempt, for work that is not
 // ready yet. Both are recognized through %w wrapping, so a worker may
-// add its own context.
+// add its own context, and both are matchable with errors.Is against
+// ErrCancelled and ErrSnoozed.
 //
 // # Crash recovery
 //
@@ -53,6 +54,20 @@
 // job first, keeping its lease alive until it finishes.
 //
 // # Current limitations
+//
+// State changes are currently guarded on a job being in the running
+// state, which establishes that some worker holds it but not which one.
+// A worker whose heartbeat is starved for longer than the lease — a long
+// stop-the-world pause, a database outage — can therefore have its job
+// rescued and re-claimed elsewhere and still write the outcome of its
+// own, older attempt over the newer one. Duplicate execution is expected
+// and documented above; this narrower window, where a stale worker
+// records a result for an attempt it no longer owns, is not, and closing
+// it with an ownership check is the next planned change.
+//
+// Lease deadlines are also computed on the client and compared against
+// the database clock, so significant skew between them shortens or
+// lengthens the effective lease.
 //
 // This version runs a single worker goroutine per Start call; pooled
 // concurrency, a Stop method with a drain deadline, named queues and
