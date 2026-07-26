@@ -27,6 +27,13 @@ func Cancel(reason error) error {
 	return fmt.Errorf("%w: %w", ErrCancelled, reason)
 }
 
+// ErrSnoozed is wrapped by every error Snooze returns, so a caller can
+// recognize a deferral with errors.Is the same way ErrCancelled
+// identifies a cancellation. Prefer Snooze, which carries a duration;
+// returning this sentinel on its own defers the job with no wait, so it
+// is claimable again immediately.
+var ErrSnoozed = errors.New("drover: job snoozed by handler")
+
 // Snooze defers a job by d without consuming an attempt. A worker
 // returning it — bare, or wrapped in more context — leaves the job
 // scheduled d from now, so a handler waiting on a precondition can
@@ -50,6 +57,11 @@ type snoozeError struct {
 func (e snoozeError) Error() string {
 	return fmt.Sprintf("drover: job snoozed for %s", e.d)
 }
+
+// Unwrap exposes the sentinel so code outside drover — middleware, a
+// wrapper handler, a test — can classify a deferral without needing the
+// unexported type.
+func (e snoozeError) Unwrap() error { return ErrSnoozed }
 
 // Duration returns the deferral, which is never negative.
 func (e snoozeError) Duration() time.Duration { return e.d }
@@ -82,6 +94,13 @@ func classifyOutcome(err error) (jobOutcome, time.Duration) {
 	var snooze snoozeError
 	if errors.As(err, &snooze) {
 		return outcomeSnoozed, snooze.Duration()
+	}
+	// A bare ErrSnoozed carries no duration, but honouring it keeps the
+	// sentinel usable on its own — a caller who reaches for errors.Is
+	// semantics should not get a silently different disposition than one
+	// who called Snooze.
+	if errors.Is(err, ErrSnoozed) {
+		return outcomeSnoozed, 0
 	}
 	return outcomeFailed, 0
 }

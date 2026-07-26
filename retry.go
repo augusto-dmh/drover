@@ -1,6 +1,7 @@
 package drover
 
 import (
+	"context"
 	"log/slog"
 	"math/rand/v2"
 	"time"
@@ -12,8 +13,16 @@ import (
 // absolute time — which expresses schedules ("retry at 03:00") that a
 // plain duration cannot. An answer at or before the present means the
 // job is claimable immediately.
+//
+// Implementations must be safe for concurrent use: NextRetry is called
+// from the worker loop and from the rescue sweep at the same time, and
+// from every worker in the pool once pooled execution lands.
+//
+// The context is the one the failing job was disposed of under, so a
+// policy that consults a database or a remote configuration service can
+// honour cancellation and deadlines. It is never nil.
 type RetryPolicy interface {
-	NextRetry(job *JobRow) time.Time
+	NextRetry(ctx context.Context, job *JobRow) time.Time
 }
 
 // ExponentialRetryPolicy is the default schedule: the wait after
@@ -23,8 +32,9 @@ type RetryPolicy interface {
 // about four and a half days.
 type ExponentialRetryPolicy struct{}
 
-// NextRetry implements RetryPolicy.
-func (ExponentialRetryPolicy) NextRetry(job *JobRow) time.Time {
+// NextRetry implements RetryPolicy. It is safe for concurrent use: the
+// only shared state is math/rand/v2's goroutine-safe global source.
+func (ExponentialRetryPolicy) NextRetry(_ context.Context, job *JobRow) time.Time {
 	return time.Now().Add(exponentialDelay(job.Attempt))
 }
 
@@ -46,12 +56,12 @@ func exponentialDelay(attempt int) time.Duration {
 // worker loop. A policy that panics falls back to the default
 // schedule, because the failed job has to leave running either way —
 // abandoning it there would strand it until the lease expires.
-func retryAt(logger *slog.Logger, p RetryPolicy, job *JobRow, now time.Time) time.Time {
-	at, recovered := safeNextRetry(p, job)
+func retryAt(ctx context.Context, logger *slog.Logger, p RetryPolicy, job *JobRow, now time.Time) time.Time {
+	at, recovered := safeNextRetry(ctx, p, job)
 	if recovered != nil {
 		logger.Error("drover: retry policy panicked, falling back to the default schedule",
 			"job_id", job.ID, "kind", job.Kind, "attempt", job.Attempt, "panic", recovered)
-		at = ExponentialRetryPolicy{}.NextRetry(job)
+		at = ExponentialRetryPolicy{}.NextRetry(ctx, job)
 	}
 	if at.Before(now) {
 		return now
@@ -61,9 +71,9 @@ func retryAt(logger *slog.Logger, p RetryPolicy, job *JobRow, now time.Time) tim
 
 // safeNextRetry calls p, converting a panic into a non-nil recovered
 // value rather than unwinding into the loop.
-func safeNextRetry(p RetryPolicy, job *JobRow) (at time.Time, recovered any) {
+func safeNextRetry(ctx context.Context, p RetryPolicy, job *JobRow) (at time.Time, recovered any) {
 	defer func() {
 		recovered = recover()
 	}()
-	return p.NextRetry(job), nil
+	return p.NextRetry(ctx, job), nil
 }

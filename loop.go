@@ -98,13 +98,13 @@ func (c *Client) runJob(ctx context.Context, row *driver.JobRow) {
 		// legitimately claim kinds only the new build registers, and the
 		// job has to survive until one of those runs it (AD-014).
 		err := fmt.Errorf("no worker registered for kind %q", row.Kind)
-		c.dispose(ctx, row, err, nil, "duration", time.Since(start))
+		c.dispose(ctx, row, err, nil, time.Since(start))
 		return
 	}
 
 	stack, err := runProtected(ctx, fn, row)
 	if err != nil {
-		c.dispose(ctx, row, err, stack, "duration", time.Since(start))
+		c.dispose(ctx, row, err, stack, time.Since(start))
 		return
 	}
 
@@ -138,11 +138,17 @@ func runProtected(ctx context.Context, fn workFunc, row *driver.JobRow) (stack [
 // rescuer both come through here, which is what makes a job abandoned by
 // a dead worker and a job whose handler returned an error reach exactly
 // the same fate rather than merely similar ones.
-func (c *Client) dispose(ctx context.Context, row *driver.JobRow, jobErr error, stack []byte, extra ...any) {
+//
+// ran is how long the attempt executed for; the rescuer passes zero,
+// because a job abandoned by a dead worker has no duration this process
+// can honestly report.
+func (c *Client) dispose(ctx context.Context, row *driver.JobRow, jobErr error, stack []byte, ran time.Duration) {
 	attrs := func(rest ...any) []any {
-		return slices.Concat(
-			[]any{"job_id", row.ID, "kind", row.Kind, "attempt", row.Attempt},
-			rest, extra)
+		base := []any{"job_id", row.ID, "kind", row.Kind, "attempt", row.Attempt}
+		if ran > 0 {
+			base = append(base, "duration", ran)
+		}
+		return slices.Concat(base, rest)
 	}
 
 	outcome, snooze := classifyOutcome(jobErr)
@@ -191,7 +197,7 @@ func (c *Client) dispose(ctx context.Context, row *driver.JobRow, jobErr error, 
 			attrs("max_attempts", row.MaxAttempts, "error", jobErr)...)
 
 	default:
-		at := retryAt(c.logger, c.retryPolicy, rowFromDriver(row), time.Now())
+		at := retryAt(ctx, c.logger, c.retryPolicy, rowFromDriver(row), time.Now())
 		if err := c.drv.MarkRetryable(ctx, row.ID, at, detail); err != nil {
 			c.writeFailed(row, err)
 			return
