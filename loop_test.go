@@ -211,12 +211,17 @@ func TestJobOutcomeIsRecordedEvenWhenItsContextWasCancelled(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name      string
-		handler   error
-		wantState string
+		name         string
+		handler      error
+		unregistered bool
+		wantState    string
 	}{
 		{name: "a job that succeeds is still completed", handler: nil, wantState: "completed"},
 		{name: "a job that fails is still scheduled to retry", handler: errors.New("send failed"), wantState: "retryable"},
+		// Mid-deploy is when a kind this binary does not know turns up and
+		// when a shutdown escalates, so the two conditions arrive together
+		// rather than independently.
+		{name: "a job with no registered worker is still scheduled to retry", unregistered: true, wantState: "retryable"},
 	}
 
 	for _, tt := range tests {
@@ -226,10 +231,12 @@ func TestJobOutcomeIsRecordedEvenWhenItsContextWasCancelled(t *testing.T) {
 			mem := memdriver.New()
 			ws := NewWorkers()
 			sawCancellation := make(chan bool, 1)
-			Register(ws, &funcWorker{fn: func(ctx context.Context, _ *Job[greetArgs]) error {
-				sawCancellation <- ctx.Err() != nil
-				return tt.handler
-			}})
+			if !tt.unregistered {
+				Register(ws, &funcWorker{fn: func(ctx context.Context, _ *Job[greetArgs]) error {
+					sawCancellation <- ctx.Err() != nil
+					return tt.handler
+				}})
+			}
 			c := newClient(&ctxDriver{mem}, Config{Workers: ws, Logger: newTestLogger(&syncWriter{})})
 
 			row, err := c.Insert(context.Background(), greetArgs{Name: "ada"})
@@ -245,7 +252,7 @@ func TestJobOutcomeIsRecordedEvenWhenItsContextWasCancelled(t *testing.T) {
 			cancel()
 			c.runJob(jobCtx, claimed[0])
 
-			if !<-sawCancellation {
+			if !tt.unregistered && !<-sawCancellation {
 				t.Error("handler ran on an uncancelled context, so shutdown could never reach a running job")
 			}
 			stored, ok := mem.Row(row.ID)
@@ -300,44 +307,66 @@ func TestALongRunningJobCanStillRecordItsOutcome(t *testing.T) {
 	}
 }
 
-// leaseLostDriver refuses every completion the way the database does
-// once the job has moved on to an attempt this caller no longer holds.
-type leaseLostDriver struct{ *memdriver.Driver }
-
-func (d *leaseLostDriver) MarkCompleted(context.Context, driver.Lease) error {
-	return driver.ErrLeaseLost
+// refusingDriver rejects every completion with a fixed error, standing
+// in for the two ways a job stops being this worker's to finish.
+type refusingDriver struct {
+	*memdriver.Driver
+	err error
 }
 
-// Losing the lease is the fence working, not a fault: the job was
-// rescued and re-claimed while this attempt was still running, and
-// another worker owns the outcome now. Reporting it as a write failure
-// would put an ERROR in the log for every rescue — training operators to
-// ignore the line that matters when a write genuinely does fail.
-func TestALostLeaseIsReportedAsATakeoverNotAFailure(t *testing.T) {
+func (d *refusingDriver) MarkCompleted(context.Context, driver.Lease) error {
+	return d.err
+}
+
+// Neither refusal is a fault, and both must stay out of the error log.
+//
+// A lost lease is the fence working: the job was rescued and re-claimed
+// while this attempt ran. An invalid transition is usually this
+// process's own shutdown — a bounded Stop hands its unfinished jobs back
+// to the queue, and the handler that ignored its cancelled context then
+// arrives here to find the row waiting rather than running. Reporting
+// either as a failed write puts an error in the log for something the
+// system chose to do, which teaches operators to ignore the line that
+// matters when a write genuinely does fail.
+func TestARefusedOutcomeIsReportedAsATakeoverNotAFailure(t *testing.T) {
 	t.Parallel()
 
-	mem := memdriver.New()
-	logs := &syncWriter{}
-	ws := NewWorkers()
-	Register(ws, &funcWorker{fn: func(context.Context, *Job[greetArgs]) error { return nil }})
-	c := newClient(&leaseLostDriver{mem}, Config{Workers: ws, Logger: newTestLogger(logs)})
-
-	if _, err := c.Insert(context.Background(), greetArgs{Name: "ada"}); err != nil {
-		t.Fatalf("Insert: %v", err)
-	}
-	claimed, err := mem.FetchAvailable(context.Background(), defaultQueue, time.Minute, 1)
-	if err != nil {
-		t.Fatalf("FetchAvailable: %v", err)
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "the lease was lost to another worker", err: driver.ErrLeaseLost},
+		{name: "shutdown already handed the job back", err: driver.ErrInvalidTransition},
 	}
 
-	c.runJob(context.Background(), claimed[0])
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-	out := logs.String()
-	if !strings.Contains(out, "taken over by another worker") {
-		t.Errorf("log does not report the takeover:\n%s", out)
-	}
-	if strings.Contains(out, `msg="drover: finalize job"`) {
-		t.Errorf("a lost lease was reported as a failed write:\n%s", out)
+			mem := memdriver.New()
+			logs := &syncWriter{}
+			ws := NewWorkers()
+			Register(ws, &funcWorker{fn: func(context.Context, *Job[greetArgs]) error { return nil }})
+			c := newClient(&refusingDriver{Driver: mem, err: tt.err}, Config{Workers: ws, Logger: newTestLogger(logs)})
+
+			if _, err := c.Insert(context.Background(), greetArgs{Name: "ada"}); err != nil {
+				t.Fatalf("Insert: %v", err)
+			}
+			claimed, err := mem.FetchAvailable(context.Background(), defaultQueue, time.Minute, 1)
+			if err != nil {
+				t.Fatalf("FetchAvailable: %v", err)
+			}
+
+			c.runJob(context.Background(), claimed[0])
+
+			out := logs.String()
+			if !strings.Contains(out, "no longer this worker's to finish") {
+				t.Errorf("log does not report the outcome as a takeover:\n%s", out)
+			}
+			if strings.Contains(out, `msg="drover: finalize job"`) {
+				t.Errorf("a refused outcome was reported as a failed write:\n%s", out)
+			}
+		})
 	}
 }
 

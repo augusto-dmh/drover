@@ -58,6 +58,9 @@ func countMemRows(t *testing.T, mem *memdriver.Driver, ids []int64, state string
 }
 
 // blockingWorker enters, announces itself, and waits to be released.
+// It never consults its context, which is deliberate: it stands in both
+// for a job that is simply slow and for one that ignores cancellation,
+// the case a bounded shutdown exists for.
 func blockingWorker(entered chan<- int64, release <-chan struct{}) *funcWorker {
 	return &funcWorker{fn: func(_ context.Context, job *Job[greetArgs]) error {
 		entered <- job.ID
@@ -263,6 +266,28 @@ func TestStartRefusesToRunTwice(t *testing.T) {
 	}
 }
 
+// The documented lifecycle runs once. Only the already-running half was
+// pinned; nilling c.runner in Stop would quietly make the client
+// restartable — reusing an inflightSet the design never reasoned about —
+// with the whole suite still green.
+func TestStartRefusesToRunAfterStop(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	c := newPoolClient(memdriver.New(), NewWorkers(), 2, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := c.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop returned %v, want nil", err)
+	}
+
+	if err := c.Start(ctx); !errors.Is(err, ErrAlreadyStarted) {
+		t.Errorf("Start after Stop = %v, want ErrAlreadyStarted — a client's lifecycle runs once", err)
+	}
+}
+
 func TestStopWithoutStartIsReportedNotIgnored(t *testing.T) {
 	t.Parallel()
 
@@ -407,16 +432,6 @@ func TestStopStopsTheRescuerClaimingToo(t *testing.T) {
 	}
 }
 
-// stubbornWorker ignores cancellation entirely — the case a bounded
-// shutdown exists for.
-func stubbornWorker(entered chan<- int64, release <-chan struct{}) *funcWorker {
-	return &funcWorker{fn: func(_ context.Context, job *Job[greetArgs]) error {
-		entered <- job.ID
-		<-release
-		return nil
-	}}
-}
-
 // waitForInflightToClear lets the abandoned handlers finish so goleak
 // sees a settled process. Stop deliberately does not wait for them.
 func waitForInflightToClear(t *testing.T, c *Client) {
@@ -435,9 +450,10 @@ func TestStopReportsAndRequeuesTheJobsItCouldNotFinish(t *testing.T) {
 	entered := make(chan int64, concurrency)
 	release := make(chan struct{})
 	ws := NewWorkers()
-	Register(ws, stubbornWorker(entered, release))
+	Register(ws, blockingWorker(entered, release))
 
-	c := newPoolClient(mem, ws, concurrency, nil)
+	logs := &syncWriter{}
+	c := newPoolClient(mem, ws, concurrency, func(cfg *Config) { cfg.Logger = newTestLogger(logs) })
 	ids := insertN(t, c, concurrency)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -488,6 +504,15 @@ func TestStopReportsAndRequeuesTheJobsItCouldNotFinish(t *testing.T) {
 
 	close(release)
 	waitForInflightToClear(t, c)
+
+	// The abandoned handlers have now finished and tried to record
+	// outcomes for jobs this shutdown already handed back. That is the
+	// designed consequence of the escalation, not a write failure, and it
+	// must not be logged as one — an error per job on every overrunning
+	// deploy is how the log stops being read.
+	if out := logs.String(); strings.Contains(out, `msg="drover: finalize job"`) {
+		t.Errorf("an escalated shutdown reported its own handed-back jobs as failed writes:\n%s", out)
+	}
 }
 
 // The requeue must not give the attempt back. attempt is the fence, so
@@ -501,7 +526,7 @@ func TestShutdownRequeueDoesNotGiveBackTheAttempt(t *testing.T) {
 	entered := make(chan int64, 1)
 	release := make(chan struct{})
 	ws := NewWorkers()
-	Register(ws, stubbornWorker(entered, release))
+	Register(ws, blockingWorker(entered, release))
 
 	c := newPoolClient(mem, ws, 1, nil)
 	ids := insertN(t, c, 1)
@@ -692,6 +717,63 @@ func TestAPoolOfOneRunsOneJobAtATime(t *testing.T) {
 	}
 }
 
+// raceLostDriver refuses a hand-back the way the database does when the
+// job's own worker got there first.
+type raceLostDriver struct {
+	*memdriver.Driver
+	err error
+}
+
+func (d *raceLostDriver) MarkRetryable(context.Context, driver.Lease, time.Time, []byte) error {
+	return d.err
+}
+
+// Losing the hand-back race is the ordinary case on a shutdown — the
+// handler finished while the shutdown was reaching for its row — so it
+// must not be logged as a failed write. Inverting that classification
+// puts an error in the log on a large share of clean deploys, and
+// nothing but a log assertion can tell the two apart.
+func TestAHandBackThatLostItsRaceIsNotReportedAsAFailure(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "the job's own worker finished first", err: driver.ErrInvalidTransition},
+		{name: "another holder took the job", err: driver.ErrLeaseLost},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			mem := memdriver.New()
+			logs := &syncWriter{}
+			c := newClient(&raceLostDriver{Driver: mem, err: tt.err},
+				Config{Workers: NewWorkers(), Logger: newTestLogger(logs), Concurrency: 2})
+			insertN(t, c, 1)
+
+			claimed, err := mem.FetchAvailable(context.Background(), defaultQueue, time.Minute, 1)
+			if err != nil {
+				t.Fatalf("FetchAvailable: %v", err)
+			}
+
+			r := newRunner(context.Background(), c)
+			defer r.cancelJobs()
+			defer r.cancelBackground()
+			<-r.slots
+			c.inflight.add(driver.Lease{ID: claimed[0].ID, Attempt: claimed[0].Attempt})
+
+			r.abandon(claimed)
+
+			if out := logs.String(); strings.Contains(out, `msg="drover: return job to the queue"`) {
+				t.Errorf("a hand-back that lost its race was reported as a failed write:\n%s", out)
+			}
+		})
+	}
+}
+
 // failFirstRetryableDriver refuses the first requeue and accepts the
 // rest, so a test can prove one row that will not go back does not take
 // the others with it.
@@ -761,7 +843,8 @@ func TestOneFailedHandBackDoesNotStopTheRest(t *testing.T) {
 func TestStopDoesNotWaitOutThePollInterval(t *testing.T) {
 	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 
-	c := newPoolClient(memdriver.New(), NewWorkers(), 2, func(cfg *Config) {
+	counting := &countingDriver{Driver: memdriver.New()}
+	c := newPoolClient(counting, NewWorkers(), 2, func(cfg *Config) {
 		cfg.PollInterval = 3 * time.Second
 	})
 	ctx, cancel := context.WithCancel(context.Background())
@@ -769,8 +852,12 @@ func TestStopDoesNotWaitOutThePollInterval(t *testing.T) {
 	if err := c.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	// Long enough to be settled into the idle sleep.
-	time.Sleep(50 * time.Millisecond)
+	// Gated on the observable rather than the clock: the claim is that
+	// Stop interrupts a wait already in progress, so the fetch loop has
+	// to have reached that wait. A fixed sleep would let a slow runner
+	// measure a loop that never got there, passing without exercising
+	// anything.
+	waitFor(t, func() bool { return counting.fetches.Load() > 0 }, "the pool to reach its idle wait")
 
 	start := time.Now()
 	if err := c.Stop(context.Background()); err != nil {
@@ -791,7 +878,7 @@ func TestClaimingStopsBeforeTheDrainBeginsWaiting(t *testing.T) {
 	entered := make(chan int64, 1)
 	release := make(chan struct{})
 	ws := NewWorkers()
-	Register(ws, stubbornWorker(entered, release))
+	Register(ws, blockingWorker(entered, release))
 
 	c := newPoolClient(counting, ws, 2, func(cfg *Config) {
 		cfg.PollInterval = time.Millisecond
@@ -924,7 +1011,7 @@ func TestSurplusClaimedJobsAreReturnedImmediately(t *testing.T) {
 	entered := make(chan int64, 1)
 	release := make(chan struct{})
 	ws := NewWorkers()
-	Register(ws, stubbornWorker(entered, release))
+	Register(ws, blockingWorker(entered, release))
 
 	c := newPoolClient(overshoot, ws, 1, nil)
 	ids := insertN(t, c, 3)
@@ -978,7 +1065,7 @@ func TestStopWithAnExpiredBudgetStillRequeues(t *testing.T) {
 	entered := make(chan int64, 1)
 	release := make(chan struct{})
 	ws := NewWorkers()
-	Register(ws, stubbornWorker(entered, release))
+	Register(ws, blockingWorker(entered, release))
 
 	c := newPoolClient(mem, ws, 1, nil)
 	ids := insertN(t, c, 1)
@@ -1007,6 +1094,64 @@ func TestStopWithAnExpiredBudgetStillRequeues(t *testing.T) {
 
 	close(release)
 	waitForInflightToClear(t, c)
+}
+
+// A budget that expires at the very moment the last worker finishes is
+// still a clean shutdown: everything recorded its outcome. Reporting it
+// as a failure would have a caller that exits non-zero on error failing
+// deploys in which nothing went wrong, decided by which of two ready
+// channels the runtime happened to pick.
+func TestEscalationReportsNothingWhenNothingWasStranded(t *testing.T) {
+	t.Parallel()
+
+	c := newPoolClient(memdriver.New(), NewWorkers(), 2, nil)
+	r := newRunner(context.Background(), c)
+	defer r.cancelJobs()
+	defer r.cancelBackground()
+
+	if err := r.escalate(); err != nil {
+		t.Errorf("escalate with an empty in-flight set = %v, want nil", err)
+	}
+}
+
+// Start publishes the runner and launches it; a Stop arriving between
+// those two steps must not be able to drain a pool that has no
+// goroutines in it and call that a clean shutdown. Driven concurrently
+// so the race detector and the WaitGroup's own misuse check both get a
+// chance at any window between them.
+func TestConcurrentStartAndStopDoNotCorruptTheLifecycle(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	for i := 0; i < 50; i++ {
+		c := newPoolClient(memdriver.New(), NewWorkers(), 4, nil)
+		ctx, cancel := context.WithCancel(context.Background())
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			if err := c.Start(ctx); err != nil {
+				t.Errorf("Start: %v", err)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			// Either it lands before Start published the runner and reports
+			// so, or it drains a pool that is genuinely running. Both are
+			// fine; a nil verdict for a pool that never launched is not.
+			if err := c.Stop(context.Background()); err != nil && !errors.Is(err, ErrNotStarted) {
+				t.Errorf("Stop: %v", err)
+			}
+		}()
+		wg.Wait()
+
+		// Whatever the interleaving, the client must end up stopped rather
+		// than half-built: a further Stop must not block or panic.
+		if err := c.Stop(context.Background()); err != nil && !errors.Is(err, ErrNotStarted) {
+			t.Errorf("final Stop: %v", err)
+		}
+		cancel()
+	}
 }
 
 // leaseCountDriver records the largest batch of leases the heartbeat
