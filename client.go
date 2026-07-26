@@ -23,6 +23,10 @@ const (
 	// default. Three leaves two beats of slack: a job survives a missed
 	// renewal without the rescuer taking it away.
 	heartbeatsPerLease = 3
+
+	// minLeaseDuration is the shortest lease that still divides into a
+	// usable heartbeat interval. Anything shorter is treated as unset.
+	minLeaseDuration = time.Millisecond
 )
 
 // JobRow is the persisted representation of a job.
@@ -44,7 +48,8 @@ type JobRow struct {
 // Config configures a Client. Zero values get defaults: slog.Default()
 // for Logger, one second for PollInterval, an empty registry for
 // Workers, ExponentialRetryPolicy for RetryPolicy, one minute for
-// LeaseDuration, and a third of the lease for HeartbeatInterval.
+// LeaseDuration, a third of the lease for HeartbeatInterval, and the
+// lease duration itself for RescueInterval.
 type Config struct {
 	Workers      *Workers
 	Logger       *slog.Logger
@@ -118,13 +123,25 @@ func newClient(drv driver.Driver, cfg Config) *Client {
 	if c.retryPolicy == nil {
 		c.retryPolicy = ExponentialRetryPolicy{}
 	}
-	if c.leaseDuration <= 0 {
+	// Floored, not merely checked for positivity: the heartbeat interval
+	// is derived by integer division, so a lease of a nanosecond or two
+	// would yield an interval of zero and panic the ticker.
+	if c.leaseDuration < minLeaseDuration {
 		c.leaseDuration = driver.DefaultLeaseDuration
 	}
 	// A heartbeat at or beyond the lease it renews can only ever renew
 	// too late, so every job outliving one lease would be rescued while
-	// still running. Treat such a setting as unconfigured.
-	if c.heartbeatInterval <= 0 || c.heartbeatInterval >= c.leaseDuration {
+	// still running.
+	if c.heartbeatInterval >= c.leaseDuration {
+		// Distinct from an unset value: this one the caller chose, and
+		// its production symptom — jobs duplicated while still running —
+		// is far easier to diagnose from one line at startup than from
+		// the behaviour.
+		c.logger.Warn("drover: heartbeat interval must be shorter than the lease; using the default instead",
+			"heartbeat_interval", c.heartbeatInterval, "lease_duration", c.leaseDuration)
+		c.heartbeatInterval = 0
+	}
+	if c.heartbeatInterval <= 0 {
 		c.heartbeatInterval = c.leaseDuration / heartbeatsPerLease
 	}
 	if c.rescueInterval <= 0 {
