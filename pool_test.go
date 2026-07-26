@@ -607,6 +607,91 @@ func TestClaimsNeverHandedToAWorkerGoBackToTheQueue(t *testing.T) {
 	}
 }
 
+// The previous test proves what abandon does; this one proves the fetch
+// loop actually reaches for it. Running the real loop with no workers at
+// all is what makes that deterministic: nothing ever receives from the
+// hand-off channel, so the loop is parked mid-hand-off holding claimed
+// rows — exactly the state shutdown has to unwind — with no race to lose.
+func TestTheFetchLoopHandsBackRowsItNeverDispatched(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	mem := memdriver.New()
+	c := newPoolClient(mem, NewWorkers(), 2, nil)
+	ids := insertN(t, c, 2)
+
+	r := newRunner(context.Background(), c)
+	defer r.cancelJobs()
+	defer r.cancelBackground()
+
+	returned := make(chan struct{})
+	go func() {
+		defer close(returned)
+		r.fetch()
+	}()
+
+	waitFor(t, func() bool { return countMemRows(t, mem, ids, "running") > 0 },
+		"the fetch loop to claim a row it cannot hand over")
+
+	close(r.stopFetch)
+	select {
+	case <-returned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the fetch loop did not return once shutdown began")
+	}
+
+	for _, id := range ids {
+		row, ok := mem.Row(id)
+		if !ok {
+			t.Fatalf("job %d not found", id)
+		}
+		if row.State == "running" {
+			t.Errorf("job %d left running — the fetch loop kept a row it never dispatched, so nothing can touch it until the lease lapses", id)
+		}
+	}
+	if held := len(c.inflight.snapshot()); held != 0 {
+		t.Errorf("in-flight set still tracks %d lease(s) the fetch loop gave up on", held)
+	}
+}
+
+// Edge case: a pool of one behaves like the single worker that came
+// before it — never more than one job in flight.
+func TestAPoolOfOneRunsOneJobAtATime(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	mem := memdriver.New()
+	entered := make(chan int64, 4)
+	release := make(chan struct{})
+	ws := NewWorkers()
+	Register(ws, blockingWorker(entered, release))
+
+	c := newPoolClient(mem, ws, 1, nil)
+	ids := insertN(t, c, 4)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("no job started")
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	if running := countMemRows(t, mem, ids, "running"); running != 1 {
+		t.Errorf("running rows = %d, want 1 — a pool of one claimed more than it can run", running)
+	}
+	if extra := len(entered); extra != 0 {
+		t.Errorf("%d further handlers were entered, want 0 — a pool of one ran jobs concurrently", extra)
+	}
+
+	close(release)
+	if err := c.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop returned %v, want nil", err)
+	}
+}
+
 // failFirstRetryableDriver refuses the first requeue and accepts the
 // rest, so a test can prove one row that will not go back does not take
 // the others with it.

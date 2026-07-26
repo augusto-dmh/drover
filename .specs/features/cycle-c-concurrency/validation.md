@@ -2,80 +2,153 @@
 
 **Date**: 2026-07-26
 **Spec**: `.specs/features/cycle-c-concurrency/spec.md`
-**Diff range**: `main..HEAD` on `feat/worker-pool-and-graceful-shutdown` (11 commits, `4772040`..`d4cf8b3`)
+**Diff range**: `main..HEAD` on `feat/worker-pool-and-graceful-shutdown` (12 commits, `4772040`..`5204dc7`)
 **Verifier**: independent sub-agent (author ≠ verifier), read-only over the implementation
+**Iteration**: 2 (re-verification after fix commit `5204dc7`)
 
-**Verdict**: ❌ **FAIL** — 3 surviving mutants and 5 uncovered criteria. Everything the cycle
-advertises as its headline behaviour is real and well proven; the gaps are on the second-order
-shutdown paths the spec also names as requirements.
+**Verdict**: ❌ **FAIL** — one surviving mutant on an explicit P1 acceptance criterion.
+
+Three of the first pass's four gaps are genuinely closed with discriminating sensors. The fourth —
+P1-Story2 AC6, claimed-but-undispatched jobs going back to the queue — is now **half** closed: the
+hand-back routine is proven, but nothing proves the fetch loop ever calls it. Deleting the call
+site passes both the unit and the integration suite.
 
 ---
 
-## Task Completion
+## What changed since iteration 1
 
-| Task | Status | Notes |
-| ---- | ------ | ----- |
-| T1 `Concurrency` setting | ✅ Done | `client.go:27,178-180`; `client_test.go:148` covers both defaulting branches + explicit value. Count `client_test.go` = 8 (was 7) ✅ |
-| T2 Handler/finalization context split | ✅ Done | `loop.go:142-144`; `loop_test.go:210` proves it with a context-honouring driver. Count `loop_test.go` = 19 (was 17) ✅ |
-| T3 Worker pool + lifecycle | ✅ Done | `pool.go` (new, 439 lines). Root unit total 77 (was 58), ≥ 70 required ✅ |
-| T4 Bound the drain, escalate, requeue | ⚠️ **Partial** | Two of its own "Done when" criteria have no sensor: *"jobs the fetch loop holds claimed but undispatched at shutdown are requeued"* (`runner.abandon` is **0% covered**) and *"a requeue that loses the race … is logged as expected, not as a failure"* (no assertion on that log; M14 survived). Root unit 77 ≥ 76 ✅ |
-| T5 Prove against PostgreSQL | ✅ Done | `e2e_integration_test.go` = 10 tests (was 7) ✅ |
-| T6 Example program | ✅ Done | `examples/email/`; `go.mod`/`go.sum` unchanged in the diff ✅ |
-| T7 Documentation | ✅ Done | `doc.go`, `README.md`, `loop.go:15-33,53-68` |
+`5204dc7` added four tests to `pool_test.go` and one to `loop_test.go`, deleted one shallow test,
+and amended `spec.md` (P1-Story3 gains AC7 and AC8; SAFE-03 rewritten to cover them).
+
+| First-pass finding | Status now |
+| --- | --- |
+| Fix 1 — `runner.abandon` 0% covered (M11) | ⚠️ **Partially closed** — `abandon`'s body is proven; its *call site* is not. See Finding 1. |
+| Fix 2 — lost-lease takeover branch untested (M13) | ✅ Closed — `loop_test.go:316` |
+| Fix 3 — `Stop` during a poll-interval sleep (M9) | ✅ Closed — `pool_test.go:676` |
+| Fix 4 — requeue failure at shutdown not sensed (M14) | ✅ Closed — `pool_test.go:628` |
+| Fix 5a — `TestExhaustingTheBudgetCancelsTheRunningHandlers` shallow (M6) | ✅ Closed — test deleted; criterion still covered, see below |
+| Fix 5b — AC3 "before it begins waiting" not sensed | ✅ Closed — `pool_test.go:702` |
+| Fix 6 — `TestALongRunningJobCanStillRecordItsOutcome` unclaimed | ✅ Closed — promoted to spec AC7 |
+| Fix 6 — `Concurrency = 1` behavioural sensor; P2 AC2/AC4 by inspection | ⚠️ Still open (cosmetic, within the spec's own stated bar) |
+
+**Deleted-test check**: `TestExhaustingTheBudgetCancelsTheRunningHandlers` was introduced on this
+branch and removed on this branch — `git diff main...HEAD -- '*_test.go' | grep '^-func Test'` is
+empty, so no test that existed on `main` was deleted. Its criterion (escalation cancels running
+handlers) is still covered, and covered *more strongly*, by
+`TestEscalationCancelsHandlersBeforeReturningTheirJobs` (`pool_test.go:776`): its handler blocks on
+`<-ctx.Done()` and `pool_test.go:812` asserts `ordered.cancelFirst.Load()` — the cancel must land
+**before** the requeue write, which the deleted test could not distinguish (it passed under mutant
+M6 because `drain`'s `defer r.cancelJobs()` fires before `Stop` returns either way). No test was
+skipped and no assertion was loosened.
+
+---
+
+## Judgement on the new sensors
+
+### `TestClaimsNeverHandedToAWorkerGoBackToTheQueue` / `TestOneFailedHandBackDoesNotStopTheRest`
+
+Both call `runner.abandon` directly on a hand-built runner rather than driving it through a running
+pool. Judgement:
+
+- `TestOneFailedHandBackDoesNotStopTheRest` — **legitimate**. Its subject is `requeueAll`'s
+  continue-on-failure loop (`pool.go:264-271`), which *is* on the live escalation path
+  (`escalate` → `requeueAll`). Calling it via `abandon` is a convenience, not a substitute; M14 is
+  killed and the behaviour is real.
+- `TestClaimsNeverHandedToAWorkerGoBackToTheQueue` — **strictly weaker than AC6**. It proves: given
+  a slice of rows, `abandon` requeues them without decrementing `attempt`, drops them from the
+  in-flight set, and returns their slots. It does **not** prove the sentence AC6 actually states —
+  that *the fetch loop*, on the `case <-r.stopFetch` arm of its hand-off select (`pool.go:370-375`),
+  passes its undispatched remainder to `abandon`. The test hand-rolls a model of that caller
+  (`<-r.slots` + `c.inflight.add` per row) and then bypasses it, so the wiring, the `rows[i:]`
+  slicing, and the caller's bookkeeping are all outside the sensor.
+
+  Confirmed empirically: mutant **M16** below — replace the arm with a bare `return` — passes
+  `go test -race ./...` and `go test -race -tags=integration ./...`.
+
+### `TestStopDoesNotWaitOutThePollInterval` / `TestClaimingStopsBeforeTheDrainBeginsWaiting`
+
+Both wall-clock; both judged **reliable and discriminating**, and empirically stable at
+`-count=10` under `-race` (20/20 passes, no flakes; observed 0.05 s and 0.60 s per iteration).
+
+- `TestStopDoesNotWaitOutThePollInterval` (`pool_test.go:676`): bound is 1 s against a 3 s poll
+  interval, and the observed value is 0.05 s — a 20× margin on the pass side and a 3× margin on the
+  discriminating side. Under mutant M9 (`sleep` ignores `stopFetch`) `Stop` must take ~3 s, so the
+  1 s bound separates the two cleanly. Not a lower-bound-only assertion.
+- `TestClaimingStopsBeforeTheDrainBeginsWaiting` (`pool_test.go:702`): samples `fetches` at ~150 ms
+  and ~400 ms into a 600 ms `Stop` budget, both while a blocked handler holds the drain open, and
+  requires the two samples to be **equal**. At a 1 ms poll interval a loop still claiming would add
+  hundreds of fetches between the samples, so the test discriminates "stopped claiming before it
+  began waiting" from the weaker "stopped claiming by the time `Stop` returned" — which is exactly
+  the distinction AC3 draws. Its only timing dependency is that the `go func(){ stopped <- c.Stop(budget) }()`
+  goroutine gets scheduled within 150 ms, which is generous even under `-race` on a loaded machine.
+
+### `TestALostLeaseIsReportedAsATakeoverNotAFailure`
+
+**Genuine and two-sided.** `loop_test.go:336` asserts the takeover *is* reported
+(`!strings.Contains(out, "taken over by another worker")` → error) and `loop_test.go:339` asserts
+the generic failure line is *absent* (`strings.Contains(out, `msg="drover: finalize job"`)` →
+error). Driven through `leaseLostDriver`, whose `MarkCompleted` returns `driver.ErrLeaseLost`, so
+mutant M13 (log the lost lease as an ordinary `ERROR` finalize failure) fails both assertions.
 
 ---
 
 ## Spec-Anchored Acceptance Criteria
 
+Only rows that changed since iteration 1 carry new evidence; unchanged rows are re-stated with the
+same evidence.
+
 ### P1-Story1: Jobs execute concurrently
 
-| Criterion | Spec-defined outcome | `file:line` + assertion | Result |
-| --- | --- | --- | --- |
-| AC1 `Concurrency = n > 0`, ≥ n jobs due → n handlers executing simultaneously | n concurrent handler entries observed before any release | `pool_test.go:91-97` — loop draining `concurrency` (=4) values from `entered` before `close(release)`; `t.Fatalf("only %d of %d handlers were running at once", i, concurrency)` | ✅ PASS |
-| AC2 `Concurrency ≤ 0` → default 10, no error | `c.concurrency == 10` | `client_test.go:168` — `if c.concurrency != tt.want` over `{0→10, -4→10, 1→1, 64→64}`; `client_test.go:143` — `if c.concurrency != 10` | ✅ PASS |
-| AC3 One fetch round claims ≤ idle-worker count | rows in `running` never exceed pool size | `pool_test.go:140` — `if running := countMemRows(t, mem, ids, "running"); running != concurrency` (3 workers, 8 queued, all blocked) | ✅ PASS |
-| AC4 Each claimed job executed exactly once by exactly one worker | `runs[id] == 1` for every id | `pool_test.go:185` — `if runs[id] != 1`; `e2e_integration_test.go:506` — `if worker.runs[id] != 1` (Postgres, `Concurrency: 8`, 60 jobs) | ✅ PASS |
-| AC5 Panic on one worker → others keep working; panicking job retryable with stack | other jobs complete; row `retryable`, error names the panic, `Trace` non-empty | `pool_test.go:233-239` — 4 healthy jobs drained alongside a panic + a stuck handler; `loop_test.go:497` — `waitFor(t, h.rowInState(bad.ID, "retryable"), …)`; `loop_test.go:502` — `!strings.Contains(recorded[0].Error, "kaboom")`; `loop_test.go:505` — `if recorded[0].Trace == ""` | ✅ PASS |
-| AC6 Idle → fetch at poll interval and no faster, **bounded count over a fixed span** | count in a 150 ms window at 30 ms bounded both sides | `loop_test.go:849` — `if fetches < 2`; `loop_test.go:854` — `if fetches > 20` | ✅ PASS (upper bound present — lesson L-001 honoured) |
-| AC7 One handler blocking indefinitely → other workers stay free | healthy jobs still complete | `pool_test.go:233-239` (the `"block"` job never returns until `close(release)` at `:241`) | ✅ PASS |
+| Criterion | `file:line` + assertion | Result |
+| --- | --- | --- |
+| AC1 n handlers executing simultaneously | `pool_test.go:91-97` — drains `concurrency` (=4) values from `entered` before `close(release)`; `t.Fatalf("only %d of %d handlers were running at once", …)` | ✅ PASS |
+| AC2 `Concurrency ≤ 0` → default 10 | `client_test.go:168` — `if c.concurrency != tt.want` over `{0→10, -4→10, 1→1, 64→64}` | ✅ PASS |
+| AC3 One fetch round claims ≤ idle-worker count | `pool_test.go:140` — `if running := countMemRows(t, mem, ids, "running"); running != concurrency` | ✅ PASS |
+| AC4 Executed exactly once by exactly one worker | `pool_test.go:185` — `if runs[id] != 1`; `e2e_integration_test.go:506` — same, `Concurrency: 8`, 60 jobs on Postgres | ✅ PASS |
+| AC5 Panic isolated; job retryable with stack | `pool_test.go:233-239`; `loop_test.go:497` state `retryable`; `:502` error contains `"kaboom"`; `:505` `Trace != ""` | ✅ PASS |
+| AC6 Idle → poll interval and no faster, bounded both sides | `loop_test.go:849` `fetches < 2`; `loop_test.go:854` `fetches > 20` | ✅ PASS |
+| AC7 One blocking handler → others stay free | `pool_test.go:233-239` | ✅ PASS |
 
 ### P1-Story2: Shutdown is ordered, bounded and honest
 
-| Criterion | Spec-defined outcome | `file:line` + assertion | Result |
-| --- | --- | --- | --- |
-| AC1 `Start` on a stopped client → starts pool, returns `nil`, does not block | `err == nil`, control returns while handlers still run | `pool_test.go:87` — `if err := c.Start(ctx); err != nil` followed by assertions that run while 4 handlers are blocked | ✅ PASS (structural: a blocking `Start` would deadlock the test) |
-| AC2 Second `Start` → error, no second pool | `errors.Is(err, ErrAlreadyStarted)` | `pool_test.go:257` — `if err := c.Start(ctx); !errors.Is(err, ErrAlreadyStarted)` | ✅ PASS ("no second pool" itself asserted only indirectly, via `goleak.VerifyNone` at `:248`) |
-| AC3 `Stop` ceases claiming before waiting; nothing claimed after | fetch count and rescue-sweep count frozen | `pool_test.go:324` — `if after := counting.fetches.Load(); after != settled`; `pool_test.go:405` — same for `sweeping.sweeps` | ⚠️ **Spec-precision gap** — both assert "no claim *after `Stop` returned*"; nothing pins "*before* it begins waiting". The ordering is real in `pool.go:166-176` but not sensed. |
-| AC4 Everything drains inside budget → `nil`, every job terminal | `Stop == nil`; zero rows `running` | `pool_test.go:177` — `if err := c.Stop(context.Background()); err != nil` after `completed == 24`; `loop_test.go:819-826`; `e2e_integration_test.go:537` — `if running := countInState(t, pool, "running"); running != 0` | ✅ PASS |
-| AC5 Budget expires → cancel job contexts, requeue best-effort, non-`nil` error naming the count | error wraps `ErrDrainIncomplete` and contains the count; handlers cancelled; rows requeued | `pool_test.go:463` — `!errors.Is(err, ErrDrainIncomplete)`; `pool_test.go:466` — `!strings.Contains(err.Error(), "2 job(s)")`; `pool_test.go:481` — `if row.State != "retryable"`; `pool_test.go:591-595` — `select { case <-cancelled: … }` | ✅ PASS |
-| AC6 Jobs claimed but **not yet handed to a worker** at shutdown → returned to the queue | those rows become claimable, not left leased | **no evidence** — `runner.abandon` (`pool.go:229`) is 0.0% covered; mutant M11 (delete its `requeueAll`) survived unit **and** integration suites. The covered case at `pool_test.go:721` is the *different* surplus path (`pool.go:347-352`). | ❌ **GAP** |
-| AC7 Requeued job claimable immediately, `attempt` not decremented, reason recorded | `ScheduledAt ≤ now`; `attempt` unchanged; error history names the shutdown | `pool_test.go:483-486` — `if !row.ScheduledAt.After(time.Now()) { continue }` else `t.Errorf`; `pool_test.go:535` — `if requeued.Attempt != claimed.Attempt`; `pool_test.go:545` — `!strings.Contains(recorded[0].Error, "shut down")`; `e2e_integration_test.go:608` — `if attempt != 1` | ✅ PASS |
-| AC8 `Stop` before `Start` → error immediately, no block | `errors.Is(err, ErrNotStarted)` | `pool_test.go:270` — `if err := c.Stop(context.Background()); !errors.Is(err, ErrNotStarted)` | ✅ PASS |
-| AC9 Second `Stop` → returns without blocking, no panic/double-close | first call's verdict, inside 2 s | `pool_test.go:294` — `if !errors.Is(second, first)`; `pool_test.go:297` — `case <-time.After(2*time.Second): t.Fatal("second Stop blocked…")` | ✅ PASS |
-| AC10 Cancelling `Start`'s context → shutdown begins on its own, same ordering | shutdown completes unaided; heartbeat still ordered after the fetch loop | `pool_test.go:362` — `case <-c.runner.done:` (else `t.Fatal`); `heartbeat_test.go:287-301` — lease still renewed and un-lapsed while draining post-cancel | ✅ PASS |
+| Criterion | `file:line` + assertion | Result |
+| --- | --- | --- |
+| AC1 `Start` non-blocking, returns nil | `pool_test.go:87` + assertions running while 4 handlers block | ✅ PASS |
+| AC2 Second `Start` → error, no second pool | `pool_test.go:257` — `!errors.Is(err, ErrAlreadyStarted)` | ✅ PASS |
+| AC3 Cease claiming **before** it begins waiting | **NEW** `pool_test.go:739` — two `counting.fetches.Load()` samples taken 250 ms apart *while the drain is still waiting* must be equal, at a 1 ms poll interval | ✅ PASS (iteration-1 precision gap closed) |
+| AC4 Drains inside budget → nil, every job terminal | `pool_test.go:177`; `e2e_integration_test.go:537` — `if running := countInState(t, pool, "running"); running != 0` | ✅ PASS |
+| AC5 Budget expires → cancel, requeue, error names the count | `pool_test.go:463` `ErrDrainIncomplete`; `:466` `"2 job(s)"`; `:481` `row.State == "retryable"` | ✅ PASS |
+| AC6 Jobs claimed but **not yet handed to a worker** → returned to the queue | ⚠️ **Partial** — `pool_test.go:596` `row.State != "retryable"`, `:599` `row.Attempt != 1`, `:606` `free slots` — but all via a **direct call** to `runner.abandon`. The fetch loop's `case <-r.stopFetch: r.abandon(rows[i:])` (`pool.go:372-373`) has no sensor; mutant **M16** deleting it survives unit **and** integration. | ❌ **GAP** |
+| AC7 Requeue claimable now, attempt not decremented, reason recorded | `pool_test.go:483-486`; `:535` `requeued.Attempt != claimed.Attempt`; `:545` error contains `"shut down"`; `e2e_integration_test.go:608` `attempt != 1` | ✅ PASS |
+| AC8 `Stop` before `Start` → error immediately | `pool_test.go:270` — `!errors.Is(err, ErrNotStarted)` | ✅ PASS |
+| AC9 Second `Stop` → same verdict, no block/panic | `pool_test.go:294` `!errors.Is(second, first)`; `:297` 2 s bound | ✅ PASS |
+| AC10 Cancelling `Start`'s ctx → shutdown begins unaided | `pool_test.go:362` `case <-c.runner.done:`; `heartbeat_test.go:287-301` | ✅ PASS |
 
 ### P1-Story3: Reliability guarantees survive the pool
 
-| Criterion | Spec-defined outcome | `file:line` + assertion | Result |
-| --- | --- | --- | --- |
-| AC1 n in flight → each tick renews all n leases in **one call** | a single `ExtendLeases` carrying n entries | `pool_test.go:832` — `waitFor(t, func() bool { return counting.largestBatch() == concurrency }, …)` with `concurrency = 4` | ✅ PASS |
-| AC2 Heartbeat keeps renewing during drain, stops only after the last worker | lease strictly advances after cancel; row still `running`; lease not lapsed | `heartbeat_test.go:289` — `current.LeasedUntil.After(leaseAtCancel)`; `heartbeat_test.go:295` — `if draining.State != "running"`; `heartbeat_test.go:298` — `draining.LeasedUntil.Before(time.Now())` | ✅ PASS ("stops only after" proven indirectly by `goleak` + mutant M3) |
-| AC3 Job re-claimed elsewhere → this worker's write refused with `ErrLeaseLost`, logged as a **takeover, not a failure** | `writeFailed` takes the `ErrLeaseLost` branch and logs at WARN with the takeover message | **no evidence at client level** — `loop.go:247-250` has no test anywhere; mutant M13 (log it as an ordinary `ERROR` finalize failure) survived. The *driver-side* fence is proven at `internal/memdriver/memdriver_test.go:574` and `internal/pgdriver/pgdriver_integration_test.go:182`, but that is the driver refusing, not the client classifying. | ❌ **GAP** (pre-existing code, unchanged by this cycle, but claimed as an AC here) |
-| AC4 Job context cancelled by escalation → outcome still recorded; finalization not on the cancelled context | handler observes cancellation; row reaches `completed`/`retryable` anyway | `loop_test.go:248` — `if !<-sawCancellation`; `loop_test.go:255` — `if stored.State != tt.wantState` (`completed` / `retryable`), driven through `ctxDriver` (`loop_test.go:189-203`), which **does** honour context — so the assertion discriminates | ✅ PASS |
-| AC5 Full `Start`/`Stop` cycle leaks no goroutine | `goleak.VerifyNone` passes | `pool_test.go:73,110,152,193,248,276,305,335,383,431,498,558,626,684,739,803` — `defer goleak.VerifyNone(t, goleak.IgnoreCurrent())` (16 lifecycle tests) | ✅ PASS |
-| AC6 Concurrent claims race the same rows → no row run by two workers of one client | `runs[id] == 1` under real `SKIP LOCKED` | `e2e_integration_test.go:506` — `if worker.runs[id] != 1` (8 workers, 60 rows, Postgres); `pool_test.go:185` in-memory | ✅ PASS |
+| Criterion | `file:line` + assertion | Result |
+| --- | --- | --- |
+| AC1 Each tick renews all n leases in one call | `pool_test.go:832` — `counting.largestBatch() == concurrency` (4) | ✅ PASS |
+| AC2 Heartbeat renews during drain, stops only after | `heartbeat_test.go:289` `current.LeasedUntil.After(leaseAtCancel)`; `:295` state `running`; `:298` lease not lapsed | ✅ PASS |
+| AC3 Lost lease → refused, logged as takeover not failure | **NEW** `loop_test.go:336` `!strings.Contains(out, "taken over by another worker")`; `loop_test.go:339` `strings.Contains(out, `msg="drover: finalize job"`)` | ✅ PASS (M13 killed) |
+| AC4 Cancelled job ctx → outcome still recorded, not on the cancelled ctx | `loop_test.go:248` `!<-sawCancellation`; `:255` `stored.State != tt.wantState`, driven through the context-honouring `ctxDriver` | ✅ PASS |
+| AC5 No goroutine leaks across `Start`/`Stop` | `defer goleak.VerifyNone(t, goleak.IgnoreCurrent())` on 17 lifecycle tests incl. `pool_test.go:677,703` | ✅ PASS |
+| AC6 Concurrent claims race → no double execution | `e2e_integration_test.go:506` (Postgres, `SKIP LOCKED`, 8×60); `pool_test.go:185` | ✅ PASS |
+| **AC7 (new)** Job outliving its lease can still record its outcome; deadline starts at the write | `loop_test.go:298` — `if stored.State != "completed"` with `LeaseDuration: 10ms` and a 40 ms handler, through `ctxDriver` (which honours context, so it discriminates). Implementation: `loop.go:142-144` `context.WithTimeout(context.WithoutCancel(jobCtx), c.leaseDuration)` | ✅ PASS |
+| **AC8 (new)** Lost lease reported as takeover rather than failed write | `loop_test.go:336` and `loop_test.go:339` (both directions asserted — see above) | ✅ PASS |
 
 ### P2-Story4: A runnable example program
 
-| Criterion | Spec-defined outcome | `file:line` + assertion | Result |
-| --- | --- | --- | --- |
-| AC1 Compiles and vets | `go build ./... && go vet ./...` exit 0 | Gate run — exit 0 | ✅ PASS |
-| AC2 Against Postgres: migrates, registers a worker, enqueues a batch, pool > 1 | all four present | `examples/email/main.go:88` `drover.Migrate`, `:93` `drover.Register`, `:103` `enqueueBatch`, `:35` `workerConcurrency = 4` | ⚠️ **Inspection only, no assertion** — but the spec's own Independent Test asks only for `go vet ./examples/...` + a stub unit test, so this is within the spec's stated bar |
-| AC3 Simulated delivery fails → ordinary retry path, retry visible in output | flaky subset fails attempt 1, succeeds after | `examples/email/delivery_test.go:103` — `if (err != nil) != tt.wantErr` over `{ada@…,1→err}, {ada@…,2→nil}, {grace@…,1→nil}`; `main.go:57` returns the error to drover; `main.go:142` logs the predicted retry count | ✅ PASS (retry mechanism itself is library-tested) |
-| AC4 SIGINT → `Stop` with a bounded context, reports what drained | `signal.NotifyContext` + 30 s budget + verdict logged | `examples/email/main.go:112-124` | ⚠️ **Inspection only, no assertion** |
-| AC5 No new module dependency | `go.mod`/`go.sum` unchanged | `git diff main...HEAD -- go.mod go.sum` → empty | ✅ PASS |
+| Criterion | Evidence | Result |
+| --- | --- | --- |
+| AC1 Compiles and vets | Gate — exit 0 | ✅ PASS |
+| AC2 Migrates, registers, enqueues, pool > 1 | `examples/email/main.go:88,93,103,35` — inspection only | ⚠️ Within the spec's own Independent Test bar |
+| AC3 Simulated failure → ordinary retry, visible in output | `examples/email/delivery_test.go:103` — `if (err != nil) != tt.wantErr`; `main.go:57,142` | ✅ PASS |
+| AC4 SIGINT → bounded `Stop`, reports what drained | `examples/email/main.go:112-124` — inspection only | ⚠️ Within the spec's stated bar |
+| AC5 No new module dependency | `git diff main...HEAD -- go.mod go.sum` empty | ✅ PASS |
 
-**Status**: ❌ 2 hard gaps in P1 (Story2 AC6, Story3 AC3) + 1 spec-precision gap (Story2 AC3) + 2 inspection-only P2 criteria.
+**Status**: 33/34 ACs matched their spec-defined outcome. 1 hard gap (P1-Story2 AC6), 2
+inspection-only P2 criteria within the spec's own stated bar.
 
 ---
 
@@ -83,61 +156,65 @@ shutdown paths the spec also names as requirements.
 
 | Edge case | Evidence | Result |
 | --- | --- | --- |
-| `Concurrency = 1` → previous single-worker semantics, one job in flight | `client_test.go:158` — `{name: "one is honoured, not mistaken for unset", cfg: Config{Concurrency: 1}, want: 1}` is **config-level only**. Several tests run with `concurrency = 1` (`pool_test.go:506,571,641,693,747`) but none asserts at-most-one-in-flight. | ⚠️ Partial — no behavioural assertion |
-| `Stop` while the fetch loop is sleeping out a poll interval → shutdown does not wait it out | **no evidence** — mutant M9 (make `sleep` ignore `stopFetch`) survived unit + integration. No test bounds `Stop`'s elapsed time for an idle pool. | ❌ **GAP** |
-| Fetch error → log, back off one poll interval, continue; pool does not stop | `loop_test.go:872` — `waitFor(t, h.rowInState(row.ID, "completed"), …)` after 2 forced fetch failures; `loop_test.go:876` — `!strings.Contains(logs, 'level=ERROR msg="drover: fetch jobs"')` | ✅ PASS (mutant M15 killed). The *duration* of the back-off is not asserted — minor spec-precision note. |
-| Requeue of an unfinished job fails at shutdown → logged, shutdown continues | **no evidence** — mutant M14 (`return` instead of `continue` after a failed requeue) survived; no test injects a requeue failure during escalation. `requeueFailed` is 75% covered — only the lost-lease/expected branch executes, and nothing asserts on either log line. | ❌ **GAP** |
-| Handler returns after cancellation, job already requeued and re-claimed → write refused by the fence | **no evidence** — same hole as P1-Story3 AC3 (`loop.go:247-250` untested) | ❌ **GAP** |
-| `Concurrency` exceeds due jobs → idle workers consume no DB capacity; one fetch sized to the idle count | `pool_test.go:140` (never claims past idle count) + `loop_test.go:849/854` (one bounded fetch cadence when idle, not one per worker) | ✅ PASS |
-| `Stop`'s context already done → still stops fetching and requeues before returning its error | `pool_test.go:764` — `if err := c.Stop(spent); !errors.Is(err, ErrDrainIncomplete)`; `pool_test.go:769` — `if row.State != "retryable"` | ✅ PASS |
+| `Concurrency = 1` → one job in flight | `client_test.go:158` config-level only; no behavioural at-most-one-in-flight assertion | ⚠️ Partial (carried forward, cosmetic) |
+| `Stop` while the fetch loop sleeps a poll interval | **NEW** `pool_test.go:695` — `if elapsed := time.Since(start); elapsed > time.Second` against a 3 s `PollInterval` | ✅ PASS (M9 killed) |
+| Fetch error → log, back off, continue | `loop_test.go:872,876` | ✅ PASS (M15 killed) |
+| Requeue failure at shutdown → logged, shutdown continues | **NEW** `pool_test.go:666` `stranded != 1`; `pool_test.go:669` `returned != 2`, via `failFirstRetryableDriver` | ✅ PASS (M14 killed) |
+| Late handler return after re-claim → write refused by the fence | **NEW** `loop_test.go:336,339` | ✅ PASS |
+| `Concurrency` exceeds due jobs → no per-worker fetch | `pool_test.go:140` + `loop_test.go:849/854` | ✅ PASS |
+| `Stop`'s ctx already done → still stops fetching and requeues | `pool_test.go:764,769` | ✅ PASS |
 
 ---
 
 ## Discrimination Sensor
 
-Run in a throwaway `tar`-copy of the repo at
-`$SCRATCH/mut` (deleted afterwards). The real working tree was never modified —
-`git status --short` and `git diff --stat` are both empty, verified before and after.
-Command per mutant: `go test -race -count=1 -timeout 300s .` (survivors re-run with
-`-tags=integration`).
+Mutations M1–M15 were run in iteration 1 and re-confirmed after `5204dc7` by the interrupted
+iteration-2 pass; they are recorded here as established. M16 is new to this pass.
+
+All mutation work was done in a throwaway `git archive` extraction outside the repo, deleted
+afterwards. The working tree was never modified: `git diff -- '*.go'` and `git status --short` are
+both empty, verified before and after.
+Command per mutant: `go test -race -count=1 -timeout 300s .`; survivors re-run with `-tags=integration`.
 
 | # | File:line | Mutation | Killed? | Killed by |
 | - | --------- | -------- | ------- | --------- |
-| M1 | `pool.go:76` | `concurrency: c.concurrency` → `1` (pool size always 1) | ✅ Killed | `TestPoolRunsJobsConcurrently`, `TestPoolClaimsNoMoreJobsThanItCanRun`, `TestOneMisbehavingJobDoesNotStallThePool`, `TestStopReportsAndRequeuesTheJobsItCouldNotFinish`, `TestHeartbeatRenewsEveryWorkersLease` |
-| M2 | `pool.go:383-385` | Worker returns its slot **before** running the job → fetch loop claims past the idle-worker count | ✅ Killed | `TestPoolClaimsNoMoreJobsThanItCanRun`, `TestSurplusClaimedJobsAreReturnedImmediately` |
-| M3 | `pool.go:175-189` | `close(r.stopHeartbeat)` + `background.Wait()` moved **before** the drain wait | ✅ Killed | `TestHeartbeatOutlivesCancellationUntilTheDrainFinishes` |
-| M4 | `pool.go:312` | `MarkRetryable(ctx, lease, now, detail)` → `MarkSnoozed(ctx, lease, now)` (gives the attempt back) | ✅ Killed | `TestShutdownRequeueDoesNotGiveBackTheAttempt` + 3 others |
-| M5 | `pool.go:221-222` | `escalate` returns `nil` instead of the `ErrDrainIncomplete` error | ✅ Killed | 6 tests incl. `TestStopReportsAndRequeuesTheJobsItCouldNotFinish` |
-| M6 | `pool.go:214` | `escalate` no longer calls `r.cancelJobs()` | ✅ Killed | `TestEscalationCancelsHandlersBeforeReturningTheirJobs` **only** — see note below |
-| M7 | `loop.go:143` | `finalizeContext`: drop `context.WithoutCancel` (finalize on the cancelled handler context) | ✅ Killed | `TestJobOutcomeIsRecordedEvenWhenItsContextWasCancelled` (both subtests) |
-| M8 | `pool.go:350` | Drop the surplus-row `requeueAll` (keep the truncation) | ✅ Killed | `TestSurplusClaimedJobsAreReturnedImmediately` |
-| M9 | `pool.go:433-438` | `sleep()` waits the timer unconditionally, ignoring `stopFetch` | ❌ **Survived** | — (also survived `-tags=integration`) |
-| M10 | `heartbeat.go:38` | `leases = leases[:1]` — renew only the first in-flight lease | ✅ Killed | `TestHeartbeatRenewsEveryWorkersLease` |
-| M11 | `pool.go:234` | `abandon` no longer requeues claimed-but-undispatched rows | ❌ **Survived** | — (also survived `-tags=integration`) |
-| M12 | `client.go:27` | `defaultConcurrency = 10` → `1` | ✅ Killed | `TestConfigZeroValuesGetDefaults`, `TestConcurrencyConfigFallsBackToTheDefault` |
-| M13 | `loop.go:247-250` | `writeFailed` logs a lost lease as an ordinary `ERROR` finalize failure instead of a WARN takeover | ❌ **Survived** | — |
-| M14 | `pool.go:266-268` | A failed requeue `return`s instead of `continue`, abandoning the remaining requeues | ❌ **Survived** | — |
-| M15 | `pool.go:334-338` | A fetch error `return`s (stops the pool) instead of backing off and continuing | ✅ Killed | `TestStartLogsAndRetriesAfterFetchErrors` |
+| M1 | `pool.go:76` | pool size forced to 1 | ✅ Killed | `TestPoolRunsJobsConcurrently` +4 |
+| M2 | `pool.go:383-385` | worker returns its slot before running the job | ✅ Killed | `TestPoolClaimsNoMoreJobsThanItCanRun`, `TestSurplusClaimedJobsAreReturnedImmediately` |
+| M3 | `pool.go:175-189` | heartbeat stopped before the drain wait | ✅ Killed | `TestHeartbeatOutlivesCancellationUntilTheDrainFinishes` |
+| M4 | `pool.go:312` | `MarkRetryable` → `MarkSnoozed` (gives the attempt back) | ✅ Killed | `TestShutdownRequeueDoesNotGiveBackTheAttempt` +3 |
+| M5 | `pool.go:221-222` | `escalate` returns `nil` | ✅ Killed | 6 tests |
+| M6 | `pool.go:214` | `escalate` no longer calls `r.cancelJobs()` | ✅ Killed | `TestEscalationCancelsHandlersBeforeReturningTheirJobs` (the sole shallow test that also "covered" it was deleted in `5204dc7`) |
+| M7 | `loop.go:143` | drop `context.WithoutCancel` in `finalizeContext` | ✅ Killed | `TestJobOutcomeIsRecordedEvenWhenItsContextWasCancelled` |
+| M8 | `pool.go:350` | drop the surplus-row `requeueAll` | ✅ Killed | `TestSurplusClaimedJobsAreReturnedImmediately` |
+| M9 | `pool.go:433-438` | `sleep()` ignores `stopFetch` | ✅ **Killed (was survivor)** | `TestStopDoesNotWaitOutThePollInterval` |
+| M10 | `heartbeat.go:38` | renew only the first in-flight lease | ✅ Killed | `TestHeartbeatRenewsEveryWorkersLease` |
+| M11 | `pool.go:234` | `abandon` no longer requeues | ✅ **Killed (was survivor)** | `TestClaimsNeverHandedToAWorkerGoBackToTheQueue` |
+| M12 | `client.go:27` | `defaultConcurrency` 10 → 1 | ✅ Killed | `TestConfigZeroValuesGetDefaults`, `TestConcurrencyConfigFallsBackToTheDefault` |
+| M13 | `loop.go:247-250` | lost lease logged as an ordinary `ERROR` finalize failure | ✅ **Killed (was survivor)** | `TestALostLeaseIsReportedAsATakeoverNotAFailure` |
+| M14 | `pool.go:266-268` | failed requeue `return`s instead of `continue` | ✅ **Killed (was survivor)** | `TestOneFailedHandBackDoesNotStopTheRest` |
+| M15 | `pool.go:334-338` | fetch error stops the pool | ✅ Killed | `TestStartLogsAndRetriesAfterFetchErrors` |
+| **M16** | `pool.go:372-373` | fetch loop's `case <-r.stopFetch:` arm returns **without** calling `r.abandon(rows[i:])` | ❌ **Survived** | — (also survived `-tags=integration`, 12.6 s, 92 tests) |
 
-**Sensor depth**: P0-full (15 mutations — data-integrity / at-least-once critical path).
-**Result**: 11/15 killed, **4 survived** — ❌ FAIL.
+**Sensor depth**: P0-full (16 mutations — data-integrity / at-least-once critical path).
+**Result**: 15/16 killed, **1 survived** — ❌ FAIL.
 
-**Note on M6 (weak-but-covered):** `TestExhaustingTheBudgetCancelsTheRunningHandlers`
-(`pool_test.go:557`) passes under M6 and therefore does **not** prove what its name claims.
-`drain`'s `defer r.cancelJobs()` (`pool.go:161`) fires before `Stop` returns, so the handler is
-cancelled either way and the test's 2 s wait at `:591` is satisfied. Only
-`TestEscalationCancelsHandlersBeforeReturningTheirJobs` (`pool_test.go:625`) actually
-discriminates, via the cancel-before-requeue ordering. The AC is covered; the first test is
-decorative.
+---
 
-**Coverage cross-check** (`go tool cover -func`, root unit suite):
+## Gate Check
 
-```
-pool.go:229  abandon         0.0%     <- P1-Story2 AC6 has no execution at all
-pool.go:282  requeueFailed  75.0%     <- error branch never taken
-pool.go:253  requeueAll     88.9%
-pool.go:316  fetch          86.7%
-```
+| Gate | Command | Result |
+| --- | --- | --- |
+| Build + vet | `go build ./... && go vet ./...` | ✅ exit 0 |
+| Quick | `go test -race -count=1 ./...` | ✅ exit 0 — root 3.1 s, all packages `ok` |
+| Full | `go test -race -count=1 -tags=integration ./...` | ✅ exit 0 — root 13.3 s, `pgdriver` 7.1 s, `migrate` 5.2 s, `memdriver` 1.0 s, `examples/email` 1.0 s |
+| Lint | `go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest run` | ✅ exit 0 — **0 issues** |
+| Flake probe | `go test -race -count=10 -run 'TestClaimingStopsBeforeTheDrainBeginsWaiting\|TestStopDoesNotWaitOutThePollInterval' .` | ✅ 20/20 PASS, 7.6 s total |
+
+**Test counts** (top-level `--- PASS`, `go test -v`):
+
+- Root unit: **81** (iteration 1: 77; baseline `main`: 58) — +4 net (+5 added, −1 deleted-on-branch). ✅
+- Root with `-tags=integration`: **92**.
+- **No test deleted relative to `main`, none skipped, no assertion loosened.** ✅
 
 ---
 
@@ -146,161 +223,90 @@ pool.go:316  fetch          86.7%
 | Principle | Status |
 | --- | --- |
 | Minimum code — no features beyond what was asked | ✅ |
-| No abstractions for single-use code | ✅ `runner` is one value per run, not a framework |
-| No unnecessary "flexibility" added | ✅ `queue` is a field rather than a hard-coded constant, which the design justifies as the Cycle D seam |
-| Only touched files required for the task | ✅ 21 files, all in scope |
-| Didn't "improve" unrelated code | ✅ |
-| Matches existing patterns/style | ✅ context-first, `%w` wrapping, package-prefixed sentinels, `*slog.Logger` via config — per CLAUDE.md |
-| Would a senior engineer approve? | ✅ The reasoning comments on `pool.go:154-193`, `loop.go:79-89` and `inflight.go:71-84` are unusually good; the shutdown ordering is correct and explained |
-| Tests map to ACs and are non-shallow | ⚠️ 14/15 spot-checked well; `TestExhaustingTheBudgetCancelsTheRunningHandlers` is shallow (see M6 note) |
-| Spec-anchored outcome check | ⚠️ 2 hard gaps + 1 precision gap (see tables) |
-| Per-layer coverage expectation met | ⚠️ Domain logic 1:1 except `abandon` (0%) and the takeover branch |
-| Every test maps to a spec requirement — no unclaimed tests | ⚠️ One near-miss: `TestALongRunningJobCanStillRecordItsOutcome` (`loop_test.go:267`) maps to design decision AD-027 / commit `95ade96`, not to any spec AC. It is a legitimate regression guard adjacent to SAFE-03 AC4 — recommend adding it to the spec rather than removing it. No other unclaimed tests. |
-| Documented guidelines followed | ✅ `CLAUDE.md` (table-driven, `t.Parallel` where safe, `-race`, testcontainers, `testing/synctest` in `heartbeat_test.go`, `goleak` on every lifecycle test) |
-
----
-
-## Gate Check
-
-| Gate | Command | Result |
-| --- | --- | --- |
-| Build | `go build ./... && go vet ./...` | ✅ exit 0 |
-| Quick | `go test -race ./...` | ✅ exit 0 — all packages `ok` |
-| Full | `go test -race -tags=integration ./...` | ✅ exit 0 — root 12.9 s, `pgdriver` 7.4 s, `migrate` 4.8 s, all `ok` |
-
-**Test counts** (top-level `--- PASS`, `go test -v`):
-
-- Root unit: **77** (baseline 58) — **+19**. T3 required ≥ 70, T4 required ≥ 76. ✅
-- Root with `-tags=integration`: **88** (= 77 unit + 10 e2e + 1 client-integration). `e2e_integration_test.go` = 10 (baseline 7), T5 required ≥ 10. ✅
-- `examples/email`: 3 (new)
-- `internal/memdriver`: unchanged
-- **No test count decreased; no assertion weakened.** ✅
-
-**Skipped tests**: none.
-**Failures**: none.
-
----
-
-## Fix Plans
-
-### Fix 1 — `runner.abandon` has no test at all (P1-Story2 AC6 / SHUT-05, T4 done-when)
-
-- **Root cause**: no test can reach `pool.go:370-375`'s `case <-r.stopFetch:` branch. It needs the
-  fetch loop parked on the unbuffered hand-off (`r.jobs <- row`) at the instant `stopFetch` closes —
-  i.e. a fetch that returns more rows than there are workers *ready to receive*, with `Stop` timed
-  into the hand-off. `TestSurplusClaimedJobsAreReturnedImmediately` looks like it covers this but
-  exercises the separate over-claim guard at `pool.go:347-352`.
-- **Fix task**: add a test with `Concurrency: 1` and a driver that blocks inside `FetchAvailable`
-  until the worker is occupied, returning ≥ 2 rows; call `Stop` while the loop is mid-hand-off;
-  assert every undispatched row is `retryable` with `attempt` unchanged, and that the slot
-  accounting still lets `Stop` return.
-- **Verify**: mutant M11 (delete `r.requeueAll(leases)` at `pool.go:234`) must fail the suite.
-- **Priority**: **Blocker** — this is an explicit P1 acceptance criterion with zero execution, and
-  the failure mode it guards (a row `running` + leased with nothing executing it) is the exact state
-  the whole slot-accounting design exists to prevent.
-
-### Fix 2 — the lost-lease takeover branch is untested (P1-Story3 AC3 + late-handler-return edge case)
-
-- **Root cause**: `loop.go:246-254` (`writeFailed`) predates this cycle and was never covered. The
-  spec re-claims it as an AC because the pool is what makes takeovers routine.
-- **Fix task**: with a driver that returns `driver.ErrLeaseLost` from `MarkCompleted`, run `runJob`
-  and assert the log carries `msg="drover: job taken over by another worker, discarding this
-  outcome"` at `level=WARN` and **not** `level=ERROR msg="drover: finalize job"`; assert the row's
-  state is untouched (the new holder's outcome is not overwritten).
-- **Verify**: mutant M13 must fail the suite.
-- **Priority**: **Major**
-
-### Fix 3 — `Stop` during a poll-interval sleep is unbounded in test (edge case)
-
-- **Root cause**: no test measures how long `Stop` takes when the fetch loop is idle-sleeping.
-- **Fix task**: start a pool with `PollInterval: 2 * time.Second` and no jobs, wait for the loop to
-  enter its sleep, then assert `Stop(context.Background())` returns in well under the interval.
-- **Verify**: mutant M9 (drop the `case <-r.stopFetch` arm of `sleep`) must fail the suite.
-- **Priority**: **Major** — this is the difference between a 100 ms deploy shutdown and one that
-  waits out the poll interval on every restart.
-
-### Fix 4 — a requeue failure at shutdown is not sensed (edge case, T4 done-when)
-
-- **Root cause**: no test injects a `MarkRetryable` failure during escalation, so neither the
-  "log and continue" behaviour nor the expected-vs-genuine failure classification is proven.
-- **Fix task**: with 2 in-flight jobs and a driver whose `MarkRetryable` fails for the first lease
-  only, exhaust `Stop`'s budget; assert the second job still reaches `retryable`, `Stop` still
-  returns `ErrDrainIncomplete` naming 2, and the error log names the failed row.
-- **Verify**: mutant M14 (`return` instead of `continue` in `requeueAll`) must fail the suite.
-- **Priority**: **Major**
-
-### Fix 5 — tighten two soft assertions
-
-- **5a**: `TestExhaustingTheBudgetCancelsTheRunningHandlers` (`pool_test.go:557`) passes under M6.
-  Either assert cancellation is observed **before** `Stop` returns, or fold the test into the
-  ordering test and delete it. **Priority: Minor**
-- **5b**: P1-Story2 AC3 says "*cease claiming **before** it begins waiting*"; the tests only prove
-  "no claim after `Stop` returned". Assert the ordering directly — e.g. a driver whose
-  `FetchAvailable` records a timestamp, compared against the first drain-wait entry.
-  **Priority: Minor**
-
-### Fix 6 — spec-precision items (no code change; amend `spec.md`)
-
-- Edge "`Concurrency = 1` → previous single-worker semantics": add a behavioural sensor (assert at
-  most one concurrent handler entry with `Concurrency: 1`), or state that the config assertion is
-  the intended bar.
-- P2-Story4 AC2/AC4 are satisfied only by inspection. The spec's own Independent Test sets that bar,
-  so either accept it explicitly or add an integration test that runs `examples/email` against a
-  testcontainer. **Priority: Cosmetic**
-- Add `TestALongRunningJobCanStillRecordItsOutcome` to the traceability table (currently an
-  unclaimed but valuable test).
+| No abstractions for single-use code | ✅ |
+| Only touched files required for the task | ✅ (`5204dc7` touches only test files + spec/lessons) |
+| Matches existing patterns/style | ✅ table-driven where applicable, `t.Parallel` where safe, `goleak` on lifecycle tests |
+| Tests map to ACs and are non-shallow | ⚠️ One structural weakness: `TestClaimsNeverHandedToAWorkerGoBackToTheQueue` unit-tests `abandon` against a hand-written model of its caller instead of the caller itself |
+| Would a senior engineer approve? | ✅ The reasoning comments on the new tests are honest — the author explicitly flags that the hand-back is exercised directly because the path is hard to provoke. That candour is right; the conclusion (leave the call site unsensed) is what this report disputes. |
+| Every test maps to a spec requirement | ✅ `TestALongRunningJobCanStillRecordItsOutcome` is now claimed by AC7; no unclaimed tests remain |
 
 ---
 
 ## Requirement Traceability Update
 
-| Requirement | Previous | New |
+| Requirement | Iteration 1 | Now |
 | --- | --- | --- |
-| POOL-01 | Design | ✅ Verified |
-| POOL-02 | Design | ✅ Verified |
-| POOL-03 | Design | ✅ Verified |
-| POOL-04 | Design | ✅ Verified |
-| POOL-05 | Design | ✅ Verified |
-| SHUT-01 | Design | ✅ Verified |
-| SHUT-02 | Design | ⚠️ Partial — AC3 ordering not sensed; poll-interval edge case uncovered (M9) |
-| SHUT-03 | Design | ✅ Verified |
-| SHUT-04 | Design | ⚠️ Partial — requeue-failure edge case uncovered (M14) |
-| SHUT-05 | Design | ❌ Needs Fix — claimed-but-undispatched requeue has 0% coverage (M11) |
-| SAFE-01 | Design | ✅ Verified |
-| SAFE-02 | Design | ✅ Verified |
-| SAFE-03 | Design | ❌ Needs Fix — AC4 verified, AC3 + late-return edge case uncovered (M13) |
-| SAFE-04 | Design | ✅ Verified |
-| EX-01 | Design | ⚠️ Partial — AC1/AC3/AC5 verified; AC2/AC4 by inspection only (within the spec's stated bar) |
+| POOL-01 … POOL-05 | ✅ Verified | ✅ Verified |
+| SHUT-01 | ✅ Verified | ✅ Verified |
+| SHUT-02 | ⚠️ Partial | ✅ Verified — AC3 ordering now sensed; poll-interval edge closed (M9) |
+| SHUT-03 | ✅ Verified | ✅ Verified |
+| SHUT-04 | ⚠️ Partial | ✅ Verified — requeue-failure edge closed (M14) |
+| SHUT-05 | ❌ Needs Fix | ⚠️ **Partial** — `abandon` proven (M11 killed); its invocation from the fetch loop unproven (M16) |
+| SAFE-01, SAFE-02, SAFE-04 | ✅ Verified | ✅ Verified |
+| SAFE-03 | ❌ Needs Fix | ✅ Verified — AC3/AC4/AC7/AC8 all sensed (M7, M13 killed) |
+| EX-01 | ⚠️ Partial | ⚠️ Partial — AC2/AC4 by inspection only, within the spec's stated bar |
+
+---
+
+## Findings
+
+### Finding 1 — the fetch loop's hand-back is unsensed (P1-Story2 AC6 / SHUT-05) — **Major**
+
+- **What is unproven**: that the fetch loop, on shutdown, gives its undispatched rows to `abandon`.
+  `pool.go:370-375`'s `case <-r.stopFetch: r.abandon(rows[i:]); return` can be reduced to a bare
+  `return` and the whole suite — 81 unit tests and 92 with `-tags=integration`, `-race` — still
+  passes (mutant M16). Also unsensed by extension: the `rows[i:]` slice boundary (an off-by-one
+  would strand the row currently being handed off, or double-requeue one already taken by a worker)
+  and the caller's `inflight.add`-before-hand-off bookkeeping that `abandon` unwinds.
+- **What *is* proven**: `abandon`'s own contract — requeue at `now`, `attempt` untouched, in-flight
+  entries removed, one slot returned per row (`pool_test.go:596,599,602,606`).
+- **Why it matters**: the failure mode is precisely the one the slot accounting exists to prevent —
+  a row `running` and leased with nothing executing it, untouchable until the lease lapses. The
+  behaviour is correct in the code today; what is missing is the regression guard.
+- **Suggested sensor (deterministic, no race needed)**: the runner does not have to be `Start`ed to
+  exercise `fetch`. Construct a runner with `newRunner`, do **not** launch workers, run `r.fetch()`
+  in a goroutine against a driver that returns ≥ 1 row, wait for the row to be claimed
+  (`running` in the driver), then `close(r.stopFetch)` and assert the row went back to `retryable`
+  with `attempt` unchanged. With no worker receiving on `r.jobs`, the hand-off select is guaranteed
+  to take the `stopFetch` arm — no timing race, and it exercises the real loop, the real slice
+  bound, and the real bookkeeping.
+- **Verify**: mutant M16 must fail the suite.
+
+### Finding 2 — `Concurrency = 1` has no behavioural sensor — **Cosmetic** (carried forward)
+
+`client_test.go:158` asserts only that `Concurrency: 1` is not mistaken for unset. Several tests run
+with `concurrency = 1` but none asserts at-most-one-handler-in-flight. Either add that assertion or
+amend the spec to state the config-level check is the intended bar.
+
+### Finding 3 — P2-Story4 AC2/AC4 satisfied by inspection only — **Cosmetic** (carried forward)
+
+`examples/email/main.go:88,93,103,112-124` are read, not asserted. The spec's own Independent Test
+asks only for `go vet ./examples/...` plus a stub unit test, so this is within the stated bar —
+accept it explicitly in the spec or add a testcontainer-driven example run.
 
 ---
 
 ## Summary
 
-**Overall**: ⚠️ Issues — not ready to mark done.
+**Overall**: ❌ FAIL — one Major finding, two cosmetic carry-forwards.
 
-**Spec-anchored check**: 27/32 ACs matched their spec-defined outcome; 2 hard gaps, 1 spec-precision
-gap, 2 inspection-only. Edge cases: 3/7 clean, 3 uncovered, 1 partial.
-**Sensor**: 11/15 mutations killed, 4 survived.
-**Gate**: build ✅, vet ✅, `-race` ✅, `-race -tags=integration` ✅ — all exit 0, 0 failures, 0 skips.
+**Spec-anchored check**: 33/34 ACs matched their spec-defined outcome (1 hard gap). Edge cases: 6/7
+clean, 1 partial.
+**Sensor**: 15/16 mutations killed, 1 survived (M16).
+**Gate**: build ✅, vet ✅, `-race` ✅, `-race -tags=integration` ✅, golangci-lint ✅ (0 issues) —
+all exit 0, 0 failures, 0 skips.
 
-**What works** — and works genuinely, not just nominally:
+**The fix commit is substantially good work.** Four survivors became four kills with sensors that
+genuinely discriminate: the takeover log is asserted in both directions, the poll-interval bound has
+a 20× margin and is stable at `-count=10` under `-race`, the requeue-failure test uses a purpose-built
+refusing driver, and the AC3 ordering test distinguishes "stopped before waiting" from "stopped by
+the time it returned" — the exact distinction the first pass said was missing. Deleting the shallow
+budget-cancellation test was the right call; its criterion survives in a stronger test.
 
-- Real concurrency: 4 handlers proven inside their bodies simultaneously; a serial executor cannot
-  pass `TestPoolRunsJobsConcurrently`.
-- Slot accounting: the pool never claims past its idle-worker count, proven directly and by two
-  independent mutants (M2, M8).
-- Exactly-once at pool scale, proven against real `SELECT … FOR UPDATE SKIP LOCKED` with 8 workers
-  over 60 rows.
-- The ownership fence on the requeue path: the attempt is **not** given back, asserted in-memory and
-  against Postgres, and the mutant that would break it dies loudly (M4).
-- Shutdown ordering: cancel-then-requeue is sensed by a purpose-built driver, and the heartbeat
-  outliving the drain is sensed by a mutant that reverses it (M3).
-- The finalization-context split (`context.WithoutCancel`) is tested through a **context-honouring**
-  wrapper (`ctxDriver`), so it discriminates despite `memdriver` ignoring context — the author's own
-  flagged risk is correctly handled.
-- The idle-poll assertion is bounded above *and* below, honouring the recorded lesson.
+The one thing that did not land is the hardest one, and the author's own test comment says why: the
+path takes a race the design makes rare. But it does not require a race to test — driving `r.fetch()`
+with no workers attached reaches the branch deterministically. Until that exists, the sentence
+P1-Story2 AC6 actually asserts is unproven.
 
-**Issues found**: see Fix Plans 1–6. One Blocker (`abandon` unexecuted), three Major, two Minor.
-
-**Next steps**: route Fixes 1–4 to an implementer as fix tasks, re-verify (iteration 1 of max 3).
-Fixes 5–6 can ride along or be deferred to a spec amendment.
+**Next step**: one fix task for Finding 1, then re-verify (iteration 3 of max 3). Findings 2 and 3
+are spec amendments, not code.
