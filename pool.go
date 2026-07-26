@@ -2,6 +2,8 @@ package drover
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -185,15 +187,124 @@ func (r *runner) drain(ctx context.Context) error {
 	return err
 }
 
-// escalate reports a drain that ran out of time, naming how many jobs
-// were still running when it did. Those jobs keep running — Go cannot
-// stop a goroutine — so the honest thing to return is a count, not a
-// promise.
+// errShutdownRequeued is recorded against an attempt a shutdown cut
+// short. It is not a failure of the job: the attempt simply did not get
+// to finish, and the record exists so an operator reading the job's
+// history can see why it ran more than once.
+var errShutdownRequeued = errors.New("drover: worker shut down before this attempt finished")
+
+// escalate spends what is left of the shutdown: it cancels the contexts
+// the running handlers were given, returns their jobs to the queue, and
+// reports how many there were.
+//
+// The count is the honest answer. Go cannot stop a goroutine, so a
+// handler that ignores its cancelled context is still running when this
+// returns — which is exactly why the jobs go back to the queue. Another
+// worker can make progress on them immediately, and if the abandoned
+// handler later tries to record an outcome, the fence refuses it
+// (AD-019).
 func (r *runner) escalate() error {
-	stranded := len(r.client.inflight.snapshot())
+	// The one place a handler's context is cancelled. Everything else
+	// about shutdown is cooperative; this is not.
+	r.cancelJobs()
+
+	stranded := r.client.inflight.snapshot()
 	r.client.logger.Warn("drover: shutdown deadline reached with jobs still running",
-		"queue", r.queue, "jobs", stranded)
-	return fmt.Errorf("%w: %d job(s) still running", ErrDrainIncomplete, stranded)
+		"queue", r.queue, "jobs", len(stranded))
+	r.requeueAll(stranded)
+
+	return fmt.Errorf("%w: %d job(s) still running, returned to the queue",
+		ErrDrainIncomplete, len(stranded))
+}
+
+// abandon returns rows the fetch loop claimed but never handed to a
+// worker. Nothing is executing them, so leaving them behind would keep
+// them running and leased until the lease lapsed — a delay a clean
+// shutdown has no reason to impose on work nobody ever started.
+func (r *runner) abandon(rows []*driver.JobRow) {
+	if len(rows) == 0 {
+		return
+	}
+	leases := leasesOf(rows)
+	r.requeueAll(leases)
+	for _, lease := range leases {
+		r.client.inflight.remove(lease)
+	}
+	// One token per row: each of these rows was dispatched a slot that no
+	// worker will now return.
+	r.releaseSlots(len(rows))
+}
+
+func leasesOf(rows []*driver.JobRow) []driver.Lease {
+	leases := make([]driver.Lease, 0, len(rows))
+	for _, row := range rows {
+		leases = append(leases, driver.Lease{ID: row.ID, Attempt: row.Attempt})
+	}
+	return leases
+}
+
+// requeueAll returns every named lease to the queue, best effort: one
+// that will not go back is reported and the rest still do.
+func (r *runner) requeueAll(leases []driver.Lease) {
+	if len(leases) == 0 {
+		return
+	}
+
+	// Deliberately not the job context, which escalate has just
+	// cancelled: these writes are how the shutdown keeps its promise, and
+	// they have to outlive the cancellation that prompted them.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.jobCtx), r.client.leaseDuration)
+	defer cancel()
+
+	for _, lease := range leases {
+		if err := r.client.requeue(ctx, lease); err != nil {
+			r.requeueFailed(lease, err)
+			continue
+		}
+		r.client.logger.Warn("drover: returned an unfinished job to the queue",
+			"job_id", lease.ID, "attempt", lease.Attempt)
+	}
+}
+
+// requeueFailed reports a job that would not go back.
+//
+// Losing the race with the job's own worker is the ordinary case, not a
+// fault: the handler finished while the shutdown was reaching for the
+// row, recorded its outcome, and the row is accounted for. A genuine
+// failure leaves the row running with a lease that will lapse, and the
+// rescuer collects it — the same backstop that covers a process dying
+// outright.
+func (r *runner) requeueFailed(lease driver.Lease, err error) {
+	if errors.Is(err, driver.ErrLeaseLost) || errors.Is(err, driver.ErrInvalidTransition) {
+		r.client.logger.Debug("drover: job finished before it could be returned to the queue",
+			"job_id", lease.ID, "attempt", lease.Attempt, "error", err)
+		return
+	}
+	r.client.logger.Error("drover: return job to the queue",
+		"job_id", lease.ID, "attempt", lease.Attempt, "error", err)
+}
+
+// requeue makes a claimed job claimable again, immediately.
+//
+// It does not give back the attempt the claim consumed, and that is the
+// point. attempt is the fence every state change is checked against, so
+// handing it back would let a handler this shutdown abandoned — one that
+// ignored its cancelled context and is still running — present the same
+// number the next claim hands out, and its stale write would be accepted
+// over the new holder's. The attempt was spent; a shutdown cutting it
+// short does not unspend it (AD-026, on the same reasoning as AD-012).
+func (c *Client) requeue(ctx context.Context, lease driver.Lease) error {
+	detail, err := json.Marshal(driver.AttemptError{
+		Attempt: lease.Attempt,
+		At:      time.Now().UTC(),
+		Error:   errShutdownRequeued.Error(),
+	})
+	if err != nil {
+		return fmt.Errorf("drover: encode requeue reason for job %d: %w", lease.ID, err)
+	}
+	// At now, not after a backoff: the job did not fail, it was
+	// interrupted, and there is nothing to wait out.
+	return c.drv.MarkRetryable(ctx, lease, time.Now(), detail)
 }
 
 // fetch claims due jobs and hands them to workers until shutdown.
@@ -222,7 +333,20 @@ func (r *runner) fetch() {
 			continue
 		}
 
-		// The driver may hand back fewer rows than there was room for.
+		// A driver that hands back more rows than the limit allowed has
+		// claimed work this pool has no worker for. Holding it would
+		// recreate exactly the state the slot accounting exists to
+		// prevent — rows running and leased with nothing executing them —
+		// so the surplus goes straight back (AD-022).
+		if len(rows) > n {
+			surplus := rows[n:]
+			c.logger.Warn("drover: driver returned more jobs than requested; returning the surplus",
+				"queue", r.queue, "requested", n, "returned", len(rows))
+			r.requeueAll(leasesOf(surplus))
+			rows = rows[:n]
+		}
+
+		// The driver may also hand back fewer rows than there was room for.
 		r.releaseSlots(n - len(rows))
 		if len(rows) == 0 {
 			if !r.sleep() {
@@ -231,7 +355,7 @@ func (r *runner) fetch() {
 			continue
 		}
 
-		for _, row := range rows {
+		for i, row := range rows {
 			// Tracked from the claim, not from the start of execution: a
 			// row waiting to be handed to a worker is already running and
 			// already leased, and the heartbeat has to cover that window
@@ -241,6 +365,7 @@ func (r *runner) fetch() {
 			select {
 			case r.jobs <- row:
 			case <-r.stopFetch:
+				r.abandon(rows[i:])
 				return
 			}
 		}

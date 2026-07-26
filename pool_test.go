@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -404,6 +405,372 @@ func TestStopStopsTheRescuerClaimingToo(t *testing.T) {
 	if after := sweeping.sweeps.Load(); after != settled {
 		t.Errorf("rescue sweeps went from %d to %d after Stop returned — the rescuer is still claiming", settled, after)
 	}
+}
+
+// stubbornWorker ignores cancellation entirely — the case a bounded
+// shutdown exists for.
+func stubbornWorker(entered chan<- int64, release <-chan struct{}) *funcWorker {
+	return &funcWorker{fn: func(_ context.Context, job *Job[greetArgs]) error {
+		entered <- job.ID
+		<-release
+		return nil
+	}}
+}
+
+// waitForInflightToClear lets the abandoned handlers finish so goleak
+// sees a settled process. Stop deliberately does not wait for them.
+func waitForInflightToClear(t *testing.T, c *Client) {
+	t.Helper()
+	waitFor(t, func() bool { return len(c.inflight.snapshot()) == 0 }, "abandoned handlers to finish")
+}
+
+// A shutdown that runs out of time must say so and must not strand the
+// work: the jobs it could not finish go back to the queue, where another
+// worker can pick them up immediately instead of waiting out a lease.
+func TestStopReportsAndRequeuesTheJobsItCouldNotFinish(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	const concurrency = 2
+	mem := memdriver.New()
+	entered := make(chan int64, concurrency)
+	release := make(chan struct{})
+	ws := NewWorkers()
+	Register(ws, stubbornWorker(entered, release))
+
+	c := newPoolClient(mem, ws, concurrency, nil)
+	ids := insertN(t, c, concurrency)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	for i := 0; i < concurrency; i++ {
+		select {
+		case <-entered:
+		case <-time.After(2 * time.Second):
+			t.Fatal("pool did not fill its workers")
+		}
+	}
+
+	budget, cancelBudget := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancelBudget()
+
+	start := time.Now()
+	err := c.Stop(budget)
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, ErrDrainIncomplete) {
+		t.Fatalf("Stop = %v, want an error wrapping ErrDrainIncomplete", err)
+	}
+	if !strings.Contains(err.Error(), "2 job(s)") {
+		t.Errorf("Stop error %q does not name the 2 unfinished jobs", err)
+	}
+	if elapsed > time.Second {
+		t.Errorf("Stop took %v, well past its 50ms budget — a handler that ignores cancellation must not hold shutdown open", elapsed)
+	}
+
+	// Returned to the queue, not left running: another worker can take
+	// them now rather than after the lease lapses.
+	for _, id := range ids {
+		row, ok := mem.Row(id)
+		if !ok {
+			t.Fatalf("job %d not found", id)
+		}
+		if row.State != "retryable" {
+			t.Errorf("job %d state = %q, want retryable", id, row.State)
+		}
+		if !row.ScheduledAt.After(time.Now()) {
+			continue // claimable now, which is what we want
+		}
+		t.Errorf("job %d is scheduled at %v, in the future — an interrupted job should be claimable immediately", id, row.ScheduledAt)
+	}
+
+	close(release)
+	waitForInflightToClear(t, c)
+}
+
+// The requeue must not give the attempt back. attempt is the fence, so
+// decrementing it would let the handler this shutdown abandoned present
+// the number the next claim hands out — and its stale write would be
+// accepted over the new holder's.
+func TestShutdownRequeueDoesNotGiveBackTheAttempt(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	mem := memdriver.New()
+	entered := make(chan int64, 1)
+	release := make(chan struct{})
+	ws := NewWorkers()
+	Register(ws, stubbornWorker(entered, release))
+
+	c := newPoolClient(mem, ws, 1, nil)
+	ids := insertN(t, c, 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("job never started")
+	}
+
+	claimed, ok := mem.Row(ids[0])
+	if !ok {
+		t.Fatalf("job %d not found", ids[0])
+	}
+	if claimed.Attempt != 1 {
+		t.Fatalf("attempt = %d after the first claim, want 1", claimed.Attempt)
+	}
+
+	budget, cancelBudget := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancelBudget()
+	if err := c.Stop(budget); !errors.Is(err, ErrDrainIncomplete) {
+		t.Fatalf("Stop = %v, want an error wrapping ErrDrainIncomplete", err)
+	}
+
+	requeued, _ := mem.Row(ids[0])
+	if requeued.Attempt != claimed.Attempt {
+		t.Errorf("attempt = %d after the requeue, want it unchanged at %d — giving the attempt back breaks the fence",
+			requeued.Attempt, claimed.Attempt)
+	}
+
+	// The reason is on the record, so an operator can see why it ran twice.
+	recorded := decodeAttemptErrors(t, mem, ids[0])
+	if len(recorded) != 1 {
+		t.Fatalf("recorded %d attempt errors, want 1", len(recorded))
+	}
+	if !strings.Contains(recorded[0].Error, "shut down") {
+		t.Errorf("recorded reason = %q, want it to name the shutdown", recorded[0].Error)
+	}
+
+	close(release)
+	waitForInflightToClear(t, c)
+}
+
+// Escalation has to actually reach the handlers. A shutdown that only
+// waited and then gave up would leave a cooperative handler — one
+// watching its context, which is the behaviour drover asks for — blocked
+// on a cancellation that never came.
+func TestExhaustingTheBudgetCancelsTheRunningHandlers(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	mem := memdriver.New()
+	entered := make(chan int64, 1)
+	cancelled := make(chan struct{})
+	ws := NewWorkers()
+	Register(ws, &funcWorker{fn: func(ctx context.Context, job *Job[greetArgs]) error {
+		entered <- job.ID
+		<-ctx.Done()
+		close(cancelled)
+		return ctx.Err()
+	}})
+
+	c := newPoolClient(mem, ws, 1, nil)
+	insertN(t, c, 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("job never started")
+	}
+
+	budget, cancelBudget := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancelBudget()
+	if err := c.Stop(budget); !errors.Is(err, ErrDrainIncomplete) {
+		t.Fatalf("Stop = %v, want an error wrapping ErrDrainIncomplete", err)
+	}
+
+	select {
+	case <-cancelled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("shutdown never cancelled the running handler's context")
+	}
+	waitForInflightToClear(t, c)
+}
+
+// orderedRequeueDriver reports whether the handlers had already been
+// cancelled by the time their jobs were returned to the queue. It waits
+// rather than sampling, so the answer does not depend on how quickly a
+// woken handler is scheduled.
+type orderedRequeueDriver struct {
+	*memdriver.Driver
+	cancelled   <-chan struct{}
+	cancelFirst atomic.Bool
+	seen        atomic.Bool
+}
+
+func (d *orderedRequeueDriver) MarkRetryable(ctx context.Context, lease driver.Lease, retryAt time.Time, errDetail []byte) error {
+	if !d.seen.Swap(true) {
+		select {
+		case <-d.cancelled:
+			d.cancelFirst.Store(true)
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+	return d.Driver.MarkRetryable(ctx, lease, retryAt, errDetail)
+}
+
+// ADR-0003 fixes the order: cancel the per-job contexts, then requeue.
+// Doing it the other way round returns a job to the queue while the
+// handler that owns it is still running uncancelled — widening the
+// window in which two workers are acting on the same job.
+func TestEscalationCancelsHandlersBeforeReturningTheirJobs(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	mem := memdriver.New()
+	entered := make(chan int64, 1)
+	cancelled := make(chan struct{})
+	ordered := &orderedRequeueDriver{Driver: mem, cancelled: cancelled}
+
+	ws := NewWorkers()
+	Register(ws, &funcWorker{fn: func(ctx context.Context, job *Job[greetArgs]) error {
+		entered <- job.ID
+		<-ctx.Done()
+		close(cancelled)
+		return ctx.Err()
+	}})
+
+	c := newPoolClient(ordered, ws, 1, nil)
+	insertN(t, c, 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("job never started")
+	}
+
+	budget, cancelBudget := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancelBudget()
+	if err := c.Stop(budget); !errors.Is(err, ErrDrainIncomplete) {
+		t.Fatalf("Stop = %v, want an error wrapping ErrDrainIncomplete", err)
+	}
+
+	if !ordered.cancelFirst.Load() {
+		t.Error("a job was returned to the queue before its handler was cancelled")
+	}
+	waitForInflightToClear(t, c)
+}
+
+// overshootDriver hands back more rows than were asked for, which is how
+// a test reproduces the fetch loop holding claimed jobs it has not
+// managed to give to a worker.
+type overshootDriver struct {
+	*memdriver.Driver
+	extra int
+}
+
+func (d *overshootDriver) FetchAvailable(ctx context.Context, queue string, leaseFor time.Duration, limit int) ([]*driver.JobRow, error) {
+	return d.Driver.FetchAvailable(ctx, queue, leaseFor, limit+d.extra)
+}
+
+// A job claimed but never started is the worst thing to strand: it is
+// running and leased with nothing executing it, and nobody can touch it
+// until the lease lapses. The pool never keeps one — a driver that hands
+// back more than was asked for gets the surplus straight back.
+func TestSurplusClaimedJobsAreReturnedImmediately(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	mem := memdriver.New()
+	overshoot := &overshootDriver{Driver: mem, extra: 2}
+	entered := make(chan int64, 1)
+	release := make(chan struct{})
+	ws := NewWorkers()
+	Register(ws, stubbornWorker(entered, release))
+
+	c := newPoolClient(overshoot, ws, 1, nil)
+	ids := insertN(t, c, 3)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	var started int64
+	select {
+	case started = <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("no job started")
+	}
+
+	// The driver claimed all three; only one has a worker. Give the pool
+	// every chance to sit on the other two, then prove it did not.
+	time.Sleep(50 * time.Millisecond)
+	if running := countInState(t, mem, ids, "running"); running != 1 {
+		t.Errorf("running rows = %d, want 1 — the pool is holding jobs no worker can run", running)
+	}
+	for _, id := range ids {
+		if id == started {
+			continue
+		}
+		row, _ := mem.Row(id)
+		if row.State != "retryable" {
+			t.Errorf("job %d was claimed with no worker for it and is %q, want retryable so another worker can take it", id, row.State)
+		}
+	}
+
+	budget, cancelBudget := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancelBudget()
+	if err := c.Stop(budget); !errors.Is(err, ErrDrainIncomplete) {
+		t.Fatalf("Stop = %v, want an error wrapping ErrDrainIncomplete", err)
+	}
+
+	close(release)
+	waitForInflightToClear(t, c)
+}
+
+// A caller whose shutdown budget is already spent still deserves the
+// ordered shutdown: returning early would leave every in-flight row
+// running with nobody coming back for it.
+func TestStopWithAnExpiredBudgetStillRequeues(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	mem := memdriver.New()
+	entered := make(chan int64, 1)
+	release := make(chan struct{})
+	ws := NewWorkers()
+	Register(ws, stubbornWorker(entered, release))
+
+	c := newPoolClient(mem, ws, 1, nil)
+	ids := insertN(t, c, 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("job never started")
+	}
+
+	spent, cancelSpent := context.WithCancel(context.Background())
+	cancelSpent()
+
+	if err := c.Stop(spent); !errors.Is(err, ErrDrainIncomplete) {
+		t.Fatalf("Stop = %v, want an error wrapping ErrDrainIncomplete", err)
+	}
+	row, _ := mem.Row(ids[0])
+	if row.State != "retryable" {
+		t.Errorf("job state = %q after a Stop with no budget left, want retryable", row.State)
+	}
+
+	close(release)
+	waitForInflightToClear(t, c)
 }
 
 // leaseCountDriver records the largest batch of leases the heartbeat
