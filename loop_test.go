@@ -259,6 +259,47 @@ func TestJobOutcomeIsRecordedEvenWhenItsContextWasCancelled(t *testing.T) {
 	}
 }
 
+// A handler may legitimately run for far longer than a lease — that is
+// what the heartbeat is for. The deadline bounding the write that
+// records its outcome must therefore start at the write, not at the
+// claim, or every long job would finish successfully and then fail to
+// say so, and sit running until the rescuer collected it.
+func TestALongRunningJobCanStillRecordItsOutcome(t *testing.T) {
+	t.Parallel()
+
+	mem := memdriver.New()
+	ws := NewWorkers()
+	Register(ws, &funcWorker{fn: func(context.Context, *Job[greetArgs]) error {
+		time.Sleep(40 * time.Millisecond)
+		return nil
+	}})
+	// A lease far shorter than the job it covers.
+	c := newClient(&ctxDriver{mem}, Config{
+		Workers:       ws,
+		Logger:        newTestLogger(&syncWriter{}),
+		LeaseDuration: 10 * time.Millisecond,
+	})
+
+	row, err := c.Insert(context.Background(), greetArgs{Name: "slow"})
+	if err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	claimed, err := mem.FetchAvailable(context.Background(), defaultQueue, time.Minute, 1)
+	if err != nil {
+		t.Fatalf("FetchAvailable: %v", err)
+	}
+
+	c.runJob(context.Background(), claimed[0])
+
+	stored, ok := mem.Row(row.ID)
+	if !ok {
+		t.Fatalf("job %d not found", row.ID)
+	}
+	if stored.State != "completed" {
+		t.Errorf("state = %q, want completed — a job outliving its lease could not record its result", stored.State)
+	}
+}
+
 func TestStartExecutesJobToCompletion(t *testing.T) {
 	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 	mem := memdriver.New()

@@ -98,12 +98,6 @@ func (c *Client) runJob(jobCtx context.Context, row *driver.JobRow) {
 	c.inflight.add(lease)
 	defer c.inflight.remove(lease)
 
-	// Bounded so a wedged database cannot hold a worker forever; the
-	// lease is the natural bound, because a write that takes longer than
-	// that has already lost the row to the rescuer.
-	ctx, cancelFinalize := context.WithTimeout(context.WithoutCancel(jobCtx), c.leaseDuration)
-	defer cancelFinalize()
-
 	fn, registered := c.workers.handler(row.Kind)
 	if !registered {
 		// A kind this binary does not know is an ordinary failure, not a
@@ -111,16 +105,22 @@ func (c *Client) runJob(jobCtx context.Context, row *driver.JobRow) {
 		// legitimately claim kinds only the new build registers, and the
 		// job has to survive until one of those runs it (AD-014).
 		err := fmt.Errorf("no worker registered for kind %q", row.Kind)
+		ctx, cancel := c.finalizeContext(jobCtx)
+		defer cancel()
 		c.dispose(ctx, row, err, nil, time.Since(start))
 		return
 	}
 
 	stack, err := runProtected(jobCtx, fn, row)
 	if err != nil {
+		ctx, cancel := c.finalizeContext(jobCtx)
+		defer cancel()
 		c.dispose(ctx, row, err, stack, time.Since(start))
 		return
 	}
 
+	ctx, cancel := c.finalizeContext(jobCtx)
+	defer cancel()
 	if err := c.drv.MarkCompleted(ctx, lease); err != nil {
 		c.writeFailed(row, err)
 		return
@@ -128,6 +128,19 @@ func (c *Client) runJob(jobCtx context.Context, row *driver.JobRow) {
 	c.logger.Info("drover: job completed",
 		"job_id", row.ID, "kind", row.Kind, "attempt", row.Attempt,
 		"duration", time.Since(start))
+}
+
+// finalizeContext bounds one attempt at recording a job's outcome.
+//
+// Cancellation is stripped for the reason on runJob: the write that ends
+// an attempt must survive the shutdown that interrupted it. The deadline
+// is a bound on the write alone, which is why it is taken here rather
+// than when the job started — a handler may legitimately run for far
+// longer than a lease, and a deadline started at claim time would have
+// expired long before such a job ever got to report its result, leaving
+// the row running for the rescuer to collect.
+func (c *Client) finalizeContext(jobCtx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(jobCtx), c.leaseDuration)
 }
 
 // runProtected calls the worker and converts a panic into an error
