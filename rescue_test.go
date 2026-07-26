@@ -25,7 +25,9 @@ func abandon(t *testing.T, mem *memdriver.Driver, kind string) *driver.JobRow {
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
-	claimed, err := mem.FetchAvailable(ctx, "default", time.Now().Add(-time.Minute), 1)
+	// A negative lease is born already expired — exactly the row a worker
+	// killed mid-job leaves behind.
+	claimed, err := mem.FetchAvailable(ctx, "default", -time.Minute, 1)
 	if err != nil {
 		t.Fatalf("FetchAvailable: %v", err)
 	}
@@ -182,7 +184,7 @@ func TestRescueLeavesAJobWhoseLeaseIsStillGoodAlone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
-	if _, err := mem.FetchAvailable(ctx, "default", time.Now().Add(time.Hour), 1); err != nil {
+	if _, err := mem.FetchAvailable(ctx, "default", time.Hour, 1); err != nil {
 		t.Fatalf("FetchAvailable: %v", err)
 	}
 	c := rescueClient(mem, nil)
@@ -371,14 +373,14 @@ type expiryCounter struct {
 	marks atomic.Int32
 }
 
-func (d *expiryCounter) MarkRetryable(ctx context.Context, id int64, retryAt time.Time, errDetail []byte) error {
+func (d *expiryCounter) MarkRetryable(ctx context.Context, lease driver.Lease, retryAt time.Time, errDetail []byte) error {
 	d.marks.Add(1)
-	return d.Driver.MarkRetryable(ctx, id, retryAt, errDetail)
+	return d.Driver.MarkRetryable(ctx, lease, retryAt, errDetail)
 }
 
-func (d *expiryCounter) MarkDead(ctx context.Context, id int64, errDetail []byte) error {
+func (d *expiryCounter) MarkDead(ctx context.Context, lease driver.Lease, errDetail []byte) error {
 	d.marks.Add(1)
-	return d.Driver.MarkDead(ctx, id, errDetail)
+	return d.Driver.MarkDead(ctx, lease, errDetail)
 }
 
 // brokenExpiryDriver stands in for a database that is unreachable when
@@ -388,7 +390,7 @@ type brokenExpiryDriver struct {
 	calls atomic.Int32
 }
 
-func (d *brokenExpiryDriver) FetchExpired(context.Context, time.Time, int) ([]*driver.JobRow, error) {
+func (d *brokenExpiryDriver) FetchExpired(context.Context, time.Duration, int) ([]*driver.JobRow, error) {
 	d.calls.Add(1)
 	return nil, errors.New("connection refused")
 }

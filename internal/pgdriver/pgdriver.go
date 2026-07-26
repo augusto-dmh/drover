@@ -59,15 +59,16 @@ func (d *Driver) InsertTx(ctx context.Context, tx any, params driver.InsertParam
 }
 
 // FetchAvailable claims up to limit due jobs with FOR UPDATE SKIP
-// LOCKED, returning them in id order as running with a fresh lease.
-func (d *Driver) FetchAvailable(ctx context.Context, queue string, leaseUntil time.Time, limit int) ([]*driver.JobRow, error) {
+// LOCKED, returning them in id order as running with a lease lasting
+// leaseFor, measured by the database clock.
+func (d *Driver) FetchAvailable(ctx context.Context, queue string, leaseFor time.Duration, limit int) ([]*driver.JobRow, error) {
 	if limit < 0 || limit > math.MaxInt32 {
 		return nil, fmt.Errorf("fetch limit %d out of range", limit)
 	}
 	jobs, err := d.queries.FetchAvailable(ctx, dbsqlc.FetchAvailableParams{
-		LeasedUntil: leaseUntil,
-		Queue:       queue,
-		MaxJobs:     int32(limit),
+		LeaseSeconds: leaseFor.Seconds(),
+		Queue:        queue,
+		MaxJobs:      int32(limit),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("fetch available jobs from queue %q: %w", queue, err)
@@ -76,16 +77,16 @@ func (d *Driver) FetchAvailable(ctx context.Context, queue string, leaseUntil ti
 }
 
 // FetchExpired re-claims up to limit running jobs whose lease has
-// passed, taking ownership with a lease that runs to leaseUntil. FOR
+// passed, taking ownership with a fresh lease lasting leaseFor. FOR
 // UPDATE SKIP LOCKED is what makes concurrent sweeps disposition each
 // row exactly once; attempt is left alone.
-func (d *Driver) FetchExpired(ctx context.Context, leaseUntil time.Time, limit int) ([]*driver.JobRow, error) {
+func (d *Driver) FetchExpired(ctx context.Context, leaseFor time.Duration, limit int) ([]*driver.JobRow, error) {
 	if limit < 0 || limit > math.MaxInt32 {
 		return nil, fmt.Errorf("fetch limit %d out of range", limit)
 	}
 	jobs, err := d.queries.FetchExpired(ctx, dbsqlc.FetchExpiredParams{
-		LeasedUntil: leaseUntil,
-		MaxJobs:     int32(limit),
+		LeaseSeconds: leaseFor.Seconds(),
+		MaxJobs:      int32(limit),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("fetch expired jobs: %w", err)
@@ -93,96 +94,120 @@ func (d *Driver) FetchExpired(ctx context.Context, leaseUntil time.Time, limit i
 	return sortedRows(jobs), nil
 }
 
-// ExtendLeases pushes the lease of every running job in ids out to
-// until. Ids that no longer qualify are skipped, not reported: the job
-// finalized first, which is a routine race, not a fault.
-func (d *Driver) ExtendLeases(ctx context.Context, ids []int64, until time.Time) error {
-	if len(ids) == 0 {
+// ExtendLeases pushes each held lease out by another leaseFor. A lease
+// whose job finalized or moved to a later attempt is skipped, not
+// reported: both race a heartbeat routinely and neither is a fault.
+func (d *Driver) ExtendLeases(ctx context.Context, leases []driver.Lease, leaseFor time.Duration) error {
+	if len(leases) == 0 {
 		return nil
 	}
+	ids := make([]int64, len(leases))
+	attempts := make([]int32, len(leases))
+	for i, lease := range leases {
+		ids[i] = lease.ID
+		attempts[i] = attemptArg(lease.Attempt)
+	}
 	if err := d.queries.ExtendLeases(ctx, dbsqlc.ExtendLeasesParams{
-		LeasedUntil: until,
-		Ids:         ids,
+		LeaseSeconds: leaseFor.Seconds(),
+		Ids:          ids,
+		Attempts:     attempts,
 	}); err != nil {
-		return fmt.Errorf("extend leases of %d jobs: %w", len(ids), err)
+		return fmt.Errorf("extend leases of %d jobs: %w", len(leases), err)
 	}
 	return nil
 }
 
 // MarkCompleted finalizes a running job as completed.
-func (d *Driver) MarkCompleted(ctx context.Context, id int64) error {
-	affected, err := d.queries.MarkCompleted(ctx, id)
+func (d *Driver) MarkCompleted(ctx context.Context, lease driver.Lease) error {
+	affected, err := d.queries.MarkCompleted(ctx, dbsqlc.MarkCompletedParams{
+		ID: lease.ID, Attempt: attemptArg(lease.Attempt),
+	})
 	if err != nil {
-		return fmt.Errorf("mark job %d completed: %w", id, err)
+		return fmt.Errorf("mark job %d completed: %w", lease.ID, err)
 	}
-	return d.explain(ctx, id, affected)
+	return d.explain(ctx, lease, affected)
 }
 
 // MarkRetryable returns a running job to the queue at retryAt without
 // finalizing it, appending errDetail to its errors array.
-func (d *Driver) MarkRetryable(ctx context.Context, id int64, retryAt time.Time, errDetail []byte) error {
+func (d *Driver) MarkRetryable(ctx context.Context, lease driver.Lease, retryAt time.Time, errDetail []byte) error {
 	affected, err := d.queries.MarkRetryable(ctx, dbsqlc.MarkRetryableParams{
-		ID:      id,
+		ID:      lease.ID,
+		Attempt: attemptArg(lease.Attempt),
 		RetryAt: retryAt,
 		Error:   errDetail,
 	})
 	if err != nil {
-		return fmt.Errorf("mark job %d retryable: %w", id, err)
+		return fmt.Errorf("mark job %d retryable: %w", lease.ID, err)
 	}
-	return d.explain(ctx, id, affected)
+	return d.explain(ctx, lease, affected)
 }
 
 // MarkDead finalizes a running job as dead, appending errDetail to its
 // errors array.
-func (d *Driver) MarkDead(ctx context.Context, id int64, errDetail []byte) error {
-	affected, err := d.queries.MarkDead(ctx, dbsqlc.MarkDeadParams{ID: id, Error: errDetail})
+func (d *Driver) MarkDead(ctx context.Context, lease driver.Lease, errDetail []byte) error {
+	affected, err := d.queries.MarkDead(ctx, dbsqlc.MarkDeadParams{
+		ID: lease.ID, Attempt: attemptArg(lease.Attempt), Error: errDetail,
+	})
 	if err != nil {
-		return fmt.Errorf("mark job %d dead: %w", id, err)
+		return fmt.Errorf("mark job %d dead: %w", lease.ID, err)
 	}
-	return d.explain(ctx, id, affected)
+	return d.explain(ctx, lease, affected)
 }
 
 // MarkCancelled finalizes a running job as cancelled, appending
 // errDetail as the reason it will never be retried.
-func (d *Driver) MarkCancelled(ctx context.Context, id int64, errDetail []byte) error {
-	affected, err := d.queries.MarkCancelled(ctx, dbsqlc.MarkCancelledParams{ID: id, Error: errDetail})
+func (d *Driver) MarkCancelled(ctx context.Context, lease driver.Lease, errDetail []byte) error {
+	affected, err := d.queries.MarkCancelled(ctx, dbsqlc.MarkCancelledParams{
+		ID: lease.ID, Attempt: attemptArg(lease.Attempt), Error: errDetail,
+	})
 	if err != nil {
-		return fmt.Errorf("mark job %d cancelled: %w", id, err)
+		return fmt.Errorf("mark job %d cancelled: %w", lease.ID, err)
 	}
-	return d.explain(ctx, id, affected)
+	return d.explain(ctx, lease, affected)
 }
 
 // MarkSnoozed defers a running job to runAt, giving back the attempt the
 // claim consumed and recording no error.
-func (d *Driver) MarkSnoozed(ctx context.Context, id int64, runAt time.Time) error {
-	affected, err := d.queries.MarkSnoozed(ctx, dbsqlc.MarkSnoozedParams{ID: id, RunAt: runAt})
+func (d *Driver) MarkSnoozed(ctx context.Context, lease driver.Lease, runAt time.Time) error {
+	affected, err := d.queries.MarkSnoozed(ctx, dbsqlc.MarkSnoozedParams{
+		ID: lease.ID, Attempt: attemptArg(lease.Attempt), RunAt: runAt,
+	})
 	if err != nil {
-		return fmt.Errorf("mark job %d snoozed: %w", id, err)
+		return fmt.Errorf("mark job %d snoozed: %w", lease.ID, err)
 	}
-	return d.explain(ctx, id, affected)
+	return d.explain(ctx, lease, affected)
 }
 
 // explain turns the row count of a guarded transition UPDATE into an
-// error: zero rows means the job was not running, and finalizeFailure
-// says whether it is missing or merely in the wrong state.
-func (d *Driver) explain(ctx context.Context, id int64, affected int64) error {
+// error: zero rows means the lease did not match, and finalizeFailure
+// says why.
+func (d *Driver) explain(ctx context.Context, lease driver.Lease, affected int64) error {
 	if affected == 0 {
-		return d.finalizeFailure(ctx, id)
+		return d.finalizeFailure(ctx, lease)
 	}
 	return nil
 }
 
-// finalizeFailure explains why a guarded finalize UPDATE matched no
-// row: the job either does not exist or is not running.
-func (d *Driver) finalizeFailure(ctx context.Context, id int64) error {
-	job, err := d.queries.GetJob(ctx, id)
+// finalizeFailure explains why a guarded transition matched no row: the
+// job is missing, it has moved on to an attempt this caller does not
+// hold, or it is simply not running.
+func (d *Driver) finalizeFailure(ctx context.Context, lease driver.Lease) error {
+	job, err := d.queries.GetJob(ctx, lease.ID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return fmt.Errorf("job %d: %w", id, driver.ErrNotFound)
+		return fmt.Errorf("job %d: %w", lease.ID, driver.ErrNotFound)
 	}
 	if err != nil {
-		return fmt.Errorf("inspect job %d: %w", id, err)
+		return fmt.Errorf("inspect job %d: %w", lease.ID, err)
 	}
-	return fmt.Errorf("job %d is %s, want running: %w", id, job.State, driver.ErrInvalidTransition)
+	// State first: a job that is not running was never this caller's to
+	// finish, whoever holds it. Only once it *is* running does the
+	// attempt distinguish "mine" from "someone else's".
+	if job.State != dbsqlc.DroverJobStateRunning {
+		return fmt.Errorf("job %d is %s, want running: %w", lease.ID, job.State, driver.ErrInvalidTransition)
+	}
+	return fmt.Errorf("job %d is on attempt %d, held attempt %d: %w",
+		lease.ID, job.Attempt, lease.Attempt, driver.ErrLeaseLost)
 }
 
 // sortedRows converts claimed jobs to driver rows in id order: UPDATE
@@ -194,6 +219,22 @@ func sortedRows(jobs []dbsqlc.DroverJob) []*driver.JobRow {
 	}
 	slices.SortFunc(rows, func(a, b *driver.JobRow) int { return int(a.ID - b.ID) })
 	return rows
+}
+
+// attemptArg narrows an attempt number for the wire. Attempt lives in an
+// int32 column, so a value read back from the database always fits;
+// clamping rather than converting blindly keeps a corrupted in-memory
+// value from wrapping into some other attempt number and matching a row
+// this caller does not hold.
+func attemptArg(attempt int) int32 {
+	switch {
+	case attempt < 0:
+		return 0
+	case attempt > math.MaxInt32:
+		return math.MaxInt32
+	default:
+		return int32(attempt)
+	}
 }
 
 func insertParams(params driver.InsertParams) dbsqlc.InsertJobParams {

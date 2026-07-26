@@ -65,7 +65,7 @@ func (c *Client) rescueLoop(ctx context.Context) {
 func (c *Client) rescueOnce(ctx context.Context) (int, error) {
 	rescued := 0
 	for round := 0; round < rescueRounds; round++ {
-		rows, err := c.drv.FetchExpired(ctx, time.Now().Add(c.leaseDuration), rescueBatch)
+		rows, err := c.drv.FetchExpired(ctx, c.leaseDuration, rescueBatch)
 		if err != nil {
 			return rescued, err
 		}

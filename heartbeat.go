@@ -32,11 +32,11 @@ func (c *Client) heartbeat(stop <-chan struct{}) {
 	}
 }
 
-// extendLeases pushes every in-flight job's lease a full lease duration
-// into the future.
+// extendLeases pushes every held lease a full lease duration into the
+// future.
 func (c *Client) extendLeases() {
-	ids := c.inflight.snapshot()
-	if len(ids) == 0 {
+	leases := c.inflight.snapshot()
+	if len(leases) == 0 {
 		return
 	}
 
@@ -47,16 +47,15 @@ func (c *Client) extendLeases() {
 	ctx, cancel := context.WithTimeout(context.Background(), c.heartbeatInterval)
 	defer cancel()
 
-	until := time.Now().Add(c.leaseDuration)
-	if err := c.drv.ExtendLeases(ctx, ids, until); err != nil {
+	if err := c.drv.ExtendLeases(ctx, leases, c.leaseDuration); err != nil {
 		// The jobs keep running. If a lease does lapse before the next
 		// beat lands, the rescuer may hand out a duplicate — the
 		// documented price of at-least-once delivery, not a reason to
 		// abandon work that is still progressing.
 		c.logger.Error("drover: extend job leases",
-			"job_ids", ids, "leased_until", until, "error", err)
+			"leases", len(leases), "lease_duration", c.leaseDuration, "error", err)
 		return
 	}
 	c.logger.Debug("drover: extended job leases",
-		"job_ids", ids, "leased_until", until)
+		"leases", len(leases), "lease_duration", c.leaseDuration)
 }

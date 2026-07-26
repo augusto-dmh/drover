@@ -26,20 +26,20 @@ type leaseRecorder struct {
 }
 
 type leaseCall struct {
-	at    time.Time
-	ids   []int64
-	until time.Time
+	at       time.Time
+	leases   []driver.Lease
+	leaseFor time.Duration
 }
 
-func (d *leaseRecorder) ExtendLeases(ctx context.Context, ids []int64, until time.Time) error {
+func (d *leaseRecorder) ExtendLeases(ctx context.Context, leases []driver.Lease, leaseFor time.Duration) error {
 	d.mu.Lock()
-	d.calls = append(d.calls, leaseCall{at: time.Now(), ids: slices.Clone(ids), until: until})
+	d.calls = append(d.calls, leaseCall{at: time.Now(), leases: slices.Clone(leases), leaseFor: leaseFor})
 	failure := d.fail
 	d.mu.Unlock()
 	if failure != nil {
 		return failure
 	}
-	return d.Driver.ExtendLeases(ctx, ids, until)
+	return d.Driver.ExtendLeases(ctx, leases, leaseFor)
 }
 
 func (d *leaseRecorder) snapshot() []leaseCall {
@@ -71,7 +71,7 @@ func TestHeartbeatExtendsLeaseOnEveryInterval(t *testing.T) {
 			LeaseDuration:     30 * time.Second,
 			HeartbeatInterval: 10 * time.Second,
 		})
-		c.inflight.add(7)
+		c.inflight.add(driver.Lease{ID: 7, Attempt: 1})
 
 		start := time.Now()
 		stop := runHeartbeat(c)
@@ -91,13 +91,13 @@ func TestHeartbeatExtendsLeaseOnEveryInterval(t *testing.T) {
 			if !call.at.Equal(wantAt) {
 				t.Errorf("extension %d happened at %v, want %v", i, call.at, wantAt)
 			}
-			// Every renewal buys a full lease from the moment it is made,
-			// not from when the job started.
-			if want := wantAt.Add(30 * time.Second); !call.until.Equal(want) {
-				t.Errorf("extension %d leased until %v, want %v", i, call.until, want)
+			// Every renewal buys a full lease, measured by the database
+			// from the moment it lands.
+			if call.leaseFor != 30*time.Second {
+				t.Errorf("extension %d renewed for %v, want 30s", i, call.leaseFor)
 			}
-			if !slices.Equal(call.ids, []int64{7}) {
-				t.Errorf("extension %d covered %v, want [7]", i, call.ids)
+			if !slices.Equal(call.leases, []driver.Lease{{ID: 7, Attempt: 1}}) {
+				t.Errorf("extension %d covered %v, want the held lease on job 7", i, call.leases)
 			}
 		}
 	})
@@ -111,12 +111,12 @@ func TestHeartbeatStopsExtendingOnceJobFinalizes(t *testing.T) {
 			LeaseDuration:     30 * time.Second,
 			HeartbeatInterval: 10 * time.Second,
 		})
-		c.inflight.add(7)
+		c.inflight.add(driver.Lease{ID: 7, Attempt: 1})
 
 		stop := runHeartbeat(c)
 		time.Sleep(25 * time.Second)
 		synctest.Wait()
-		c.inflight.remove(7)
+		c.inflight.remove(driver.Lease{ID: 7, Attempt: 1})
 		time.Sleep(40 * time.Second)
 		synctest.Wait()
 		stop()
@@ -158,7 +158,7 @@ func TestHeartbeatKeepsBeatingAfterAFailedExtension(t *testing.T) {
 			LeaseDuration:     30 * time.Second,
 			HeartbeatInterval: 10 * time.Second,
 		})
-		c.inflight.add(7)
+		c.inflight.add(driver.Lease{ID: 7, Attempt: 1})
 
 		stop := runHeartbeat(c)
 		time.Sleep(35 * time.Second)
@@ -185,16 +185,17 @@ func TestExtendLeasesDoesNotResurrectAFinalizedJob(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
-	if _, err := mem.FetchAvailable(ctx, "default", time.Now().Add(time.Minute), 1); err != nil {
+	if _, err := mem.FetchAvailable(ctx, "default", time.Minute, 1); err != nil {
 		t.Fatalf("FetchAvailable: %v", err)
 	}
-	if err := mem.MarkCompleted(ctx, row.ID); err != nil {
+	lease := driver.Lease{ID: row.ID, Attempt: 1}
+	if err := mem.MarkCompleted(ctx, lease); err != nil {
 		t.Fatalf("MarkCompleted: %v", err)
 	}
 
 	// The heartbeat races finalization routinely: a beat can be in
 	// flight when the job ends. Landing it must not revive the row.
-	if err := mem.ExtendLeases(ctx, []int64{row.ID}, time.Now().Add(time.Hour)); err != nil {
+	if err := mem.ExtendLeases(ctx, []driver.Lease{lease}, time.Hour); err != nil {
 		t.Fatalf("ExtendLeases on a finalized job returned %v, want nil", err)
 	}
 
@@ -323,9 +324,9 @@ func TestInflightSetTracksJobsConcurrently(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			set.add(id)
+			set.add(driver.Lease{ID: id, Attempt: 1})
 			if id%2 == 0 {
-				set.remove(id)
+				set.remove(driver.Lease{ID: id, Attempt: 1})
 			}
 		}()
 	}
@@ -333,14 +334,14 @@ func TestInflightSetTracksJobsConcurrently(t *testing.T) {
 
 	got := set.snapshot()
 	if len(got) != 25 {
-		t.Fatalf("snapshot has %d ids, want the 25 still running", len(got))
+		t.Fatalf("snapshot has %d leases, want the 25 still running", len(got))
 	}
-	if !slices.IsSorted(got) {
-		t.Errorf("snapshot = %v, want ascending order", got)
+	if !slices.IsSortedFunc(got, func(a, b driver.Lease) int { return int(a.ID - b.ID) }) {
+		t.Errorf("snapshot = %v, want ascending id order", got)
 	}
-	for _, id := range got {
-		if id%2 == 0 {
-			t.Errorf("snapshot contains %d, which was removed", id)
+	for _, held := range got {
+		if held.ID%2 == 0 {
+			t.Errorf("snapshot contains %d, which was removed", held.ID)
 		}
 	}
 }

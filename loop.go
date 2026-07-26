@@ -3,6 +3,7 @@ package drover
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"runtime/debug"
 	"slices"
@@ -58,7 +59,7 @@ func (c *Client) fetchLoop(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		rows, err := c.drv.FetchAvailable(ctx, defaultQueue, time.Now().Add(c.leaseDuration), 1)
+		rows, err := c.drv.FetchAvailable(ctx, defaultQueue, c.leaseDuration, 1)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -88,8 +89,9 @@ func (c *Client) runJob(ctx context.Context, row *driver.JobRow) {
 
 	// Tracked from claim to finalize, which is exactly the window in
 	// which this job's lease must not lapse.
-	c.inflight.add(row.ID)
-	defer c.inflight.remove(row.ID)
+	lease := driver.Lease{ID: row.ID, Attempt: row.Attempt}
+	c.inflight.add(lease)
+	defer c.inflight.remove(lease)
 
 	fn, registered := c.workers.handler(row.Kind)
 	if !registered {
@@ -108,7 +110,7 @@ func (c *Client) runJob(ctx context.Context, row *driver.JobRow) {
 		return
 	}
 
-	if err := c.drv.MarkCompleted(ctx, row.ID); err != nil {
+	if err := c.drv.MarkCompleted(ctx, lease); err != nil {
 		c.writeFailed(row, err)
 		return
 	}
@@ -151,6 +153,7 @@ func (c *Client) dispose(ctx context.Context, row *driver.JobRow, jobErr error, 
 		return slices.Concat(base, rest)
 	}
 
+	lease := driver.Lease{ID: row.ID, Attempt: row.Attempt}
 	outcome, snooze := classifyOutcome(jobErr)
 
 	// A snooze is not a failure: nothing is recorded against the attempt,
@@ -158,7 +161,7 @@ func (c *Client) dispose(ctx context.Context, row *driver.JobRow, jobErr error, 
 	// so a handler waiting on a precondition can ask again indefinitely.
 	if outcome == outcomeSnoozed {
 		runAt := time.Now().Add(snooze)
-		if err := c.drv.MarkSnoozed(ctx, row.ID, runAt); err != nil {
+		if err := c.drv.MarkSnoozed(ctx, lease, runAt); err != nil {
 			c.writeFailed(row, err)
 			return
 		}
@@ -182,14 +185,14 @@ func (c *Client) dispose(ctx context.Context, row *driver.JobRow, jobErr error, 
 
 	switch {
 	case outcome == outcomeCancelled:
-		if err := c.drv.MarkCancelled(ctx, row.ID, detail); err != nil {
+		if err := c.drv.MarkCancelled(ctx, lease, detail); err != nil {
 			c.writeFailed(row, err)
 			return
 		}
 		c.logger.Warn("drover: job cancelled", attrs("error", jobErr)...)
 
 	case row.Attempt >= row.MaxAttempts:
-		if err := c.drv.MarkDead(ctx, row.ID, detail); err != nil {
+		if err := c.drv.MarkDead(ctx, lease, detail); err != nil {
 			c.writeFailed(row, err)
 			return
 		}
@@ -198,7 +201,7 @@ func (c *Client) dispose(ctx context.Context, row *driver.JobRow, jobErr error, 
 
 	default:
 		at := retryAt(ctx, c.logger, c.retryPolicy, rowFromDriver(row), time.Now())
-		if err := c.drv.MarkRetryable(ctx, row.ID, at, detail); err != nil {
+		if err := c.drv.MarkRetryable(ctx, lease, at, detail); err != nil {
 			c.writeFailed(row, err)
 			return
 		}
@@ -207,10 +210,21 @@ func (c *Client) dispose(ctx context.Context, row *driver.JobRow, jobErr error, 
 	}
 }
 
-// writeFailed reports a state change that did not land. The job is still
-// running with a lease that will lapse, so the rescuer picks it up
-// later; the loop keeps going either way.
+// writeFailed reports a state change that did not land. The loop keeps
+// going either way.
+//
+// Losing the lease is reported at a lower level than a genuine write
+// failure, because it is not one: the job was rescued and re-claimed
+// while this attempt was still running, another worker now owns it, and
+// refusing the write is the fence doing its job. A real failure leaves
+// the row running with a lease that will lapse, so the rescuer collects
+// it later.
 func (c *Client) writeFailed(row *driver.JobRow, err error) {
+	if errors.Is(err, driver.ErrLeaseLost) {
+		c.logger.Warn("drover: job taken over by another worker, discarding this outcome",
+			"job_id", row.ID, "kind", row.Kind, "attempt", row.Attempt, "error", err)
+		return
+	}
 	c.logger.Error("drover: finalize job",
 		"job_id", row.ID, "kind", row.Kind, "error", err)
 }

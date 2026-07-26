@@ -76,15 +76,15 @@ type cappedDriver struct {
 	max int
 }
 
-func (d *cappedDriver) FetchAvailable(ctx context.Context, queue string, leaseUntil time.Time, limit int) ([]*driver.JobRow, error) {
-	rows, err := d.Driver.FetchAvailable(ctx, queue, leaseUntil, limit)
+func (d *cappedDriver) FetchAvailable(ctx context.Context, queue string, leaseFor time.Duration, limit int) ([]*driver.JobRow, error) {
+	rows, err := d.Driver.FetchAvailable(ctx, queue, leaseFor, limit)
 	return capRows(rows, d.max), err
 }
 
 // Both claim paths are capped: a job reaches the rescuer carrying the
 // same ceiling it would have carried into the worker loop.
-func (d *cappedDriver) FetchExpired(ctx context.Context, leaseUntil time.Time, limit int) ([]*driver.JobRow, error) {
-	rows, err := d.Driver.FetchExpired(ctx, leaseUntil, limit)
+func (d *cappedDriver) FetchExpired(ctx context.Context, leaseFor time.Duration, limit int) ([]*driver.JobRow, error) {
+	rows, err := d.Driver.FetchExpired(ctx, leaseFor, limit)
 	return capRows(rows, d.max), err
 }
 
@@ -763,9 +763,9 @@ type countingDriver struct {
 	fetches atomic.Int64
 }
 
-func (d *countingDriver) FetchAvailable(ctx context.Context, queue string, leaseUntil time.Time, limit int) ([]*driver.JobRow, error) {
+func (d *countingDriver) FetchAvailable(ctx context.Context, queue string, leaseFor time.Duration, limit int) ([]*driver.JobRow, error) {
 	d.fetches.Add(1)
-	return d.Driver.FetchAvailable(ctx, queue, leaseUntil, limit)
+	return d.Driver.FetchAvailable(ctx, queue, leaseFor, limit)
 }
 
 type flakyDriver struct {
@@ -774,11 +774,11 @@ type flakyDriver struct {
 	calls    atomic.Int32
 }
 
-func (d *flakyDriver) FetchAvailable(ctx context.Context, queue string, leaseUntil time.Time, limit int) ([]*driver.JobRow, error) {
+func (d *flakyDriver) FetchAvailable(ctx context.Context, queue string, leaseFor time.Duration, limit int) ([]*driver.JobRow, error) {
 	if d.calls.Add(1) <= d.failures {
 		return nil, errors.New("connection refused")
 	}
-	return d.Driver.FetchAvailable(ctx, queue, leaseUntil, limit)
+	return d.Driver.FetchAvailable(ctx, queue, leaseFor, limit)
 }
 
 // blockedRetryDriver refuses every attempt to queue a retry, standing in
@@ -789,7 +789,7 @@ type blockedRetryDriver struct {
 	calls atomic.Int32
 }
 
-func (d *blockedRetryDriver) MarkRetryable(context.Context, int64, time.Time, []byte) error {
+func (d *blockedRetryDriver) MarkRetryable(context.Context, driver.Lease, time.Time, []byte) error {
 	d.calls.Add(1)
 	return errors.New("connection refused")
 }
