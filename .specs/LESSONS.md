@@ -26,6 +26,36 @@ Seen once or not yet corroborated. Tracked, not trusted.
 - evidence: loop.go:194 M16 / RESCUE-01 (spec P1-Story3 AC1) (testing/fixtures)
 - last seen: 2026-07-25T22:49:20Z
 
+### L-003 — Run a coverage report over the feature's new files before declaring an AC covered; a function at 0% means the criterion has no evidence no matter how many tests appear to name it.
+- signal: `ac_gap` · recurrence: 1 feature(s) · scope: `testing/coverage` · harmful: 0
+- features: cycle-c-concurrency
+- evidence: pool.go:229 abandon 0.0% coverage / P1-Story2 AC6 (SHUT-05) (testing/coverage)
+- last seen: 2026-07-26T14:03:33Z
+
+### L-004 — An AC saying an operation must NOT wait for a timer needs an upper-bound elapsed-time assertion; without one, deleting the early-exit channel arm survives.
+- signal: `surviving_mutant` · recurrence: 1 feature(s) · scope: `testing/timing` · harmful: 0
+- features: cycle-c-concurrency
+- evidence: pool.go:433 M9 / edge case: Stop must not wait out a poll interval (testing/timing)
+- last seen: 2026-07-26T14:03:33Z
+
+### L-005 — When an AC distinguishes two error classifications only by how they are logged, assert on the log record's level and message; otherwise both branches are indistinguishable to the suite.
+- signal: `surviving_mutant` · recurrence: 1 feature(s) · scope: `testing/logging` · harmful: 0
+- features: cycle-c-concurrency
+- evidence: loop.go:247 M13 / P1-Story3 AC3 (testing/logging)
+- last seen: 2026-07-26T14:03:33Z
+
+### L-006 — A best-effort loop that must continue past a failing element needs a test where exactly one element fails and a later one is asserted to have still been processed.
+- signal: `surviving_mutant` · recurrence: 1 feature(s) · scope: `testing/error-paths` · harmful: 0
+- features: cycle-c-concurrency
+- evidence: pool.go:266 M14 / edge case: requeue failure at shutdown (testing/error-paths)
+- last seen: 2026-07-26T14:03:33Z
+
+### L-007 — When a deferred cleanup performs the same side effect as the code under test, assert the effect happens before the function returns or in a required order; otherwise the deferred path silently satisfies the test.
+- signal: `spec_precision_gap` · recurrence: 1 feature(s) · scope: `testing/lifecycle` · harmful: 0
+- features: cycle-c-concurrency
+- evidence: pool_test.go:557 M6 / P1-Story2 AC3, AC5 (testing/lifecycle)
+- last seen: 2026-07-26T14:03:33Z
+
 ## Quarantined (failed when applied — ignore)
 
 A confirmed lesson that recurred alongside failure. Kept for the maintainer to review.

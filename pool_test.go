@@ -550,25 +550,167 @@ func TestShutdownRequeueDoesNotGiveBackTheAttempt(t *testing.T) {
 	waitForInflightToClear(t, c)
 }
 
-// Escalation has to actually reach the handlers. A shutdown that only
-// waited and then gave up would leave a cooperative handler — one
-// watching its context, which is the behaviour drover asks for — blocked
-// on a cancellation that never came.
-func TestExhaustingTheBudgetCancelsTheRunningHandlers(t *testing.T) {
-	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+// The fetch loop can be holding rows it claimed but had not yet handed
+// to a worker when shutdown began. Nothing is executing those, so they
+// are the worst kind of row to strand: running and leased with no worker
+// behind them and nobody able to touch them until the lease lapses.
+//
+// Reaching that state through the running pool takes a race the slot
+// accounting exists to make vanishingly rare, so the hand-back is
+// exercised directly — the behaviour is what the spec requires, whether
+// or not the path is easy to provoke from outside.
+func TestClaimsNeverHandedToAWorkerGoBackToTheQueue(t *testing.T) {
+	t.Parallel()
 
 	mem := memdriver.New()
-	entered := make(chan int64, 1)
-	cancelled := make(chan struct{})
-	ws := NewWorkers()
-	Register(ws, &funcWorker{fn: func(ctx context.Context, job *Job[greetArgs]) error {
-		entered <- job.ID
-		<-ctx.Done()
-		close(cancelled)
-		return ctx.Err()
-	}})
+	c := newPoolClient(mem, NewWorkers(), 2, nil)
+	ids := insertN(t, c, 2)
 
-	c := newPoolClient(mem, ws, 1, nil)
+	claimed, err := mem.FetchAvailable(context.Background(), defaultQueue, time.Minute, 2)
+	if err != nil {
+		t.Fatalf("FetchAvailable: %v", err)
+	}
+	if len(claimed) != 2 {
+		t.Fatalf("claimed %d rows, want 2", len(claimed))
+	}
+
+	r := newRunner(context.Background(), c)
+	defer r.cancelJobs()
+	defer r.cancelBackground()
+
+	// Stand in for the fetch loop: it holds one slot per row it claimed,
+	// and each claim is tracked so the heartbeat covers it.
+	for _, row := range claimed {
+		<-r.slots
+		c.inflight.add(driver.Lease{ID: row.ID, Attempt: row.Attempt})
+	}
+
+	r.abandon(claimed)
+
+	for _, id := range ids {
+		row, ok := mem.Row(id)
+		if !ok {
+			t.Fatalf("job %d not found", id)
+		}
+		if row.State != "retryable" {
+			t.Errorf("job %d state = %q, want retryable — a claimed job nothing ran was left stranded", id, row.State)
+		}
+		if row.Attempt != 1 {
+			t.Errorf("job %d attempt = %d, want it left at 1 by the hand-back", id, row.Attempt)
+		}
+	}
+	if held := len(c.inflight.snapshot()); held != 0 {
+		t.Errorf("in-flight set still tracks %d lease(s) after they were handed back", held)
+	}
+	if free := len(r.slots); free != 2 {
+		t.Errorf("free slots = %d, want 2 — the abandoned rows' capacity was not returned", free)
+	}
+}
+
+// failFirstRetryableDriver refuses the first requeue and accepts the
+// rest, so a test can prove one row that will not go back does not take
+// the others with it.
+type failFirstRetryableDriver struct {
+	*memdriver.Driver
+	refused atomic.Bool
+}
+
+func (d *failFirstRetryableDriver) MarkRetryable(ctx context.Context, lease driver.Lease, retryAt time.Time, errDetail []byte) error {
+	if !d.refused.Swap(true) {
+		return errors.New("connection reset")
+	}
+	return d.Driver.MarkRetryable(ctx, lease, retryAt, errDetail)
+}
+
+// A shutdown is best effort across every job it is handing back. One row
+// that will not go back is logged and left for the rescuer; it must not
+// abandon the rows behind it in the queue.
+func TestOneFailedHandBackDoesNotStopTheRest(t *testing.T) {
+	t.Parallel()
+
+	mem := memdriver.New()
+	refusing := &failFirstRetryableDriver{Driver: mem}
+	c := newPoolClient(refusing, NewWorkers(), 3, nil)
+	ids := insertN(t, c, 3)
+
+	claimed, err := mem.FetchAvailable(context.Background(), defaultQueue, time.Minute, 3)
+	if err != nil {
+		t.Fatalf("FetchAvailable: %v", err)
+	}
+
+	r := newRunner(context.Background(), c)
+	defer r.cancelJobs()
+	defer r.cancelBackground()
+	for _, row := range claimed {
+		<-r.slots
+		c.inflight.add(driver.Lease{ID: row.ID, Attempt: row.Attempt})
+	}
+
+	r.abandon(claimed)
+
+	// The first was refused and stays running for the rescuer. Every one
+	// after it must still have gone back.
+	stranded, returned := 0, 0
+	for _, id := range ids {
+		row, _ := mem.Row(id)
+		switch row.State {
+		case "running":
+			stranded++
+		case "retryable":
+			returned++
+		default:
+			t.Errorf("job %d state = %q, want running or retryable", id, row.State)
+		}
+	}
+	if stranded != 1 {
+		t.Errorf("%d jobs left running, want exactly the 1 the driver refused", stranded)
+	}
+	if returned != 2 {
+		t.Errorf("%d jobs went back to the queue, want 2 — a refused hand-back stopped the ones behind it", returned)
+	}
+}
+
+// An idle pool spends most of its life asleep between polls. Shutdown
+// has to interrupt that sleep rather than wait it out, or every restart
+// costs a poll interval — paid on each deploy, on every worker.
+func TestStopDoesNotWaitOutThePollInterval(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	c := newPoolClient(memdriver.New(), NewWorkers(), 2, func(cfg *Config) {
+		cfg.PollInterval = 3 * time.Second
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	// Long enough to be settled into the idle sleep.
+	time.Sleep(50 * time.Millisecond)
+
+	start := time.Now()
+	if err := c.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop returned %v, want nil", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("Stop took %v against a 3s poll interval — shutdown waited out an idle tick", elapsed)
+	}
+}
+
+// The spec's ordering is that claiming ceases before shutdown begins
+// waiting, not merely by the time it returns. Sampling twice while a
+// blocked handler holds the drain open is what tells those apart.
+func TestClaimingStopsBeforeTheDrainBeginsWaiting(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	counting := &countingDriver{Driver: memdriver.New()}
+	entered := make(chan int64, 1)
+	release := make(chan struct{})
+	ws := NewWorkers()
+	Register(ws, stubbornWorker(entered, release))
+
+	c := newPoolClient(counting, ws, 2, func(cfg *Config) {
+		cfg.PollInterval = time.Millisecond
+	})
 	insertN(t, c, 1)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -582,17 +724,26 @@ func TestExhaustingTheBudgetCancelsTheRunningHandlers(t *testing.T) {
 		t.Fatal("job never started")
 	}
 
-	budget, cancelBudget := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	budget, cancelBudget := context.WithTimeout(context.Background(), 600*time.Millisecond)
 	defer cancelBudget()
-	if err := c.Stop(budget); !errors.Is(err, ErrDrainIncomplete) {
-		t.Fatalf("Stop = %v, want an error wrapping ErrDrainIncomplete", err)
+	stopped := make(chan error, 1)
+	go func() { stopped <- c.Stop(budget) }()
+
+	// Both samples are taken while the drain is still waiting on the
+	// blocked handler. At a 1ms poll interval a fetch loop still claiming
+	// would add hundreds of calls between them.
+	time.Sleep(150 * time.Millisecond)
+	duringDrain := counting.fetches.Load()
+	time.Sleep(250 * time.Millisecond)
+	if later := counting.fetches.Load(); later != duringDrain {
+		t.Errorf("fetches went from %d to %d while the drain was waiting — claiming did not stop before shutdown began waiting",
+			duringDrain, later)
 	}
 
-	select {
-	case <-cancelled:
-	case <-time.After(2 * time.Second):
-		t.Fatal("shutdown never cancelled the running handler's context")
+	if err := <-stopped; !errors.Is(err, ErrDrainIncomplete) {
+		t.Fatalf("Stop = %v, want an error wrapping ErrDrainIncomplete", err)
 	}
+	close(release)
 	waitForInflightToClear(t, c)
 }
 

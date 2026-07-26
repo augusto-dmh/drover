@@ -3,7 +3,7 @@
   "promote_threshold": 2,
   "window_days": 45,
   "quarantine_threshold": 2,
-  "next_id": 3,
+  "next_id": 8,
   "lessons": [
     {
       "id": "L-001",
@@ -40,6 +40,96 @@
       ],
       "created": "2026-07-25T22:49:20Z",
       "last_seen": "2026-07-25T22:49:20Z"
+    },
+    {
+      "id": "L-003",
+      "key": "ac_gap::run a coverage report over the feature s new files before declaring an ac covered a function at 0 means the criterion has no evidence no matter how many tests appear to name it",
+      "text": "Run a coverage report over the feature's new files before declaring an AC covered; a function at 0% means the criterion has no evidence no matter how many tests appear to name it.",
+      "signal": "ac_gap",
+      "scope": "testing/coverage",
+      "status": "candidate",
+      "features": [
+        "cycle-c-concurrency"
+      ],
+      "recurrence": 1,
+      "harmful": 0,
+      "evidence": [
+        "pool.go:229 abandon 0.0% coverage / P1-Story2 AC6 (SHUT-05) (testing/coverage)"
+      ],
+      "created": "2026-07-26T14:03:33Z",
+      "last_seen": "2026-07-26T14:03:33Z"
+    },
+    {
+      "id": "L-004",
+      "key": "surviving_mutant::an ac saying an operation must not wait for a timer needs an upper bound elapsed time assertion without one deleting the early exit channel arm survives",
+      "text": "An AC saying an operation must NOT wait for a timer needs an upper-bound elapsed-time assertion; without one, deleting the early-exit channel arm survives.",
+      "signal": "surviving_mutant",
+      "scope": "testing/timing",
+      "status": "candidate",
+      "features": [
+        "cycle-c-concurrency"
+      ],
+      "recurrence": 1,
+      "harmful": 0,
+      "evidence": [
+        "pool.go:433 M9 / edge case: Stop must not wait out a poll interval (testing/timing)"
+      ],
+      "created": "2026-07-26T14:03:33Z",
+      "last_seen": "2026-07-26T14:03:33Z"
+    },
+    {
+      "id": "L-005",
+      "key": "surviving_mutant::when an ac distinguishes two error classifications only by how they are logged assert on the log record s level and message otherwise both branches are indistinguishable to the suite",
+      "text": "When an AC distinguishes two error classifications only by how they are logged, assert on the log record's level and message; otherwise both branches are indistinguishable to the suite.",
+      "signal": "surviving_mutant",
+      "scope": "testing/logging",
+      "status": "candidate",
+      "features": [
+        "cycle-c-concurrency"
+      ],
+      "recurrence": 1,
+      "harmful": 0,
+      "evidence": [
+        "loop.go:247 M13 / P1-Story3 AC3 (testing/logging)"
+      ],
+      "created": "2026-07-26T14:03:33Z",
+      "last_seen": "2026-07-26T14:03:33Z"
+    },
+    {
+      "id": "L-006",
+      "key": "surviving_mutant::a best effort loop that must continue past a failing element needs a test where exactly one element fails and a later one is asserted to have still been processed",
+      "text": "A best-effort loop that must continue past a failing element needs a test where exactly one element fails and a later one is asserted to have still been processed.",
+      "signal": "surviving_mutant",
+      "scope": "testing/error-paths",
+      "status": "candidate",
+      "features": [
+        "cycle-c-concurrency"
+      ],
+      "recurrence": 1,
+      "harmful": 0,
+      "evidence": [
+        "pool.go:266 M14 / edge case: requeue failure at shutdown (testing/error-paths)"
+      ],
+      "created": "2026-07-26T14:03:33Z",
+      "last_seen": "2026-07-26T14:03:33Z"
+    },
+    {
+      "id": "L-007",
+      "key": "spec_precision_gap::when a deferred cleanup performs the same side effect as the code under test assert the effect happens before the function returns or in a required order otherwise the deferred path silently satisfies the test",
+      "text": "When a deferred cleanup performs the same side effect as the code under test, assert the effect happens before the function returns or in a required order; otherwise the deferred path silently satisfies the test.",
+      "signal": "spec_precision_gap",
+      "scope": "testing/lifecycle",
+      "status": "candidate",
+      "features": [
+        "cycle-c-concurrency"
+      ],
+      "recurrence": 1,
+      "harmful": 0,
+      "evidence": [
+        "pool_test.go:557 M6 / P1-Story2 AC3, AC5 (testing/lifecycle)"
+      ],
+      "created": "2026-07-26T14:03:33Z",
+      "last_seen": "2026-07-26T14:03:33Z"
     }
   ]
 }

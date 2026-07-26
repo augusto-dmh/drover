@@ -300,6 +300,47 @@ func TestALongRunningJobCanStillRecordItsOutcome(t *testing.T) {
 	}
 }
 
+// leaseLostDriver refuses every completion the way the database does
+// once the job has moved on to an attempt this caller no longer holds.
+type leaseLostDriver struct{ *memdriver.Driver }
+
+func (d *leaseLostDriver) MarkCompleted(context.Context, driver.Lease) error {
+	return driver.ErrLeaseLost
+}
+
+// Losing the lease is the fence working, not a fault: the job was
+// rescued and re-claimed while this attempt was still running, and
+// another worker owns the outcome now. Reporting it as a write failure
+// would put an ERROR in the log for every rescue — training operators to
+// ignore the line that matters when a write genuinely does fail.
+func TestALostLeaseIsReportedAsATakeoverNotAFailure(t *testing.T) {
+	t.Parallel()
+
+	mem := memdriver.New()
+	logs := &syncWriter{}
+	ws := NewWorkers()
+	Register(ws, &funcWorker{fn: func(context.Context, *Job[greetArgs]) error { return nil }})
+	c := newClient(&leaseLostDriver{mem}, Config{Workers: ws, Logger: newTestLogger(logs)})
+
+	if _, err := c.Insert(context.Background(), greetArgs{Name: "ada"}); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	claimed, err := mem.FetchAvailable(context.Background(), defaultQueue, time.Minute, 1)
+	if err != nil {
+		t.Fatalf("FetchAvailable: %v", err)
+	}
+
+	c.runJob(context.Background(), claimed[0])
+
+	out := logs.String()
+	if !strings.Contains(out, "taken over by another worker") {
+		t.Errorf("log does not report the takeover:\n%s", out)
+	}
+	if strings.Contains(out, `msg="drover: finalize job"`) {
+		t.Errorf("a lost lease was reported as a failed write:\n%s", out)
+	}
+}
+
 func TestStartExecutesJobToCompletion(t *testing.T) {
 	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 	mem := memdriver.New()

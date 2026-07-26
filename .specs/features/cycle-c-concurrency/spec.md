@@ -103,6 +103,8 @@ Every ambiguity is resolved or recorded here. Full option sets and rationale liv
 4. WHEN a job's context has been cancelled by shutdown escalation THEN the client SHALL still record that job's outcome — finalization SHALL NOT run on the cancelled context.
 5. WHEN a full `Start`/`Stop` cycle completes THEN no goroutine created by the client SHALL still be running.
 6. WHEN concurrent claims race against the same rows THEN no row SHALL be executed by two workers of the same client.
+7. WHEN a handler runs for longer than one lease duration THEN the job SHALL still be able to record its outcome when it finishes — the deadline bounding that write SHALL start at the write, not at the claim.
+8. WHEN a job's lease has been taken over by another holder THEN the refused write SHALL be reported as a takeover rather than as a failed write, so a routine rescue does not log an error.
 
 **Independent Test**: run the pool against the in-memory driver with `n` jobs and assert the recorded `ExtendLeases` calls carry `n` lease entries; separately, assert `goleak.VerifyNone` after `Stop` returns.
 
@@ -174,7 +176,7 @@ Every ambiguity is resolved or recorded here. Full option sets and rationale liv
 | SHUT-05 | Claimed-but-undispatched jobs are requeued; `Stop` is safe when never started and when called twice | P1-Story2 AC6, AC8, AC9 |
 | SAFE-01 | The heartbeat renews every in-flight lease, at any pool size | P1-Story3 AC1 |
 | SAFE-02 | The heartbeat outlives the fetch loop and stops only after the last worker drains | P1-Story3 AC2 |
-| SAFE-03 | The ownership fence holds: a lost lease refuses the write and is logged as a takeover; finalization never runs on a cancelled context | P1-Story3 AC3, AC4; Edge: late handler return |
+| SAFE-03 | The ownership fence holds: a lost lease refuses the write, is logged as a takeover rather than a failure, and finalization never runs on a cancelled context or on a deadline started at claim time | P1-Story3 AC3, AC4, AC7, AC8; Edge: late handler return |
 | SAFE-04 | No goroutine leaks across a `Start`/`Stop` cycle | P1-Story3 AC5 |
 | EX-01 | A runnable example program builds, vets, and demonstrates concurrency, retries and graceful shutdown with no new dependencies | P2-Story4 AC1–AC5 |
 
