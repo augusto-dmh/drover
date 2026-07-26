@@ -9,6 +9,20 @@ Implement these tasks with the `tlc-spec-driven` skill: activate it by name and 
 **Design**: `.specs/features/cycle-c-concurrency/design.md`
 **Status**: Approved (auto — ship-cycle autonomy contract)
 
+## Progress
+
+| Task | Commit | Notes |
+| --- | --- | --- |
+| T1 `Concurrency` setting | `4097bb7` | `client_test.go` 7 → 8 |
+| T2 per-job context split | `7eb7b94` | Needed a driver that honours context — `memdriver` ignores it, so the first version of the sensor could not discriminate (lesson L-002 in the wild). Both mutants killed. |
+| T3 pool + `Start`/`Stop` | `169a30d` | Root unit tests 58 → 70. Five mutants killed (pool-of-one, over-claim, early heartbeat stop, no watcher, immortal rescuer). |
+| T4 escalation + requeue | `366ec21` | Root unit tests 70 → 76. Uncovered a token-accounting deadlock when a driver returns more rows than the limit; fixed by returning the surplus immediately. First cancel-ordering sensor was masked by a `defer`, so it was rewritten to pin the order. |
+| — regression fix | `95ade96` | The integration suite caught a real defect from T2: the finalization deadline was anchored at job start, so any job outliving its lease finished successfully and then failed to record it. Now taken at the write. Unit sensor added. |
+| T5 integration proof | `f907a3b` | `e2e_integration_test.go` 7 → 10. Also repaired two existing tests and the `runLoop` helper, which had become vacuous under a non-blocking `Start`. |
+| — lint | `3a79fd4` | errcheck + errorlint on the shutdown path. |
+| T6 example program | delegated | phase worker |
+| T7 documentation | delegated | phase worker |
+
 ---
 
 ## Test Coverage Matrix
