@@ -6,17 +6,25 @@ import (
 	"time"
 )
 
-// rescueBatch bounds how many expired jobs one round of a sweep
-// re-claims. A sweep keeps going until a round comes back short, so a
-// backlog of thousands drains in one tick instead of one batch per tick,
-// while no single round holds an unbounded result set in memory.
-const rescueBatch = 100
+const (
+	// rescueBatch bounds how many expired jobs one round of a sweep
+	// re-claims, so no single round holds an unbounded result set in
+	// memory.
+	rescueBatch = 100
+
+	// rescueRounds bounds how many rounds one tick may run. A backlog of
+	// thousands still drains far faster than one batch per tick, but a
+	// single sweep can no longer occupy a pool connection indefinitely —
+	// and the connection it would be holding is one the heartbeat needs,
+	// which is exactly how a stalled renewal turns into a duplicate.
+	rescueRounds = 10
+)
 
 // errLeaseExpired is recorded against the attempt of a job whose worker
 // stopped renewing its lease. There is nothing more specific to say: a
 // process that died mid-job left no error behind, and the expired lease
 // is the only evidence the queue has.
-var errLeaseExpired = errors.New("lease expired: worker presumed dead")
+var errLeaseExpired = errors.New("drover: lease expired, worker presumed dead")
 
 // rescueLoop sweeps for jobs abandoned by dead workers, once per rescue
 // interval, until ctx is cancelled.
@@ -56,20 +64,32 @@ func (c *Client) rescueLoop(ctx context.Context) {
 // loud.
 func (c *Client) rescueOnce(ctx context.Context) (int, error) {
 	rescued := 0
-	for {
+	for round := 0; round < rescueRounds; round++ {
 		rows, err := c.drv.FetchExpired(ctx, time.Now().Add(c.leaseDuration), rescueBatch)
 		if err != nil {
 			return rescued, err
 		}
+
+		// Re-claiming committed a fresh lease on every one of these rows,
+		// so this sweep now owns them, and owning them means having to
+		// disposition them. Cancellation must not abandon that obligation:
+		// a row dropped here is left leased for a full duration with
+		// nobody running it — strictly less recoverable than the expired
+		// row the sweep started from. The fetch loop resolves the
+		// identical problem the same way for the job it has claimed.
+		disposeCtx := context.WithoutCancel(ctx)
 		for _, row := range rows {
 			c.logger.Warn("drover: job lease expired, worker presumed dead",
 				"job_id", row.ID, "kind", row.Kind, "attempt", row.Attempt,
 				"max_attempts", row.MaxAttempts)
-			c.dispose(ctx, row, errLeaseExpired, nil)
+			c.dispose(disposeCtx, row, errLeaseExpired, nil, 0)
 			rescued++
 		}
+
 		if len(rows) < rescueBatch || ctx.Err() != nil {
 			return rescued, nil
 		}
 	}
+	// Still more to collect; the next tick carries on.
+	return rescued, nil
 }
