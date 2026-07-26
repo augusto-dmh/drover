@@ -3,11 +3,14 @@ INSERT INTO drover_jobs (kind, queue, args)
 VALUES ($1, $2, $3)
 RETURNING *;
 
+-- Lease deadlines are computed here, from the database clock, because
+-- that is the clock the sweep compares them against. Deriving them on
+-- the client would make every lease depend on two machines agreeing.
 -- name: FetchAvailable :many
 UPDATE drover_jobs
 SET state = 'running',
     attempt = attempt + 1,
-    leased_until = sqlc.arg(leased_until)::timestamptz
+    leased_until = now() + make_interval(secs => sqlc.arg(lease_seconds)::float8)
 WHERE id IN (
     SELECT j.id FROM drover_jobs j
     WHERE j.state IN ('available', 'retryable', 'scheduled')
@@ -31,7 +34,7 @@ RETURNING *;
 -- of every job whose worker ever crashed.
 -- name: FetchExpired :many
 UPDATE drover_jobs
-SET leased_until = sqlc.arg(leased_until)::timestamptz
+SET leased_until = now() + make_interval(secs => sqlc.arg(lease_seconds)::float8)
 WHERE id IN (
     SELECT j.id FROM drover_jobs j
     WHERE j.state = 'running'
@@ -46,20 +49,30 @@ WHERE id IN (
 RETURNING *;
 
 -- name: ExtendLeases :exec
-UPDATE drover_jobs
-SET leased_until = sqlc.arg(leased_until)::timestamptz
-WHERE id = ANY(sqlc.arg(ids)::bigint[])
-  AND state = 'running';
+UPDATE drover_jobs j
+SET leased_until = now() + make_interval(secs => sqlc.arg(lease_seconds)::float8)
+FROM (
+    SELECT unnest(sqlc.arg(ids)::bigint[]) AS id,
+           unnest(sqlc.arg(attempts)::int[]) AS attempt
+) AS held
+WHERE j.id = held.id
+  AND j.attempt = held.attempt
+  AND j.state = 'running';
 
 -- name: GetJob :one
 SELECT * FROM drover_jobs WHERE id = $1;
 
+-- Every finalizer is guarded on the attempt as well as the state. The
+-- state alone proves some worker holds the row, not that this one does:
+-- a worker whose heartbeat starved past its lease can find its job
+-- rescued and re-claimed, and must not then record the outcome of an
+-- attempt it no longer owns over the one now running.
 -- name: MarkCompleted :execrows
 UPDATE drover_jobs
 SET state = 'completed',
     finalized_at = now(),
     leased_until = NULL
-WHERE id = $1 AND state = 'running';
+WHERE id = sqlc.arg(id) AND attempt = sqlc.arg(attempt) AND state = 'running';
 
 -- name: MarkRetryable :execrows
 UPDATE drover_jobs
@@ -67,7 +80,7 @@ SET state = 'retryable',
     scheduled_at = sqlc.arg(retry_at)::timestamptz,
     leased_until = NULL,
     errors = errors || sqlc.arg(error)::jsonb
-WHERE id = sqlc.arg(id) AND state = 'running';
+WHERE id = sqlc.arg(id) AND attempt = sqlc.arg(attempt) AND state = 'running';
 
 -- name: MarkDead :execrows
 UPDATE drover_jobs
@@ -75,7 +88,7 @@ SET state = 'dead',
     finalized_at = now(),
     leased_until = NULL,
     errors = errors || sqlc.arg(error)::jsonb
-WHERE id = $1 AND state = 'running';
+WHERE id = sqlc.arg(id) AND attempt = sqlc.arg(attempt) AND state = 'running';
 
 -- name: MarkCancelled :execrows
 UPDATE drover_jobs
@@ -83,7 +96,7 @@ SET state = 'cancelled',
     finalized_at = now(),
     leased_until = NULL,
     errors = errors || sqlc.arg(error)::jsonb
-WHERE id = sqlc.arg(id) AND state = 'running';
+WHERE id = sqlc.arg(id) AND attempt = sqlc.arg(attempt) AND state = 'running';
 
 -- MarkSnoozed gives back the attempt the claim consumed, floored at zero
 -- so a deferral can never drive attempt negative or exhaust a job.
@@ -93,4 +106,4 @@ SET state = 'scheduled',
     scheduled_at = sqlc.arg(run_at)::timestamptz,
     leased_until = NULL,
     attempt = GREATEST(attempt - 1, 0)
-WHERE id = sqlc.arg(id) AND state = 'running';
+WHERE id = sqlc.arg(id) AND attempt = sqlc.arg(attempt) AND state = 'running';

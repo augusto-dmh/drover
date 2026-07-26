@@ -26,7 +26,7 @@ func mustInsert(t *testing.T, d *Driver, kind, queue string) *driver.JobRow {
 
 func claimOne(t *testing.T, d *Driver, queue string) *driver.JobRow {
 	t.Helper()
-	rows, err := d.FetchAvailable(context.Background(), queue, time.Now().Add(time.Minute), 1)
+	rows, err := d.FetchAvailable(context.Background(), queue, time.Minute, 1)
 	if err != nil {
 		t.Fatalf("FetchAvailable: %v", err)
 	}
@@ -48,12 +48,12 @@ func park(t *testing.T, d *Driver, state string, at time.Time) *driver.JobRow {
 		d.mu.Unlock()
 	case "retryable":
 		claimOne(t, d, "default")
-		if err := d.MarkRetryable(context.Background(), row.ID, at, []byte(`{"error":"boom"}`)); err != nil {
+		if err := d.MarkRetryable(context.Background(), held(row.ID), at, []byte(`{"error":"boom"}`)); err != nil {
 			t.Fatalf("MarkRetryable: %v", err)
 		}
 	case "scheduled":
 		claimOne(t, d, "default")
-		if err := d.MarkSnoozed(context.Background(), row.ID, at); err != nil {
+		if err := d.MarkSnoozed(context.Background(), held(row.ID), at); err != nil {
 			t.Fatalf("MarkSnoozed: %v", err)
 		}
 	default:
@@ -88,6 +88,11 @@ func decodeErrors(t *testing.T, row *driver.JobRow) []driver.AttemptError {
 	}
 	return recorded
 }
+
+// held builds the lease a caller holds after claiming a job once. Every
+// test here claims at most once, so attempt 1 is what a legitimate
+// holder presents.
+func held(id int64) driver.Lease { return driver.Lease{ID: id, Attempt: 1} }
 
 func TestInsertSetsNewJobDefaults(t *testing.T) {
 	t.Parallel()
@@ -175,7 +180,7 @@ func TestFetchAvailableFilters(t *testing.T) {
 			d := New()
 			tt.setup(t, d)
 
-			rows, err := d.FetchAvailable(context.Background(), "default", time.Now().Add(time.Minute), 1)
+			rows, err := d.FetchAvailable(context.Background(), "default", time.Minute, 1)
 			if err != nil {
 				t.Fatalf("FetchAvailable: %v", err)
 			}
@@ -192,7 +197,7 @@ func TestMarkCompletedFinalizesRunningJob(t *testing.T) {
 	mustInsert(t, d, "k", "default")
 	claimed := claimOne(t, d, "default")
 
-	if err := d.MarkCompleted(context.Background(), claimed.ID); err != nil {
+	if err := d.MarkCompleted(context.Background(), held(claimed.ID)); err != nil {
 		t.Fatalf("MarkCompleted: %v", err)
 	}
 
@@ -215,7 +220,7 @@ func TestMarkDeadAppendsErrorDetail(t *testing.T) {
 	claimed := claimOne(t, d, "default")
 
 	detail, _ := json.Marshal(driver.AttemptError{Attempt: 1, At: time.Now(), Error: "boom"})
-	if err := d.MarkDead(context.Background(), claimed.ID, detail); err != nil {
+	if err := d.MarkDead(context.Background(), held(claimed.ID), detail); err != nil {
 		t.Fatalf("MarkDead: %v", err)
 	}
 
@@ -247,13 +252,13 @@ func TestFinalizeTransitionGuards(t *testing.T) {
 		{
 			"complete an available job",
 			func(d *Driver, t *testing.T) int64 { return mustInsert(t, d, "k", "default").ID },
-			func(d *Driver, id int64) error { return d.MarkCompleted(context.Background(), id) },
+			func(d *Driver, id int64) error { return d.MarkCompleted(context.Background(), held(id)) },
 			driver.ErrInvalidTransition,
 		},
 		{
 			"kill an available job",
 			func(d *Driver, t *testing.T) int64 { return mustInsert(t, d, "k", "default").ID },
-			func(d *Driver, id int64) error { return d.MarkDead(context.Background(), id, []byte(`{}`)) },
+			func(d *Driver, id int64) error { return d.MarkDead(context.Background(), held(id), []byte(`{}`)) },
 			driver.ErrInvalidTransition,
 		},
 		{
@@ -261,31 +266,31 @@ func TestFinalizeTransitionGuards(t *testing.T) {
 			func(d *Driver, t *testing.T) int64 {
 				mustInsert(t, d, "k", "default")
 				id := claimOne(t, d, "default").ID
-				if err := d.MarkCompleted(context.Background(), id); err != nil {
+				if err := d.MarkCompleted(context.Background(), held(id)); err != nil {
 					t.Fatal(err)
 				}
 				return id
 			},
-			func(d *Driver, id int64) error { return d.MarkCompleted(context.Background(), id) },
+			func(d *Driver, id int64) error { return d.MarkCompleted(context.Background(), held(id)) },
 			driver.ErrInvalidTransition,
 		},
 		{
 			"complete an unknown id",
 			func(*Driver, *testing.T) int64 { return 999 },
-			func(d *Driver, id int64) error { return d.MarkCompleted(context.Background(), id) },
+			func(d *Driver, id int64) error { return d.MarkCompleted(context.Background(), held(id)) },
 			driver.ErrNotFound,
 		},
 		{
 			"kill an unknown id",
 			func(*Driver, *testing.T) int64 { return 999 },
-			func(d *Driver, id int64) error { return d.MarkDead(context.Background(), id, []byte(`{}`)) },
+			func(d *Driver, id int64) error { return d.MarkDead(context.Background(), held(id), []byte(`{}`)) },
 			driver.ErrNotFound,
 		},
 		{
 			"retry an available job",
 			func(d *Driver, t *testing.T) int64 { return mustInsert(t, d, "k", "default").ID },
 			func(d *Driver, id int64) error {
-				return d.MarkRetryable(context.Background(), id, time.Now(), []byte(`{}`))
+				return d.MarkRetryable(context.Background(), held(id), time.Now(), []byte(`{}`))
 			},
 			driver.ErrInvalidTransition,
 		},
@@ -295,14 +300,14 @@ func TestFinalizeTransitionGuards(t *testing.T) {
 				return park(t, d, "retryable", time.Now().Add(time.Hour)).ID
 			},
 			func(d *Driver, id int64) error {
-				return d.MarkRetryable(context.Background(), id, time.Now(), []byte(`{}`))
+				return d.MarkRetryable(context.Background(), held(id), time.Now(), []byte(`{}`))
 			},
 			driver.ErrInvalidTransition,
 		},
 		{
 			"cancel an available job",
 			func(d *Driver, t *testing.T) int64 { return mustInsert(t, d, "k", "default").ID },
-			func(d *Driver, id int64) error { return d.MarkCancelled(context.Background(), id, []byte(`{}`)) },
+			func(d *Driver, id int64) error { return d.MarkCancelled(context.Background(), held(id), []byte(`{}`)) },
 			driver.ErrInvalidTransition,
 		},
 		{
@@ -310,18 +315,18 @@ func TestFinalizeTransitionGuards(t *testing.T) {
 			func(d *Driver, t *testing.T) int64 {
 				mustInsert(t, d, "k", "default")
 				id := claimOne(t, d, "default").ID
-				if err := d.MarkCompleted(context.Background(), id); err != nil {
+				if err := d.MarkCompleted(context.Background(), held(id)); err != nil {
 					t.Fatal(err)
 				}
 				return id
 			},
-			func(d *Driver, id int64) error { return d.MarkCancelled(context.Background(), id, []byte(`{}`)) },
+			func(d *Driver, id int64) error { return d.MarkCancelled(context.Background(), held(id), []byte(`{}`)) },
 			driver.ErrInvalidTransition,
 		},
 		{
 			"snooze an available job",
 			func(d *Driver, t *testing.T) int64 { return mustInsert(t, d, "k", "default").ID },
-			func(d *Driver, id int64) error { return d.MarkSnoozed(context.Background(), id, time.Now()) },
+			func(d *Driver, id int64) error { return d.MarkSnoozed(context.Background(), held(id), time.Now()) },
 			driver.ErrInvalidTransition,
 		},
 		{
@@ -329,27 +334,27 @@ func TestFinalizeTransitionGuards(t *testing.T) {
 			func(d *Driver, t *testing.T) int64 {
 				return park(t, d, "scheduled", time.Now().Add(time.Hour)).ID
 			},
-			func(d *Driver, id int64) error { return d.MarkSnoozed(context.Background(), id, time.Now()) },
+			func(d *Driver, id int64) error { return d.MarkSnoozed(context.Background(), held(id), time.Now()) },
 			driver.ErrInvalidTransition,
 		},
 		{
 			"retry an unknown id",
 			func(*Driver, *testing.T) int64 { return 999 },
 			func(d *Driver, id int64) error {
-				return d.MarkRetryable(context.Background(), id, time.Now(), []byte(`{}`))
+				return d.MarkRetryable(context.Background(), held(id), time.Now(), []byte(`{}`))
 			},
 			driver.ErrNotFound,
 		},
 		{
 			"cancel an unknown id",
 			func(*Driver, *testing.T) int64 { return 999 },
-			func(d *Driver, id int64) error { return d.MarkCancelled(context.Background(), id, []byte(`{}`)) },
+			func(d *Driver, id int64) error { return d.MarkCancelled(context.Background(), held(id), []byte(`{}`)) },
 			driver.ErrNotFound,
 		},
 		{
 			"snooze an unknown id",
 			func(*Driver, *testing.T) int64 { return 999 },
-			func(d *Driver, id int64) error { return d.MarkSnoozed(context.Background(), id, time.Now()) },
+			func(d *Driver, id int64) error { return d.MarkSnoozed(context.Background(), held(id), time.Now()) },
 			driver.ErrNotFound,
 		},
 	}
@@ -388,7 +393,7 @@ func TestFetchAvailableClaimsEveryDueWaitingState(t *testing.T) {
 			d := New()
 			parked := park(t, d, tt.state, time.Now().Add(tt.offset))
 
-			claimed, err := d.FetchAvailable(context.Background(), "default", time.Now().Add(time.Minute), 1)
+			claimed, err := d.FetchAvailable(context.Background(), "default", time.Minute, 1)
 			if err != nil {
 				t.Fatalf("FetchAvailable: %v", err)
 			}
@@ -425,7 +430,7 @@ func TestMarkRetryableSchedulesRetryWithoutFinalizing(t *testing.T) {
 	retryAt := time.Now().Add(16 * time.Second).Round(0)
 
 	detail, _ := json.Marshal(driver.AttemptError{Attempt: 1, At: time.Now(), Error: "boom"})
-	if err := d.MarkRetryable(context.Background(), claimed.ID, retryAt, detail); err != nil {
+	if err := d.MarkRetryable(context.Background(), held(claimed.ID), retryAt, detail); err != nil {
 		t.Fatalf("MarkRetryable: %v", err)
 	}
 
@@ -455,7 +460,7 @@ func TestMarkCancelledFinalizesWithReason(t *testing.T) {
 	claimed := claimOne(t, d, "default")
 
 	detail, _ := json.Marshal(driver.AttemptError{Attempt: 1, At: time.Now(), Error: "bad input"})
-	if err := d.MarkCancelled(context.Background(), claimed.ID, detail); err != nil {
+	if err := d.MarkCancelled(context.Background(), held(claimed.ID), detail); err != nil {
 		t.Fatalf("MarkCancelled: %v", err)
 	}
 
@@ -479,7 +484,7 @@ func TestMarkSnoozedDefersWithoutConsumingAttempt(t *testing.T) {
 	claimed := claimOne(t, d, "default")
 	runAt := time.Now().Add(time.Hour).Round(0)
 
-	if err := d.MarkSnoozed(context.Background(), claimed.ID, runAt); err != nil {
+	if err := d.MarkSnoozed(context.Background(), held(claimed.ID), runAt); err != nil {
 		t.Fatalf("MarkSnoozed: %v", err)
 	}
 
@@ -511,7 +516,9 @@ func TestMarkSnoozedFloorsAttemptAtZero(t *testing.T) {
 	d.jobs[claimed.ID].Attempt = 0
 	d.mu.Unlock()
 
-	if err := d.MarkSnoozed(context.Background(), claimed.ID, time.Now()); err != nil {
+	// The lease names the attempt actually on the row, so this exercises
+	// the floor rather than the ownership fence.
+	if err := d.MarkSnoozed(context.Background(), driver.Lease{ID: claimed.ID}, time.Now()); err != nil {
 		t.Fatalf("MarkSnoozed: %v", err)
 	}
 
@@ -521,6 +528,109 @@ func TestMarkSnoozedFloorsAttemptAtZero(t *testing.T) {
 	}
 }
 
+func TestTransitionsRefuseAnAttemptTheCallerNoLongerHolds(t *testing.T) {
+	t.Parallel()
+
+	transitions := []struct {
+		name string
+		call func(*Driver, driver.Lease) error
+	}{
+		{"completed", func(d *Driver, l driver.Lease) error { return d.MarkCompleted(context.Background(), l) }},
+		{"dead", func(d *Driver, l driver.Lease) error { return d.MarkDead(context.Background(), l, []byte(`{}`)) }},
+		{"cancelled", func(d *Driver, l driver.Lease) error { return d.MarkCancelled(context.Background(), l, []byte(`{}`)) }},
+		{"retryable", func(d *Driver, l driver.Lease) error {
+			return d.MarkRetryable(context.Background(), l, time.Now(), []byte(`{}`))
+		}},
+		{"snoozed", func(d *Driver, l driver.Lease) error { return d.MarkSnoozed(context.Background(), l, time.Now()) }},
+	}
+
+	for _, tt := range transitions {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			d := New()
+			mustInsert(t, d, "k", "default")
+
+			// A worker claims the job, then stalls long enough for its
+			// lease to lapse. The sweep hands the row back and a second
+			// worker claims it — the row is running again, on a later
+			// attempt, and the first worker is still executing.
+			stale := claimOne(t, d, "default")
+			expire(t, d, stale.ID)
+			if _, err := d.FetchExpired(context.Background(), time.Minute, 1); err != nil {
+				t.Fatalf("FetchExpired: %v", err)
+			}
+			if err := d.MarkRetryable(context.Background(), held(stale.ID), time.Now(), []byte(`{}`)); err != nil {
+				t.Fatalf("rescue to retryable: %v", err)
+			}
+			current := claimOne(t, d, "default")
+			if current.Attempt != 2 {
+				t.Fatalf("second claim is attempt %d, want 2", current.Attempt)
+			}
+
+			// The stale worker finishes and tries to record its outcome.
+			// The row is running, so a state-only guard would let this
+			// through and overwrite the attempt now in flight.
+			err := tt.call(d, driver.Lease{ID: stale.ID, Attempt: stale.Attempt})
+			if !errors.Is(err, driver.ErrLeaseLost) {
+				t.Fatalf("stale write returned %v, want ErrLeaseLost", err)
+			}
+
+			row, _ := d.Row(stale.ID)
+			if row.State != "running" {
+				t.Errorf("State = %q, want running: the live attempt was disturbed", row.State)
+			}
+			if row.Attempt != 2 {
+				t.Errorf("Attempt = %d, want 2 unchanged", row.Attempt)
+			}
+			if recorded := decodeErrors(t, row); len(recorded) != 1 {
+				t.Errorf("Errors = %+v, want only the rescue entry", recorded)
+			}
+
+			// The worker that does hold the job is unaffected.
+			if err := d.MarkCompleted(context.Background(), driver.Lease{ID: current.ID, Attempt: current.Attempt}); err != nil {
+				t.Errorf("current holder could not finalize: %v", err)
+			}
+		})
+	}
+}
+
+func TestExtendLeasesSkipsAnAttemptTheCallerNoLongerHolds(t *testing.T) {
+	t.Parallel()
+	d := New()
+	mustInsert(t, d, "k", "default")
+	stale := claimOne(t, d, "default")
+	expire(t, d, stale.ID)
+	if _, err := d.FetchExpired(context.Background(), time.Millisecond, 1); err != nil {
+		t.Fatalf("FetchExpired: %v", err)
+	}
+	if err := d.MarkRetryable(context.Background(), held(stale.ID), time.Now(), []byte(`{}`)); err != nil {
+		t.Fatalf("rescue to retryable: %v", err)
+	}
+	current := claimOne(t, d, "default")
+	beforeLease := *mustRow(t, d, current.ID).LeasedUntil
+
+	// The stale worker's heartbeat is still beating. Renewing here would
+	// hand the row's lease back to a worker that no longer owns it,
+	// keeping the rescuer away from a job nobody is really running.
+	if err := d.ExtendLeases(context.Background(),
+		[]driver.Lease{{ID: stale.ID, Attempt: stale.Attempt}}, time.Hour); err != nil {
+		t.Fatalf("ExtendLeases: %v, want nil: a lost lease is not a failure", err)
+	}
+
+	if got := *mustRow(t, d, current.ID).LeasedUntil; !got.Equal(beforeLease) {
+		t.Errorf("LeasedUntil = %v, want %v unchanged by a stale holder's heartbeat", got, beforeLease)
+	}
+}
+
+func mustRow(t *testing.T, d *Driver, id int64) *driver.JobRow {
+	t.Helper()
+	row, ok := d.Row(id)
+	if !ok {
+		t.Fatalf("job %d not found", id)
+	}
+	return row
+}
+
 func TestEveryTransitionClearsTheLease(t *testing.T) {
 	t.Parallel()
 
@@ -528,13 +638,13 @@ func TestEveryTransitionClearsTheLease(t *testing.T) {
 		name string
 		call func(d *Driver, id int64) error
 	}{
-		{"completed", func(d *Driver, id int64) error { return d.MarkCompleted(context.Background(), id) }},
-		{"dead", func(d *Driver, id int64) error { return d.MarkDead(context.Background(), id, []byte(`{}`)) }},
-		{"cancelled", func(d *Driver, id int64) error { return d.MarkCancelled(context.Background(), id, []byte(`{}`)) }},
+		{"completed", func(d *Driver, id int64) error { return d.MarkCompleted(context.Background(), held(id)) }},
+		{"dead", func(d *Driver, id int64) error { return d.MarkDead(context.Background(), held(id), []byte(`{}`)) }},
+		{"cancelled", func(d *Driver, id int64) error { return d.MarkCancelled(context.Background(), held(id), []byte(`{}`)) }},
 		{"retryable", func(d *Driver, id int64) error {
-			return d.MarkRetryable(context.Background(), id, time.Now(), []byte(`{}`))
+			return d.MarkRetryable(context.Background(), held(id), time.Now(), []byte(`{}`))
 		}},
-		{"snoozed", func(d *Driver, id int64) error { return d.MarkSnoozed(context.Background(), id, time.Now()) }},
+		{"snoozed", func(d *Driver, id int64) error { return d.MarkSnoozed(context.Background(), held(id), time.Now()) }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -565,9 +675,9 @@ func TestFetchExpiredReclaimsWithoutTouchingAttempt(t *testing.T) {
 	mustInsert(t, d, "k", "default")
 	claimed := claimOne(t, d, "default")
 	expire(t, d, claimed.ID)
-	leaseUntil := time.Now().Add(time.Minute).Round(0)
+	before := time.Now()
 
-	reclaimed, err := d.FetchExpired(context.Background(), leaseUntil, 10)
+	reclaimed, err := d.FetchExpired(context.Background(), time.Minute, 10)
 	if err != nil {
 		t.Fatalf("FetchExpired: %v", err)
 	}
@@ -583,8 +693,8 @@ func TestFetchExpiredReclaimsWithoutTouchingAttempt(t *testing.T) {
 		t.Errorf("State = %q, want running: the sweeper now owns the row", reclaimed[0].State)
 	}
 	row, _ := d.Row(claimed.ID)
-	if row.LeasedUntil == nil || !row.LeasedUntil.Equal(leaseUntil) {
-		t.Errorf("LeasedUntil = %v, want the fresh lease %v", row.LeasedUntil, leaseUntil)
+	if row.LeasedUntil == nil || row.LeasedUntil.Before(before.Add(time.Minute)) {
+		t.Errorf("LeasedUntil = %v, want a fresh lease at least a minute past %v", row.LeasedUntil, before)
 	}
 	if row.Attempt != claimed.Attempt {
 		t.Errorf("stored Attempt = %d, want %d unchanged", row.Attempt, claimed.Attempt)
@@ -608,7 +718,7 @@ func TestFetchExpiredIgnoresLiveAndUnclaimedRows(t *testing.T) {
 		{"already completed", func(t *testing.T, d *Driver) {
 			mustInsert(t, d, "k", "default")
 			id := claimOne(t, d, "default").ID
-			if err := d.MarkCompleted(context.Background(), id); err != nil {
+			if err := d.MarkCompleted(context.Background(), held(id)); err != nil {
 				t.Fatal(err)
 			}
 		}},
@@ -619,7 +729,7 @@ func TestFetchExpiredIgnoresLiveAndUnclaimedRows(t *testing.T) {
 			d := New()
 			tt.setup(t, d)
 
-			reclaimed, err := d.FetchExpired(context.Background(), time.Now().Add(time.Minute), 10)
+			reclaimed, err := d.FetchExpired(context.Background(), time.Minute, 10)
 			if err != nil {
 				t.Fatalf("FetchExpired: %v", err)
 			}
@@ -637,18 +747,19 @@ func TestExtendLeasesMovesOnlyRunningRows(t *testing.T) {
 	running := claimOne(t, d, "default")
 	mustInsert(t, d, "k", "default")
 	finished := claimOne(t, d, "default")
-	if err := d.MarkCompleted(context.Background(), finished.ID); err != nil {
+	if err := d.MarkCompleted(context.Background(), held(finished.ID)); err != nil {
 		t.Fatalf("MarkCompleted: %v", err)
 	}
-	until := time.Now().Add(30 * time.Minute).Round(0)
+	before := time.Now()
 
-	if err := d.ExtendLeases(context.Background(), []int64{running.ID, finished.ID, 999}, until); err != nil {
+	leases := []driver.Lease{held(running.ID), held(finished.ID), held(999)}
+	if err := d.ExtendLeases(context.Background(), leases, 30*time.Minute); err != nil {
 		t.Fatalf("ExtendLeases: %v, want nil: finalized and unknown ids are not failures", err)
 	}
 
 	row, _ := d.Row(running.ID)
-	if row.LeasedUntil == nil || !row.LeasedUntil.Equal(until) {
-		t.Errorf("running job LeasedUntil = %v, want %v", row.LeasedUntil, until)
+	if row.LeasedUntil == nil || row.LeasedUntil.Before(before.Add(30*time.Minute)) {
+		t.Errorf("running job LeasedUntil = %v, want at least 30 minutes past %v", row.LeasedUntil, before)
 	}
 	done, _ := d.Row(finished.ID)
 	if done.State != "completed" {
@@ -666,7 +777,7 @@ func TestConcurrentFetchExpiredReclaimsEachJobExactlyOnce(t *testing.T) {
 	for range jobs {
 		mustInsert(t, d, "k", "default")
 	}
-	claimed, err := d.FetchAvailable(context.Background(), "default", time.Now().Add(time.Minute), jobs)
+	claimed, err := d.FetchAvailable(context.Background(), "default", time.Minute, jobs)
 	if err != nil || len(claimed) != jobs {
 		t.Fatalf("claim all: %v (%d rows)", err, len(claimed))
 	}
@@ -682,7 +793,7 @@ func TestConcurrentFetchExpiredReclaimsEachJobExactlyOnce(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for {
-				rows, err := d.FetchExpired(context.Background(), time.Now().Add(time.Minute), 1)
+				rows, err := d.FetchExpired(context.Background(), time.Minute, 1)
 				if err != nil {
 					t.Errorf("FetchExpired: %v", err)
 					return
@@ -724,7 +835,7 @@ func TestConcurrentFetchClaimsEachJobExactlyOnce(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for {
-				rows, err := d.FetchAvailable(context.Background(), "default", time.Now().Add(time.Minute), 1)
+				rows, err := d.FetchAvailable(context.Background(), "default", time.Minute, 1)
 				if err != nil {
 					t.Errorf("FetchAvailable: %v", err)
 					return

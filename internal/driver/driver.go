@@ -26,7 +26,27 @@ var (
 	// ErrTxUnsupported is returned by drivers that cannot participate
 	// in a caller-owned transaction.
 	ErrTxUnsupported = errors.New("driver: transactional insert not supported")
+
+	// ErrLeaseLost reports that the job has moved on to an attempt this
+	// caller does not hold — its lease lapsed, the rescuer returned the
+	// job to the queue, and someone else claimed it. It is the expected
+	// outcome of a starved heartbeat, not a fault: the work may well have
+	// been done twice, which at-least-once delivery permits, but only the
+	// current holder may record what happened.
+	ErrLeaseLost = errors.New("driver: job reclaimed by another worker")
 )
+
+// Lease identifies one claim on a job: the row, and the attempt the
+// holder is executing. Every state change carries it, so a worker can
+// only finalize the attempt it actually owns.
+//
+// The attempt number is the fence. FetchAvailable increments it on every
+// claim and FetchExpired deliberately does not, so a rescued job reaches
+// its next worker with a number no earlier holder can present.
+type Lease struct {
+	ID      int64
+	Attempt int
+}
 
 // InsertParams carries everything needed to persist a new job.
 type InsertParams struct {
@@ -61,9 +81,18 @@ type AttemptError struct {
 }
 
 // Driver is the storage contract. Every Mark method is guarded on the
-// job being running: from any other state it reports
-// ErrInvalidTransition, and for an unknown id ErrNotFound. All of them
-// clear the lease, so no finalized or waiting row carries a stale one.
+// caller's lease: the job must still be running on the exact attempt the
+// lease names. From any other state it reports ErrInvalidTransition, for
+// an unknown id ErrNotFound, and for an attempt that has moved on
+// ErrLeaseLost. All of them clear the lease, so no finalized or waiting
+// row carries a stale one.
+//
+// Lease durations are passed rather than deadlines because the database
+// clock is the one that decides expiry. Computing the instant on the
+// caller would make every claim depend on the two clocks agreeing, and
+// across a fleet they do not: a client running behind would write leases
+// the database already considers expired, and one running ahead would
+// stretch recovery past what the configuration advertises.
 type Driver interface {
 	Migrate(ctx context.Context) error
 	Insert(ctx context.Context, params InsertParams) (*JobRow, error)
@@ -71,43 +100,40 @@ type Driver interface {
 
 	// FetchAvailable claims up to limit due jobs from queue: each waiting
 	// job whose scheduled time has passed becomes running with an
-	// incremented attempt and a lease running to leaseUntil. A job waits
-	// in one of three states — available (never run), retryable (failed,
-	// waiting out its backoff) or scheduled (snoozed) — and all three are
-	// claimed alike.
-	//
-	// The lease comes from the caller rather than the driver because the
-	// caller is what renews it: a claim lease the caller did not choose
-	// could not be kept in step with its heartbeat.
-	FetchAvailable(ctx context.Context, queue string, leaseUntil time.Time, limit int) ([]*JobRow, error)
+	// incremented attempt and a lease lasting leaseFor. A job waits in one
+	// of three states — available (never run), retryable (failed, waiting
+	// out its backoff) or scheduled (snoozed) — and all three are claimed
+	// alike.
+	FetchAvailable(ctx context.Context, queue string, leaseFor time.Duration, limit int) ([]*JobRow, error)
 
 	// FetchExpired re-claims up to limit running jobs whose lease has
-	// passed, writing leaseUntil as the new lease so the caller owns
-	// them. It does not touch attempt: the attempt that stranded the row
-	// was really spent, and counting it twice would halve the effective
-	// ceiling of every job whose worker ever crashed.
-	FetchExpired(ctx context.Context, leaseUntil time.Time, limit int) ([]*JobRow, error)
+	// passed, giving each a fresh lease lasting leaseFor so the caller
+	// owns them. It does not touch attempt: the attempt that stranded the
+	// row was really spent, and counting it twice would halve the
+	// effective ceiling of every job whose worker ever crashed.
+	FetchExpired(ctx context.Context, leaseFor time.Duration, limit int) ([]*JobRow, error)
 
-	// ExtendLeases pushes the lease of every running job in ids out to
-	// until. An id that is missing or no longer running is skipped rather
-	// than reported: it means the job finalized first, which races a
-	// heartbeat routinely and must never resurrect the row.
-	ExtendLeases(ctx context.Context, ids []int64, until time.Time) error
+	// ExtendLeases pushes each held lease out by another leaseFor. A lease
+	// whose job is missing, no longer running, or already on a later
+	// attempt is skipped rather than reported: it means the job finished
+	// or moved on, which races a heartbeat routinely and must never
+	// resurrect the row or steal it back.
+	ExtendLeases(ctx context.Context, leases []Lease, leaseFor time.Duration) error
 
-	MarkCompleted(ctx context.Context, id int64) error
+	MarkCompleted(ctx context.Context, lease Lease) error
 
 	// MarkRetryable returns a failed job to the queue at retryAt without
 	// finalizing it, appending errDetail to its errors array.
-	MarkRetryable(ctx context.Context, id int64, retryAt time.Time, errDetail []byte) error
+	MarkRetryable(ctx context.Context, lease Lease, retryAt time.Time, errDetail []byte) error
 
-	MarkDead(ctx context.Context, id int64, errDetail []byte) error
+	MarkDead(ctx context.Context, lease Lease, errDetail []byte) error
 
 	// MarkCancelled finalizes a job whose handler declared it
 	// unretryable, appending errDetail as the reason.
-	MarkCancelled(ctx context.Context, id int64, errDetail []byte) error
+	MarkCancelled(ctx context.Context, lease Lease, errDetail []byte) error
 
 	// MarkSnoozed defers a job to runAt without finalizing it. It records
 	// no error and gives back the attempt the claim consumed, floored at
 	// zero, so snoozing can never exhaust a job's attempts.
-	MarkSnoozed(ctx context.Context, id int64, runAt time.Time) error
+	MarkSnoozed(ctx context.Context, lease Lease, runAt time.Time) error
 }

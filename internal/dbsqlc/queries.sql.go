@@ -11,19 +11,25 @@ import (
 )
 
 const extendLeases = `-- name: ExtendLeases :exec
-UPDATE drover_jobs
-SET leased_until = $1::timestamptz
-WHERE id = ANY($2::bigint[])
-  AND state = 'running'
+UPDATE drover_jobs j
+SET leased_until = now() + make_interval(secs => $1::float8)
+FROM (
+    SELECT unnest($2::bigint[]) AS id,
+           unnest($3::int[]) AS attempt
+) AS held
+WHERE j.id = held.id
+  AND j.attempt = held.attempt
+  AND j.state = 'running'
 `
 
 type ExtendLeasesParams struct {
-	LeasedUntil time.Time
-	Ids         []int64
+	LeaseSeconds float64
+	Ids          []int64
+	Attempts     []int32
 }
 
 func (q *Queries) ExtendLeases(ctx context.Context, arg ExtendLeasesParams) error {
-	_, err := q.db.Exec(ctx, extendLeases, arg.LeasedUntil, arg.Ids)
+	_, err := q.db.Exec(ctx, extendLeases, arg.LeaseSeconds, arg.Ids, arg.Attempts)
 	return err
 }
 
@@ -31,7 +37,7 @@ const fetchAvailable = `-- name: FetchAvailable :many
 UPDATE drover_jobs
 SET state = 'running',
     attempt = attempt + 1,
-    leased_until = $1::timestamptz
+    leased_until = now() + make_interval(secs => $1::float8)
 WHERE id IN (
     SELECT j.id FROM drover_jobs j
     WHERE j.state IN ('available', 'retryable', 'scheduled')
@@ -51,13 +57,16 @@ RETURNING id, kind, queue, args, state, attempt, max_attempts, errors, scheduled
 `
 
 type FetchAvailableParams struct {
-	LeasedUntil time.Time
-	Queue       string
-	MaxJobs     int32
+	LeaseSeconds float64
+	Queue        string
+	MaxJobs      int32
 }
 
+// Lease deadlines are computed here, from the database clock, because
+// that is the clock the sweep compares them against. Deriving them on
+// the client would make every lease depend on two machines agreeing.
 func (q *Queries) FetchAvailable(ctx context.Context, arg FetchAvailableParams) ([]DroverJob, error) {
-	rows, err := q.db.Query(ctx, fetchAvailable, arg.LeasedUntil, arg.Queue, arg.MaxJobs)
+	rows, err := q.db.Query(ctx, fetchAvailable, arg.LeaseSeconds, arg.Queue, arg.MaxJobs)
 	if err != nil {
 		return nil, err
 	}
@@ -91,7 +100,7 @@ func (q *Queries) FetchAvailable(ctx context.Context, arg FetchAvailableParams) 
 
 const fetchExpired = `-- name: FetchExpired :many
 UPDATE drover_jobs
-SET leased_until = $1::timestamptz
+SET leased_until = now() + make_interval(secs => $1::float8)
 WHERE id IN (
     SELECT j.id FROM drover_jobs j
     WHERE j.state = 'running'
@@ -107,8 +116,8 @@ RETURNING id, kind, queue, args, state, attempt, max_attempts, errors, scheduled
 `
 
 type FetchExpiredParams struct {
-	LeasedUntil time.Time
-	MaxJobs     int32
+	LeaseSeconds float64
+	MaxJobs      int32
 }
 
 // FetchExpired re-claims jobs whose worker is presumed dead. attempt is
@@ -116,7 +125,7 @@ type FetchExpiredParams struct {
 // really spent, and counting it twice would halve the effective ceiling
 // of every job whose worker ever crashed.
 func (q *Queries) FetchExpired(ctx context.Context, arg FetchExpiredParams) ([]DroverJob, error) {
-	rows, err := q.db.Query(ctx, fetchExpired, arg.LeasedUntil, arg.MaxJobs)
+	rows, err := q.db.Query(ctx, fetchExpired, arg.LeaseSeconds, arg.MaxJobs)
 	if err != nil {
 		return nil, err
 	}
@@ -210,16 +219,17 @@ SET state = 'cancelled',
     finalized_at = now(),
     leased_until = NULL,
     errors = errors || $1::jsonb
-WHERE id = $2 AND state = 'running'
+WHERE id = $2 AND attempt = $3 AND state = 'running'
 `
 
 type MarkCancelledParams struct {
-	Error []byte
-	ID    int64
+	Error   []byte
+	ID      int64
+	Attempt int32
 }
 
 func (q *Queries) MarkCancelled(ctx context.Context, arg MarkCancelledParams) (int64, error) {
-	result, err := q.db.Exec(ctx, markCancelled, arg.Error, arg.ID)
+	result, err := q.db.Exec(ctx, markCancelled, arg.Error, arg.ID, arg.Attempt)
 	if err != nil {
 		return 0, err
 	}
@@ -231,11 +241,21 @@ UPDATE drover_jobs
 SET state = 'completed',
     finalized_at = now(),
     leased_until = NULL
-WHERE id = $1 AND state = 'running'
+WHERE id = $1 AND attempt = $2 AND state = 'running'
 `
 
-func (q *Queries) MarkCompleted(ctx context.Context, id int64) (int64, error) {
-	result, err := q.db.Exec(ctx, markCompleted, id)
+type MarkCompletedParams struct {
+	ID      int64
+	Attempt int32
+}
+
+// Every finalizer is guarded on the attempt as well as the state. The
+// state alone proves some worker holds the row, not that this one does:
+// a worker whose heartbeat starved past its lease can find its job
+// rescued and re-claimed, and must not then record the outcome of an
+// attempt it no longer owns over the one now running.
+func (q *Queries) MarkCompleted(ctx context.Context, arg MarkCompletedParams) (int64, error) {
+	result, err := q.db.Exec(ctx, markCompleted, arg.ID, arg.Attempt)
 	if err != nil {
 		return 0, err
 	}
@@ -247,17 +267,18 @@ UPDATE drover_jobs
 SET state = 'dead',
     finalized_at = now(),
     leased_until = NULL,
-    errors = errors || $2::jsonb
-WHERE id = $1 AND state = 'running'
+    errors = errors || $1::jsonb
+WHERE id = $2 AND attempt = $3 AND state = 'running'
 `
 
 type MarkDeadParams struct {
-	ID    int64
-	Error []byte
+	Error   []byte
+	ID      int64
+	Attempt int32
 }
 
 func (q *Queries) MarkDead(ctx context.Context, arg MarkDeadParams) (int64, error) {
-	result, err := q.db.Exec(ctx, markDead, arg.ID, arg.Error)
+	result, err := q.db.Exec(ctx, markDead, arg.Error, arg.ID, arg.Attempt)
 	if err != nil {
 		return 0, err
 	}
@@ -270,17 +291,23 @@ SET state = 'retryable',
     scheduled_at = $1::timestamptz,
     leased_until = NULL,
     errors = errors || $2::jsonb
-WHERE id = $3 AND state = 'running'
+WHERE id = $3 AND attempt = $4 AND state = 'running'
 `
 
 type MarkRetryableParams struct {
 	RetryAt time.Time
 	Error   []byte
 	ID      int64
+	Attempt int32
 }
 
 func (q *Queries) MarkRetryable(ctx context.Context, arg MarkRetryableParams) (int64, error) {
-	result, err := q.db.Exec(ctx, markRetryable, arg.RetryAt, arg.Error, arg.ID)
+	result, err := q.db.Exec(ctx, markRetryable,
+		arg.RetryAt,
+		arg.Error,
+		arg.ID,
+		arg.Attempt,
+	)
 	if err != nil {
 		return 0, err
 	}
@@ -293,18 +320,19 @@ SET state = 'scheduled',
     scheduled_at = $1::timestamptz,
     leased_until = NULL,
     attempt = GREATEST(attempt - 1, 0)
-WHERE id = $2 AND state = 'running'
+WHERE id = $2 AND attempt = $3 AND state = 'running'
 `
 
 type MarkSnoozedParams struct {
-	RunAt time.Time
-	ID    int64
+	RunAt   time.Time
+	ID      int64
+	Attempt int32
 }
 
 // MarkSnoozed gives back the attempt the claim consumed, floored at zero
 // so a deferral can never drive attempt negative or exhaust a job.
 func (q *Queries) MarkSnoozed(ctx context.Context, arg MarkSnoozedParams) (int64, error) {
-	result, err := q.db.Exec(ctx, markSnoozed, arg.RunAt, arg.ID)
+	result, err := q.db.Exec(ctx, markSnoozed, arg.RunAt, arg.ID, arg.Attempt)
 	if err != nil {
 		return 0, err
 	}
