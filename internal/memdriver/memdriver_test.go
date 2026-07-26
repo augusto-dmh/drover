@@ -26,7 +26,7 @@ func mustInsert(t *testing.T, d *Driver, kind, queue string) *driver.JobRow {
 
 func claimOne(t *testing.T, d *Driver, queue string) *driver.JobRow {
 	t.Helper()
-	rows, err := d.FetchAvailable(context.Background(), queue, 1)
+	rows, err := d.FetchAvailable(context.Background(), queue, time.Now().Add(time.Minute), 1)
 	if err != nil {
 		t.Fatalf("FetchAvailable: %v", err)
 	}
@@ -34,6 +34,59 @@ func claimOne(t *testing.T, d *Driver, queue string) *driver.JobRow {
 		t.Fatalf("FetchAvailable claimed %d jobs, want 1", len(rows))
 	}
 	return rows[0]
+}
+
+// park drives a fresh job into a waiting state whose scheduled_at is at,
+// using the driver's own transitions wherever one exists.
+func park(t *testing.T, d *Driver, state string, at time.Time) *driver.JobRow {
+	t.Helper()
+	row := mustInsert(t, d, "k", "default")
+	switch state {
+	case "available":
+		d.mu.Lock()
+		d.jobs[row.ID].ScheduledAt = at
+		d.mu.Unlock()
+	case "retryable":
+		claimOne(t, d, "default")
+		if err := d.MarkRetryable(context.Background(), row.ID, at, []byte(`{"error":"boom"}`)); err != nil {
+			t.Fatalf("MarkRetryable: %v", err)
+		}
+	case "scheduled":
+		claimOne(t, d, "default")
+		if err := d.MarkSnoozed(context.Background(), row.ID, at); err != nil {
+			t.Fatalf("MarkSnoozed: %v", err)
+		}
+	default:
+		t.Fatalf("park: unknown waiting state %q", state)
+	}
+	parked, ok := d.Row(row.ID)
+	if !ok {
+		t.Fatal("park: job disappeared")
+	}
+	return parked
+}
+
+// expire forces a claimed job's lease into the past, standing in for the
+// worker that died still holding it.
+func expire(t *testing.T, d *Driver, id int64) {
+	t.Helper()
+	past := time.Now().Add(-time.Minute)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	row, ok := d.jobs[id]
+	if !ok {
+		t.Fatalf("expire: job %d not found", id)
+	}
+	row.LeasedUntil = &past
+}
+
+func decodeErrors(t *testing.T, row *driver.JobRow) []driver.AttemptError {
+	t.Helper()
+	var recorded []driver.AttemptError
+	if err := json.Unmarshal(row.Errors, &recorded); err != nil {
+		t.Fatalf("decode errors %s: %v", row.Errors, err)
+	}
+	return recorded
 }
 
 func TestInsertSetsNewJobDefaults(t *testing.T) {
@@ -122,7 +175,7 @@ func TestFetchAvailableFilters(t *testing.T) {
 			d := New()
 			tt.setup(t, d)
 
-			rows, err := d.FetchAvailable(context.Background(), "default", 1)
+			rows, err := d.FetchAvailable(context.Background(), "default", time.Now().Add(time.Minute), 1)
 			if err != nil {
 				t.Fatalf("FetchAvailable: %v", err)
 			}
@@ -228,6 +281,77 @@ func TestFinalizeTransitionGuards(t *testing.T) {
 			func(d *Driver, id int64) error { return d.MarkDead(context.Background(), id, []byte(`{}`)) },
 			driver.ErrNotFound,
 		},
+		{
+			"retry an available job",
+			func(d *Driver, t *testing.T) int64 { return mustInsert(t, d, "k", "default").ID },
+			func(d *Driver, id int64) error {
+				return d.MarkRetryable(context.Background(), id, time.Now(), []byte(`{}`))
+			},
+			driver.ErrInvalidTransition,
+		},
+		{
+			"retry a job already waiting to retry",
+			func(d *Driver, t *testing.T) int64 {
+				return park(t, d, "retryable", time.Now().Add(time.Hour)).ID
+			},
+			func(d *Driver, id int64) error {
+				return d.MarkRetryable(context.Background(), id, time.Now(), []byte(`{}`))
+			},
+			driver.ErrInvalidTransition,
+		},
+		{
+			"cancel an available job",
+			func(d *Driver, t *testing.T) int64 { return mustInsert(t, d, "k", "default").ID },
+			func(d *Driver, id int64) error { return d.MarkCancelled(context.Background(), id, []byte(`{}`)) },
+			driver.ErrInvalidTransition,
+		},
+		{
+			"cancel a completed job",
+			func(d *Driver, t *testing.T) int64 {
+				mustInsert(t, d, "k", "default")
+				id := claimOne(t, d, "default").ID
+				if err := d.MarkCompleted(context.Background(), id); err != nil {
+					t.Fatal(err)
+				}
+				return id
+			},
+			func(d *Driver, id int64) error { return d.MarkCancelled(context.Background(), id, []byte(`{}`)) },
+			driver.ErrInvalidTransition,
+		},
+		{
+			"snooze an available job",
+			func(d *Driver, t *testing.T) int64 { return mustInsert(t, d, "k", "default").ID },
+			func(d *Driver, id int64) error { return d.MarkSnoozed(context.Background(), id, time.Now()) },
+			driver.ErrInvalidTransition,
+		},
+		{
+			"snooze an already snoozed job",
+			func(d *Driver, t *testing.T) int64 {
+				return park(t, d, "scheduled", time.Now().Add(time.Hour)).ID
+			},
+			func(d *Driver, id int64) error { return d.MarkSnoozed(context.Background(), id, time.Now()) },
+			driver.ErrInvalidTransition,
+		},
+		{
+			"retry an unknown id",
+			func(*Driver, *testing.T) int64 { return 999 },
+			func(d *Driver, id int64) error {
+				return d.MarkRetryable(context.Background(), id, time.Now(), []byte(`{}`))
+			},
+			driver.ErrNotFound,
+		},
+		{
+			"cancel an unknown id",
+			func(*Driver, *testing.T) int64 { return 999 },
+			func(d *Driver, id int64) error { return d.MarkCancelled(context.Background(), id, []byte(`{}`)) },
+			driver.ErrNotFound,
+		},
+		{
+			"snooze an unknown id",
+			func(*Driver, *testing.T) int64 { return 999 },
+			func(d *Driver, id int64) error { return d.MarkSnoozed(context.Background(), id, time.Now()) },
+			driver.ErrNotFound,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -239,6 +363,348 @@ func TestFinalizeTransitionGuards(t *testing.T) {
 				t.Fatalf("error = %v, want %v", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestFetchAvailableClaimsEveryDueWaitingState(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		state       string
+		offset      time.Duration
+		wantClaimed bool
+	}{
+		{"available and due", "available", -time.Second, true},
+		{"retryable and due", "retryable", -time.Second, true},
+		{"scheduled and due", "scheduled", -time.Second, true},
+		{"available but not yet due", "available", time.Hour, false},
+		{"retryable but not yet due", "retryable", time.Hour, false},
+		{"scheduled but not yet due", "scheduled", time.Hour, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			d := New()
+			parked := park(t, d, tt.state, time.Now().Add(tt.offset))
+
+			claimed, err := d.FetchAvailable(context.Background(), "default", time.Now().Add(time.Minute), 1)
+			if err != nil {
+				t.Fatalf("FetchAvailable: %v", err)
+			}
+
+			if !tt.wantClaimed {
+				if len(claimed) != 0 {
+					t.Fatalf("claimed %d jobs from state %s due in %v, want 0",
+						len(claimed), tt.state, tt.offset)
+				}
+				return
+			}
+			if len(claimed) != 1 || claimed[0].ID != parked.ID {
+				t.Fatalf("claimed %d jobs, want job %d in state %s", len(claimed), parked.ID, tt.state)
+			}
+			if claimed[0].State != "running" {
+				t.Errorf("State = %q, want running", claimed[0].State)
+			}
+			if claimed[0].Attempt != parked.Attempt+1 {
+				t.Errorf("Attempt = %d, want %d (one more than the parked %d)",
+					claimed[0].Attempt, parked.Attempt+1, parked.Attempt)
+			}
+			if claimed[0].LeasedUntil == nil || !claimed[0].LeasedUntil.After(time.Now()) {
+				t.Errorf("LeasedUntil = %v, want a future lease", claimed[0].LeasedUntil)
+			}
+		})
+	}
+}
+
+func TestMarkRetryableSchedulesRetryWithoutFinalizing(t *testing.T) {
+	t.Parallel()
+	d := New()
+	mustInsert(t, d, "k", "default")
+	claimed := claimOne(t, d, "default")
+	retryAt := time.Now().Add(16 * time.Second).Round(0)
+
+	detail, _ := json.Marshal(driver.AttemptError{Attempt: 1, At: time.Now(), Error: "boom"})
+	if err := d.MarkRetryable(context.Background(), claimed.ID, retryAt, detail); err != nil {
+		t.Fatalf("MarkRetryable: %v", err)
+	}
+
+	row, _ := d.Row(claimed.ID)
+	if row.State != "retryable" {
+		t.Errorf("State = %q, want retryable", row.State)
+	}
+	if !row.ScheduledAt.Equal(retryAt) {
+		t.Errorf("ScheduledAt = %v, want the policy's %v", row.ScheduledAt, retryAt)
+	}
+	if row.FinalizedAt != nil {
+		t.Errorf("FinalizedAt = %v, want unset: a retrying job is not finished", row.FinalizedAt)
+	}
+	if row.Attempt != claimed.Attempt {
+		t.Errorf("Attempt = %d, want %d unchanged by the retry transition", row.Attempt, claimed.Attempt)
+	}
+	recorded := decodeErrors(t, row)
+	if len(recorded) != 1 || recorded[0].Error != "boom" || recorded[0].Attempt != 1 {
+		t.Errorf("Errors = %+v, want exactly one entry {Attempt:1 Error:boom}", recorded)
+	}
+}
+
+func TestMarkCancelledFinalizesWithReason(t *testing.T) {
+	t.Parallel()
+	d := New()
+	mustInsert(t, d, "k", "default")
+	claimed := claimOne(t, d, "default")
+
+	detail, _ := json.Marshal(driver.AttemptError{Attempt: 1, At: time.Now(), Error: "bad input"})
+	if err := d.MarkCancelled(context.Background(), claimed.ID, detail); err != nil {
+		t.Fatalf("MarkCancelled: %v", err)
+	}
+
+	row, _ := d.Row(claimed.ID)
+	if row.State != "cancelled" {
+		t.Errorf("State = %q, want cancelled", row.State)
+	}
+	if row.FinalizedAt == nil {
+		t.Error("FinalizedAt not set on a cancelled job")
+	}
+	recorded := decodeErrors(t, row)
+	if len(recorded) != 1 || recorded[0].Error != "bad input" {
+		t.Errorf("Errors = %+v, want exactly one entry recording the cancellation reason", recorded)
+	}
+}
+
+func TestMarkSnoozedDefersWithoutConsumingAttempt(t *testing.T) {
+	t.Parallel()
+	d := New()
+	mustInsert(t, d, "k", "default")
+	claimed := claimOne(t, d, "default")
+	runAt := time.Now().Add(time.Hour).Round(0)
+
+	if err := d.MarkSnoozed(context.Background(), claimed.ID, runAt); err != nil {
+		t.Fatalf("MarkSnoozed: %v", err)
+	}
+
+	row, _ := d.Row(claimed.ID)
+	if row.State != "scheduled" {
+		t.Errorf("State = %q, want scheduled: a snooze is a deferral, not a failure", row.State)
+	}
+	if !row.ScheduledAt.Equal(runAt) {
+		t.Errorf("ScheduledAt = %v, want the requested wake time %v", row.ScheduledAt, runAt)
+	}
+	if row.FinalizedAt != nil {
+		t.Errorf("FinalizedAt = %v, want unset", row.FinalizedAt)
+	}
+	if row.Attempt != claimed.Attempt-1 {
+		t.Errorf("Attempt = %d, want %d: the snooze gives back the attempt the claim consumed",
+			row.Attempt, claimed.Attempt-1)
+	}
+	if recorded := decodeErrors(t, row); len(recorded) != 0 {
+		t.Errorf("Errors = %+v, want none: a snooze records no failure", recorded)
+	}
+}
+
+func TestMarkSnoozedFloorsAttemptAtZero(t *testing.T) {
+	t.Parallel()
+	d := New()
+	mustInsert(t, d, "k", "default")
+	claimed := claimOne(t, d, "default")
+	d.mu.Lock()
+	d.jobs[claimed.ID].Attempt = 0
+	d.mu.Unlock()
+
+	if err := d.MarkSnoozed(context.Background(), claimed.ID, time.Now()); err != nil {
+		t.Fatalf("MarkSnoozed: %v", err)
+	}
+
+	row, _ := d.Row(claimed.ID)
+	if row.Attempt != 0 {
+		t.Errorf("Attempt = %d, want 0: the decrement is floored, never negative", row.Attempt)
+	}
+}
+
+func TestEveryTransitionClearsTheLease(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		call func(d *Driver, id int64) error
+	}{
+		{"completed", func(d *Driver, id int64) error { return d.MarkCompleted(context.Background(), id) }},
+		{"dead", func(d *Driver, id int64) error { return d.MarkDead(context.Background(), id, []byte(`{}`)) }},
+		{"cancelled", func(d *Driver, id int64) error { return d.MarkCancelled(context.Background(), id, []byte(`{}`)) }},
+		{"retryable", func(d *Driver, id int64) error {
+			return d.MarkRetryable(context.Background(), id, time.Now(), []byte(`{}`))
+		}},
+		{"snoozed", func(d *Driver, id int64) error { return d.MarkSnoozed(context.Background(), id, time.Now()) }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			d := New()
+			mustInsert(t, d, "k", "default")
+			claimed := claimOne(t, d, "default")
+			if claimed.LeasedUntil == nil {
+				t.Fatal("claim did not write a lease")
+			}
+
+			if err := tt.call(d, claimed.ID); err != nil {
+				t.Fatalf("transition to %s: %v", tt.name, err)
+			}
+
+			row, _ := d.Row(claimed.ID)
+			if row.LeasedUntil != nil {
+				t.Errorf("LeasedUntil = %v after moving to %s, want nil: no stale lease may survive a transition",
+					row.LeasedUntil, tt.name)
+			}
+		})
+	}
+}
+
+func TestFetchExpiredReclaimsWithoutTouchingAttempt(t *testing.T) {
+	t.Parallel()
+	d := New()
+	mustInsert(t, d, "k", "default")
+	claimed := claimOne(t, d, "default")
+	expire(t, d, claimed.ID)
+	leaseUntil := time.Now().Add(time.Minute).Round(0)
+
+	reclaimed, err := d.FetchExpired(context.Background(), leaseUntil, 10)
+	if err != nil {
+		t.Fatalf("FetchExpired: %v", err)
+	}
+
+	if len(reclaimed) != 1 || reclaimed[0].ID != claimed.ID {
+		t.Fatalf("reclaimed %d jobs, want the expired job %d", len(reclaimed), claimed.ID)
+	}
+	if reclaimed[0].Attempt != claimed.Attempt {
+		t.Errorf("Attempt = %d, want %d unchanged: a rescue never spends an attempt",
+			reclaimed[0].Attempt, claimed.Attempt)
+	}
+	if reclaimed[0].State != "running" {
+		t.Errorf("State = %q, want running: the sweeper now owns the row", reclaimed[0].State)
+	}
+	row, _ := d.Row(claimed.ID)
+	if row.LeasedUntil == nil || !row.LeasedUntil.Equal(leaseUntil) {
+		t.Errorf("LeasedUntil = %v, want the fresh lease %v", row.LeasedUntil, leaseUntil)
+	}
+	if row.Attempt != claimed.Attempt {
+		t.Errorf("stored Attempt = %d, want %d unchanged", row.Attempt, claimed.Attempt)
+	}
+}
+
+func TestFetchExpiredIgnoresLiveAndUnclaimedRows(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		setup func(t *testing.T, d *Driver)
+	}{
+		{"running with a live lease", func(t *testing.T, d *Driver) {
+			mustInsert(t, d, "k", "default")
+			claimOne(t, d, "default")
+		}},
+		{"available, never claimed", func(t *testing.T, d *Driver) {
+			mustInsert(t, d, "k", "default")
+		}},
+		{"already completed", func(t *testing.T, d *Driver) {
+			mustInsert(t, d, "k", "default")
+			id := claimOne(t, d, "default").ID
+			if err := d.MarkCompleted(context.Background(), id); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			d := New()
+			tt.setup(t, d)
+
+			reclaimed, err := d.FetchExpired(context.Background(), time.Now().Add(time.Minute), 10)
+			if err != nil {
+				t.Fatalf("FetchExpired: %v", err)
+			}
+			if len(reclaimed) != 0 {
+				t.Fatalf("reclaimed %d jobs, want 0", len(reclaimed))
+			}
+		})
+	}
+}
+
+func TestExtendLeasesMovesOnlyRunningRows(t *testing.T) {
+	t.Parallel()
+	d := New()
+	mustInsert(t, d, "k", "default")
+	running := claimOne(t, d, "default")
+	mustInsert(t, d, "k", "default")
+	finished := claimOne(t, d, "default")
+	if err := d.MarkCompleted(context.Background(), finished.ID); err != nil {
+		t.Fatalf("MarkCompleted: %v", err)
+	}
+	until := time.Now().Add(30 * time.Minute).Round(0)
+
+	if err := d.ExtendLeases(context.Background(), []int64{running.ID, finished.ID, 999}, until); err != nil {
+		t.Fatalf("ExtendLeases: %v, want nil: finalized and unknown ids are not failures", err)
+	}
+
+	row, _ := d.Row(running.ID)
+	if row.LeasedUntil == nil || !row.LeasedUntil.Equal(until) {
+		t.Errorf("running job LeasedUntil = %v, want %v", row.LeasedUntil, until)
+	}
+	done, _ := d.Row(finished.ID)
+	if done.State != "completed" {
+		t.Errorf("finished job State = %q, want completed: an extension must not resurrect it", done.State)
+	}
+	if done.LeasedUntil != nil {
+		t.Errorf("finished job LeasedUntil = %v, want nil: an extension must not re-lease it", done.LeasedUntil)
+	}
+}
+
+func TestConcurrentFetchExpiredReclaimsEachJobExactlyOnce(t *testing.T) {
+	t.Parallel()
+	d := New()
+	const jobs = 100
+	for range jobs {
+		mustInsert(t, d, "k", "default")
+	}
+	claimed, err := d.FetchAvailable(context.Background(), "default", time.Now().Add(time.Minute), jobs)
+	if err != nil || len(claimed) != jobs {
+		t.Fatalf("claim all: %v (%d rows)", err, len(claimed))
+	}
+	for _, row := range claimed {
+		expire(t, d, row.ID)
+	}
+
+	var mu sync.Mutex
+	seen := make(map[int64]int)
+	var wg sync.WaitGroup
+	for range 10 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				rows, err := d.FetchExpired(context.Background(), time.Now().Add(time.Minute), 1)
+				if err != nil {
+					t.Errorf("FetchExpired: %v", err)
+					return
+				}
+				if len(rows) == 0 {
+					return
+				}
+				mu.Lock()
+				seen[rows[0].ID]++
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+
+	if len(seen) != jobs {
+		t.Fatalf("reclaimed %d distinct jobs, want %d", len(seen), jobs)
+	}
+	for id, n := range seen {
+		if n != 1 {
+			t.Fatalf("job %d reclaimed %d times, want exactly once", id, n)
+		}
 	}
 }
 
@@ -258,7 +724,7 @@ func TestConcurrentFetchClaimsEachJobExactlyOnce(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for {
-				rows, err := d.FetchAvailable(context.Background(), "default", 1)
+				rows, err := d.FetchAvailable(context.Background(), "default", time.Now().Add(time.Minute), 1)
 				if err != nil {
 					t.Errorf("FetchAvailable: %v", err)
 					return

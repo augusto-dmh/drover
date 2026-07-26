@@ -20,6 +20,12 @@ Seen once or not yet corroborated. Tracked, not trusted.
 - evidence: loop.go:120 M5 / CORE-03 AC7 (testing/timing)
 - last seen: 2026-07-25T14:42:47Z
 
+### L-002 — When a test fixture's stub returns the same value the un-implemented path would produce (e.g. an immediate-retry policy answering time.Now()), the assertion cannot tell 'consulted' from 'ignored' — give at least one test a distinctive value.
+- signal: `surviving_mutant` · recurrence: 1 feature(s) · scope: `testing/fixtures` · harmful: 0
+- features: cycle-b-reliability-core
+- evidence: loop.go:194 M16 / RESCUE-01 (spec P1-Story3 AC1) (testing/fixtures)
+- last seen: 2026-07-25T22:49:20Z
+
 ## Quarantined (failed when applied — ignore)
 
 A confirmed lesson that recurred alongside failure. Kept for the maintainer to review.

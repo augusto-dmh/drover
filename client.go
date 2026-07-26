@@ -18,6 +18,15 @@ import (
 const (
 	defaultQueue        = "default"
 	defaultPollInterval = time.Second
+
+	// heartbeatsPerLease is how many renewals fit in one lease by
+	// default. Three leaves two beats of slack: a job survives a missed
+	// renewal without the rescuer taking it away.
+	heartbeatsPerLease = 3
+
+	// minLeaseDuration is the shortest lease that still divides into a
+	// usable heartbeat interval. Anything shorter is treated as unset.
+	minLeaseDuration = time.Millisecond
 )
 
 // JobRow is the persisted representation of a job.
@@ -38,19 +47,46 @@ type JobRow struct {
 
 // Config configures a Client. Zero values get defaults: slog.Default()
 // for Logger, one second for PollInterval, an empty registry for
-// Workers.
+// Workers, ExponentialRetryPolicy for RetryPolicy, one minute for
+// LeaseDuration, a third of the lease for HeartbeatInterval, and the
+// lease duration itself for RescueInterval.
 type Config struct {
 	Workers      *Workers
 	Logger       *slog.Logger
 	PollInterval time.Duration
+	RetryPolicy  RetryPolicy
+
+	// LeaseDuration is how long a claimed job may run before the rescuer
+	// treats its worker as dead. It bounds how long work sits idle after
+	// a crash, so a shorter lease recovers faster and a longer one
+	// tolerates more heartbeat trouble.
+	LeaseDuration time.Duration
+
+	// HeartbeatInterval is how often a running job's lease is renewed.
+	// It must be shorter than LeaseDuration or every job outliving one
+	// lease would be rescued while still running; a value that is not is
+	// replaced with a third of the lease.
+	HeartbeatInterval time.Duration
+
+	// RescueInterval is how often the client sweeps for jobs whose
+	// workers died. Together with LeaseDuration it bounds how long
+	// abandoned work sits idle. It defaults to LeaseDuration, so
+	// shortening the lease to recover faster does not leave the sweep
+	// running on the old, slower cadence.
+	RescueInterval time.Duration
 }
 
 // Client enqueues jobs and runs the worker loop.
 type Client struct {
-	drv          driver.Driver
-	workers      *Workers
-	logger       *slog.Logger
-	pollInterval time.Duration
+	drv               driver.Driver
+	workers           *Workers
+	logger            *slog.Logger
+	pollInterval      time.Duration
+	retryPolicy       RetryPolicy
+	leaseDuration     time.Duration
+	heartbeatInterval time.Duration
+	rescueInterval    time.Duration
+	inflight          *inflightSet
 }
 
 // NewClient returns a Client backed by the given PostgreSQL pool.
@@ -65,10 +101,15 @@ func NewClient(pool *pgxpool.Pool, cfg Config) (*Client, error) {
 // memdriver.
 func newClient(drv driver.Driver, cfg Config) *Client {
 	c := &Client{
-		drv:          drv,
-		workers:      cfg.Workers,
-		logger:       cfg.Logger,
-		pollInterval: cfg.PollInterval,
+		drv:               drv,
+		workers:           cfg.Workers,
+		logger:            cfg.Logger,
+		pollInterval:      cfg.PollInterval,
+		retryPolicy:       cfg.RetryPolicy,
+		leaseDuration:     cfg.LeaseDuration,
+		heartbeatInterval: cfg.HeartbeatInterval,
+		rescueInterval:    cfg.RescueInterval,
+		inflight:          newInflightSet(),
 	}
 	if c.workers == nil {
 		c.workers = NewWorkers()
@@ -78,6 +119,33 @@ func newClient(drv driver.Driver, cfg Config) *Client {
 	}
 	if c.pollInterval <= 0 {
 		c.pollInterval = defaultPollInterval
+	}
+	if c.retryPolicy == nil {
+		c.retryPolicy = ExponentialRetryPolicy{}
+	}
+	// Floored, not merely checked for positivity: the heartbeat interval
+	// is derived by integer division, so a lease of a nanosecond or two
+	// would yield an interval of zero and panic the ticker.
+	if c.leaseDuration < minLeaseDuration {
+		c.leaseDuration = driver.DefaultLeaseDuration
+	}
+	// A heartbeat at or beyond the lease it renews can only ever renew
+	// too late, so every job outliving one lease would be rescued while
+	// still running.
+	if c.heartbeatInterval >= c.leaseDuration {
+		// Distinct from an unset value: this one the caller chose, and
+		// its production symptom — jobs duplicated while still running —
+		// is far easier to diagnose from one line at startup than from
+		// the behaviour.
+		c.logger.Warn("drover: heartbeat interval must be shorter than the lease; using the default instead",
+			"heartbeat_interval", c.heartbeatInterval, "lease_duration", c.leaseDuration)
+		c.heartbeatInterval = 0
+	}
+	if c.heartbeatInterval <= 0 {
+		c.heartbeatInterval = c.leaseDuration / heartbeatsPerLease
+	}
+	if c.rescueInterval <= 0 {
+		c.rescueInterval = c.leaseDuration
 	}
 	return c
 }
