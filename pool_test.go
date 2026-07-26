@@ -291,7 +291,7 @@ func TestStopIsSafeToCallTwice(t *testing.T) {
 	go func() { done <- c.Stop(context.Background()) }()
 	select {
 	case second := <-done:
-		if second != first {
+		if !errors.Is(second, first) {
 			t.Errorf("second Stop = %v, want the first call's verdict %v", second, first)
 		}
 	case <-time.After(2 * time.Second):

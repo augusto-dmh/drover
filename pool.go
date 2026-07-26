@@ -128,7 +128,12 @@ func (r *runner) start(ctx context.Context) {
 func (r *runner) watch(ctx context.Context) {
 	select {
 	case <-ctx.Done():
-		r.stop(context.WithoutCancel(ctx))
+		// The verdict is discarded because there is nobody to hand it to:
+		// this caller cancelled rather than calling Stop, so no return
+		// value carries it. Nothing is lost — the budget here is
+		// unbounded, so the one error Stop can report cannot arise, and
+		// the shutdown logs what it did either way.
+		_ = r.stop(context.WithoutCancel(ctx))
 	case <-r.done:
 	}
 }
