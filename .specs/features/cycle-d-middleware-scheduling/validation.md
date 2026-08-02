@@ -196,3 +196,37 @@ reason gains a second caller.
   the job's history as a shutdown). `Logging`'s WARN-not-ERROR choice, `writeFailed`'s
   lease-lost demotion, and `escalate`'s empty-snapshot check were all re-read and are
   correct as written.
+
+---
+
+## Disposition of the gaps (author, after verification)
+
+Verification returned PASS with seven gaps. Six were closed by adding sensors; one is
+accepted and recorded. No shipped behaviour was found wrong, so every change below is to
+the suite or to a comment that misdescribed the code — except the removal of one redundant
+line noted under G-7.
+
+| Gap | Disposition |
+| --- | --- |
+| G-1 — a worker panic reaching middleware as an ordinary error was unsensed | **Fixed.** A test now asserts the chain *observed* the failure as a return value naming the panic, and that the logging middleware still emitted an end record. Deleting the inner recovery now fails it; previously the outer recovery masked the deletion. |
+| G-2 — the unregistered-kind failure being raised inside the chain was unsensed | **Fixed.** A test asserts configured middleware runs, and sees the unregistered-kind error, for a job whose kind has no worker. Moving the check out to the caller now fails it. |
+| G-3 — only the failure record's level was asserted | **Fixed.** The start and success records are now asserted at `INFO` as well as counted. |
+| G-4 — each queue being asked only for the *remaining* capacity was unsensed | **Fixed.** A test drives the claim round over 200 orderings and asserts the limit passed to the queue visited after a partial claim. Asking every queue for the full capacity now fails it. |
+| G-5 — dueness being decided by the database clock cannot be falsified while the test container and the client share a host clock | **Accepted, not fixed.** Proving it needs a container with a deliberately skewed clock. This is the same limitation already recorded against lease deadlines in the previous cycle, and it is the same fixture that would close both. Carried forward as known weak coverage rather than papered over with a test that cannot fail. |
+| G-6 — a job in an unworked queue had no test | **Fixed.** A test asserts such a job is neither rejected nor claimed, stays `available`, and keeps `attempt` at zero, with a marker job proving the pool made a full pass. |
+| G-7 — the copy test was inert, and its comment claimed the copy was load-bearing | **Fixed, and a line removed.** The verifier was right: the chain is composed eagerly, so the caller's slice is never retained and `slices.Clone` was doing nothing. The clone is gone; the function, its comment, the `Config.Middleware` doc, and the test now all say what actually holds. Keeping a defensive copy that looks like the reason would have been worse than removing it. |
+
+### On the overlapping-protection reading
+
+The verifier's correction is accepted. The surplus guard is *not* masked — an existing test
+kills that mutation — so only one of the three protections was genuinely unsensed, and G-4
+closes it. The wider point stands and is the more useful one: the path that would have
+"corrected" a full-capacity claim does so by claiming rows and handing them straight back,
+which warns about the driver for the pool's own mistake, records an attempt error naming a
+shutdown that did not happen, and spends an attempt the hand-back never returns. A
+correction that lies three times is not a protection worth relying on, which is why the
+limit is now asserted at the point it is computed.
+
+The pre-existing over-broad use of the shutdown-requeue reason on other hand-back paths is
+noted and left alone: it predates this work and belongs to whichever cycle next touches the
+hand-back, along with the batching already carried forward for it.

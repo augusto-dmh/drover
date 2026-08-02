@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"slices"
 	"sync"
 	"time"
 
@@ -68,9 +67,9 @@ type Config struct {
 	// kind. The first element is outermost: it sees a job before the
 	// others and its result after them.
 	//
-	// The chain is composed once, when the client is built, and the
-	// slice is copied — appending to the caller's slice afterwards
-	// changes nothing. A nil element is a programmer error and panics,
+	// The chain is composed once, when the client is built, so appending
+	// to the slice afterwards changes nothing about what the client runs.
+	// A nil element is a programmer error and panics,
 	// because the alternative is a middleware the caller believes is
 	// running: a timeout that was silently dropped looks exactly like a
 	// timeout that has not fired yet.
@@ -239,16 +238,21 @@ func newClient(drv driver.Driver, cfg Config) *Client {
 	return c
 }
 
-// checkedMiddleware validates the configured chain and returns a copy of
-// it. The copy is what makes the client's behaviour independent of a
-// caller who keeps appending to the slice they passed.
+// checkedMiddleware rejects a chain that cannot be composed, and returns
+// it unchanged.
+//
+// It deliberately does not copy. What keeps the client independent of a
+// caller who goes on appending to their slice is that the chain is
+// composed here and now: wrap closes over each middleware, not over the
+// slice, so once construction returns there is nothing left for a later
+// append to reach. A defensive copy would only look like the reason.
 func checkedMiddleware(mws []Middleware) []Middleware {
 	for i, mw := range mws {
 		if mw == nil {
 			panic(fmt.Sprintf("drover: Config.Middleware[%d] is nil", i))
 		}
 	}
-	return slices.Clone(mws)
+	return mws
 }
 
 // InsertOpts are the per-job choices made at enqueue time. A nil

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -321,7 +322,7 @@ func TestPanickingMiddlewareDoesNotKillThePool(t *testing.T) {
 	}
 }
 
-func TestMiddlewareSliceIsCopiedAtConstruction(t *testing.T) {
+func TestChainIsFixedAtConstruction(t *testing.T) {
 	t.Parallel()
 
 	var ran atomic.Int32
@@ -332,11 +333,11 @@ func TestMiddlewareSliceIsCopiedAtConstruction(t *testing.T) {
 		}
 	}
 
-	// Spare capacity is the point: appending to a full slice reallocates
-	// and would leave the client's copy untouched no matter how it was
-	// stored, so the test would pass without proving anything. With room
-	// to grow, the append writes into the very array the client was
-	// handed — only a genuine copy survives it.
+	// Spare capacity so the append writes into the very array the client
+	// was handed, rather than reallocating and trivially leaving it alone.
+	// What holds is that the chain was already composed at construction:
+	// wrap closed over this one middleware, so there is nothing left for
+	// the append to reach.
 	mws := make([]Middleware, 1, 2)
 	mws[0] = counting
 	c := newClient(memdriver.New(), Config{Middleware: mws})
@@ -400,11 +401,26 @@ func TestLoggingReportsOneStartAndOneEndPerSuccessfulJob(t *testing.T) {
 	h.stop(t)
 
 	logs := h.logs.String()
-	if got := countRecords(logs, `msg="drover: job started"`); got != 1 {
-		t.Errorf("start records = %d, want 1\nlogs:\n%s", got, logs)
-	}
-	if got := countRecords(logs, `msg="drover: job execution finished"`); got != 1 {
-		t.Errorf("success records = %d, want 1\nlogs:\n%s", got, logs)
+	// Level as well as count: a start or success record emitted at ERROR
+	// would train an operator to ignore the level that means something.
+	for _, want := range []struct{ msg, level string }{
+		{`msg="drover: job started"`, "level=INFO"},
+		{`msg="drover: job execution finished"`, "level=INFO"},
+	} {
+		if got := countRecords(logs, want.msg); got != 1 {
+			t.Errorf("records matching %s = %d, want 1\nlogs:\n%s", want.msg, got, logs)
+			continue
+		}
+		found := false
+		for _, line := range strings.Split(logs, "\n") {
+			if strings.Contains(line, want.msg) {
+				found = strings.Contains(line, want.level)
+				break
+			}
+		}
+		if !found {
+			t.Errorf("record %s was not logged at %s\nlogs:\n%s", want.msg, want.level, logs)
+		}
 	}
 	// The line the middleware replaced must not also be emitted, or every
 	// successful job would report its success twice.
@@ -672,4 +688,109 @@ func TestShutdownCancellationReachesAHandlerUnderATimeout(t *testing.T) {
 		t.Errorf("shutdown took %v — cancellation did not reach the handler under the timeout", elapsed)
 	}
 	h.cancel()
+}
+
+// The inner recovery, around the registered worker, is what turns a
+// panicking job into an ordinary error *for the middleware wrapped
+// around it*. Deleting it leaves the outer recovery to catch the panic,
+// so the job still retries and a test watching only the job's fate stays
+// green — while every middleware is skipped on the way out. This asserts
+// what the outer recovery cannot provide: that the chain observed the
+// failure as a return value.
+func TestMiddlewareObservesAWorkerPanicAsAnOrdinaryError(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	mem := memdriver.New()
+
+	var mu sync.Mutex
+	var seen []string
+	ws := NewWorkers()
+	Register(ws, &funcWorker{fn: func(context.Context, *Job[greetArgs]) error {
+		panic("kaboom")
+	}})
+
+	logs := &syncWriter{}
+	h := startLoopWith(t, mem, mem, ws, func(cfg *Config) {
+		cfg.Logger = newTestLogger(logs)
+		cfg.Middleware = []Middleware{func(next Handler) Handler {
+			return func(ctx context.Context, job *JobRow) error {
+				err := next(ctx, job)
+				mu.Lock()
+				if err == nil {
+					seen = append(seen, "nil")
+				} else {
+					seen = append(seen, err.Error())
+				}
+				mu.Unlock()
+				return err
+			}
+		}}
+	})
+
+	row, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"}, nil)
+	if err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	waitFor(t, h.rowInState(row.ID, "retryable"), "panicked job to be queued for retry")
+	h.stop(t)
+
+	mu.Lock()
+	got := slices.Clone(seen)
+	mu.Unlock()
+
+	if len(got) == 0 {
+		t.Fatal("the middleware never returned — the panic unwound past it instead of becoming an error")
+	}
+	if !strings.Contains(got[0], "kaboom") {
+		t.Errorf("middleware saw %q, want an error naming the panic", got[0])
+	}
+
+	// The logging middleware is wrapped around the same handler, so it
+	// too must have reported an end record rather than being skipped.
+	if n := countRecords(logs.String(), `msg="drover: job execution failed"`); n == 0 {
+		t.Errorf("no execution-failure record — the panic bypassed the logging middleware\nlogs:\n%s", logs.String())
+	}
+}
+
+// The unregistered-kind failure is raised inside the chain so middleware
+// observes it. Moving it out to the caller leaves the job retrying
+// exactly as before, which is why the job's fate alone cannot detect the
+// move.
+func TestMiddlewareRunsForAnUnregisteredKind(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	mem := memdriver.New()
+
+	var ran atomic.Int32
+	var saw atomic.Value
+	logs := &syncWriter{}
+	h := startLoopWith(t, mem, mem, NewWorkers(), func(cfg *Config) {
+		cfg.Logger = newTestLogger(logs)
+		cfg.Middleware = []Middleware{func(next Handler) Handler {
+			return func(ctx context.Context, job *JobRow) error {
+				ran.Add(1)
+				err := next(ctx, job)
+				if err != nil {
+					saw.Store(err.Error())
+				}
+				return err
+			}
+		}}
+	})
+
+	row, err := h.client.Insert(context.Background(), ghostArgs{}, nil)
+	if err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	waitFor(t, h.rowInState(row.ID, "retryable"), "job of an unregistered kind to be queued for retry")
+	h.stop(t)
+
+	if ran.Load() == 0 {
+		t.Fatal("middleware never ran for a job whose kind has no worker")
+	}
+	msg, _ := saw.Load().(string)
+	if !strings.Contains(msg, "no worker registered") {
+		t.Errorf("middleware saw %q, want the unregistered-kind error", msg)
+	}
+	if n := countRecords(logs.String(), `msg="drover: job started"`); n == 0 {
+		t.Errorf("the logging middleware did not run for an unregistered kind\nlogs:\n%s", logs.String())
+	}
 }

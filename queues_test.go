@@ -480,3 +480,115 @@ func TestARoundNeverClaimsMoreThanTheIdleWorkerCount(t *testing.T) {
 	close(release)
 	h.stop(t)
 }
+
+// limitRecordingDriver remembers the limit each queue was asked for, so a
+// test can assert what bounded the claim rather than only what came back.
+type limitRecordingDriver struct {
+	*memdriver.Driver
+
+	mu     sync.Mutex
+	limits []int
+}
+
+func (d *limitRecordingDriver) FetchAvailable(ctx context.Context, queue string, leaseFor time.Duration, limit int) ([]*driver.JobRow, error) {
+	d.mu.Lock()
+	d.limits = append(d.limits, limit)
+	d.mu.Unlock()
+	return d.Driver.FetchAvailable(ctx, queue, leaseFor, limit)
+}
+
+// Each queue in a round must be asked only for the capacity still
+// unspoken-for. Asking every queue for the full capacity happens to be
+// corrected further downstream, but only by claiming rows and handing
+// them straight back — which blames the driver in a warning, records an
+// attempt error saying a shutdown interrupted the job when none did, and
+// spends an attempt that is never given back. The limit is where this
+// has to be right.
+func TestEachQueueIsAskedOnlyForTheRemainingCapacity(t *testing.T) {
+	t.Parallel()
+
+	const capacity = 4
+	for i := 0; i < 200; i++ {
+		mem := memdriver.New()
+		// One job in "thin" cannot fill the round, so whatever is asked of
+		// the queue visited after it must be strictly less than capacity.
+		if _, err := mem.Insert(context.Background(), driver.InsertParams{
+			Kind: "greet", Queue: "thin", Args: []byte(`{"name":"ada"}`),
+		}); err != nil {
+			t.Fatalf("seed job: %v", err)
+		}
+		for j := 0; j < 10; j++ {
+			if _, err := mem.Insert(context.Background(), driver.InsertParams{
+				Kind: "greet", Queue: "fat", Args: []byte(`{"name":"ada"}`),
+			}); err != nil {
+				t.Fatalf("seed job: %v", err)
+			}
+		}
+
+		drv := &limitRecordingDriver{Driver: mem}
+		c := newClient(drv, Config{
+			Logger: newTestLogger(&syncWriter{}),
+			Queues: map[string]int{"thin": 1, "fat": 1},
+		})
+		r := newRunner(context.Background(), c)
+		r.claimRound(capacity)
+
+		drv.mu.Lock()
+		limits := slices.Clone(drv.limits)
+		drv.mu.Unlock()
+
+		if len(limits) == 0 {
+			t.Fatal("no queue was queried")
+		}
+		if limits[0] != capacity {
+			t.Fatalf("first queue asked for %d, want the full capacity %d", limits[0], capacity)
+		}
+		// Only the ordering that visits "thin" first exercises the
+		// interesting case; the other one fills the round immediately.
+		if len(limits) > 1 && r.order[0] == "thin" {
+			if limits[1] != capacity-1 {
+				t.Fatalf("after claiming 1 job, the next queue was asked for %d, want %d (ordering %v)",
+					limits[1], capacity-1, r.order)
+			}
+		}
+	}
+}
+
+// A job enqueued to a queue no running client works must simply wait,
+// not be rejected, lost, or picked up by a client working other queues.
+func TestAJobInAnUnworkedQueueStaysClaimable(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	mem := memdriver.New()
+	ws := NewWorkers()
+	Register(ws, &funcWorker{fn: func(context.Context, *Job[greetArgs]) error { return nil }})
+	h := startLoopWith(t, mem, mem, ws, func(cfg *Config) {
+		cfg.Queues = map[string]int{"worked": 1}
+	})
+
+	stranded, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"},
+		&InsertOpts{Queue: "nobody-works-this"})
+	if err != nil {
+		t.Fatalf("Insert into an unworked queue returned %v, want nil", err)
+	}
+	marker, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"},
+		&InsertOpts{Queue: "worked"})
+	if err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+
+	// The marker running proves the pool made a full pass, so the other
+	// job was not merely still in flight.
+	waitFor(t, h.rowInState(marker.ID, "completed"), "the worked queue to drain")
+	h.stop(t)
+
+	row, ok := mem.Row(stranded.ID)
+	if !ok {
+		t.Fatal("the job in the unworked queue disappeared")
+	}
+	if row.State != "available" {
+		t.Errorf("state = %q, want it still available for whoever works that queue", row.State)
+	}
+	if row.Attempt != 0 {
+		t.Errorf("attempt = %d, want 0 — nothing should have claimed it", row.Attempt)
+	}
+}
