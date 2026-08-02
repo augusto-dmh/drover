@@ -202,11 +202,21 @@ type InsertJobParams struct {
 }
 
 // A null scheduled_at means "now". The state follows from the same
-// comparison the fetch predicate makes, evaluated against the same
-// clock: a job due later waits in scheduled, one due now is available.
-// Deciding this on the client would let a machine running fast or slow
-// write a state this database disagrees with, and the state column is
-// what an operator is shown.
+// comparison the fetch predicate makes, evaluated by the database rather
+// than the client: a job due later waits in scheduled, one due now is
+// available. Deciding this on the client would let a machine running
+// fast or slow write a state this database disagrees with, and the state
+// column is what an operator is shown.
+//
+// now() is transaction_timestamp(), so both readings here are the same
+// instant and the stored time can never disagree with the state derived
+// from it. On the InsertTx path that instant is the caller's transaction
+// start, not the insert, so a job enqueued late in a long transaction
+// can be recorded scheduled while already due. Nothing is delayed by it:
+// the fetch predicate compares scheduled_at against its own now() and
+// claims the row on the next poll. clock_timestamp() would fix the label
+// and break the guarantee — being volatile, its two occurrences would
+// evaluate at different instants and could disagree for real.
 func (q *Queries) InsertJob(ctx context.Context, arg InsertJobParams) (DroverJob, error) {
 	row := q.db.QueryRow(ctx, insertJob,
 		arg.Kind,

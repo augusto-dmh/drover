@@ -56,7 +56,7 @@ client, err := drover.NewClient(pool, drover.Config{
 })
 
 // Enqueue atomically with your own writes
-err = client.InsertTx(ctx, tx, SendEmail{To: user.Email, Template: "welcome"}, nil)
+_, err = client.InsertTx(ctx, tx, SendEmail{To: user.Email, Template: "welcome"}, nil)
 
 // Or delay a job and route it to a named queue; nil opts mean the
 // "default" queue, runnable now.

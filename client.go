@@ -89,9 +89,19 @@ type Config struct {
 	// getting a slice of it, so a busy queue can use the whole pool while
 	// the others are idle.
 	//
-	// A weight below one is corrected to one and reported. An empty queue
-	// name panics: an empty Queue at enqueue time means "default", so no
-	// caller could ever address it.
+	// A weight below one is corrected to one and reported, as is one
+	// above the internal maximum — priority is a ratio, and an enormous
+	// weight buys nothing a large one does not.
+	//
+	// An empty queue name panics: an empty Queue at enqueue time means
+	// "default", so no caller could ever address it.
+	//
+	// Cost scales with the map. A round asks each queue in turn until the
+	// idle workers are spoken for, so an idle client polls once per
+	// configured queue per interval where a single-queue client polls
+	// once. The queries are cheap — each is served by the fetch index and
+	// one matching no rows does no write — but they are round trips, so
+	// widen PollInterval as the map grows.
 	Queues map[string]int
 
 	// Concurrency is how many jobs this client executes at once. It

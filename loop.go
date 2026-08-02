@@ -136,11 +136,12 @@ func (c *Client) runJob(jobCtx context.Context, row *driver.JobRow) {
 //
 // The recover here is the outer of two: it catches a panic thrown by a
 // middleware, which dispatch's own recover cannot see because it is
-// deeper in the chain. Without it a single misbehaving middleware would
-// unwind its pool worker's goroutine, and nothing supervises those — the
-// pool would quietly shrink by one worker per occurrence until it held
-// none and the client worked no jobs while still reporting itself
-// running.
+// deeper in the chain. Without it a middleware panic would unwind past
+// this frame with nothing above it to catch, and an unrecovered panic in
+// any goroutine terminates the whole process — taking every other
+// in-flight job with it, each left running until its lease lapses and a
+// rescuer collects it. One misbehaving middleware would be a crash, not
+// a degradation.
 func (c *Client) execute(ctx context.Context, job *JobRow) (err error) {
 	defer func() {
 		if r := recover(); r != nil {

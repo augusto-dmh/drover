@@ -32,7 +32,8 @@ func New() *Driver {
 // Migrate is a no-op: the in-memory store has no schema.
 func (d *Driver) Migrate(context.Context) error { return nil }
 
-// Insert stores a new available job and returns a copy of its row.
+// Insert stores a new job — available, or scheduled when it is due
+// later — and returns a copy of its row.
 func (d *Driver) Insert(_ context.Context, params driver.InsertParams) (*driver.JobRow, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
