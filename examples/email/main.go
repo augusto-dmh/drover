@@ -14,10 +14,11 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"maps"
 	"os"
 	"os/signal"
+	"slices"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -88,17 +89,44 @@ func (EmailWorker) Work(_ context.Context, job *drover.Job[SendWelcomeEmail]) er
 // counts each successful delivery by the queue it ran on, so the totals
 // printed at shutdown show the two queues configured in run() being
 // worked from the one shared pool.
-func perQueueCounts(counts *sync.Map) drover.Middleware {
+func perQueueCounts(counts *queueCounts) drover.Middleware {
 	return func(next drover.Handler) drover.Handler {
 		return func(ctx context.Context, job *drover.JobRow) error {
 			err := next(ctx, job)
 			if err == nil {
-				n, _ := counts.LoadOrStore(job.Queue, new(int64))
-				atomic.AddInt64(n.(*int64), 1)
+				counts.record(job.Queue)
 			}
 			return err
 		}
 	}
+}
+
+// queueCounts tallies completed jobs per queue. Every pool worker calls
+// record concurrently, so the map needs guarding — a plain mutex rather
+// than sync.Map, whose documented cases are append-mostly caches and
+// disjoint per-goroutine keys, neither of which this is. The key set is
+// the two queues configured in run().
+type queueCounts struct {
+	mu sync.Mutex
+	n  map[string]int
+}
+
+func newQueueCounts() *queueCounts {
+	return &queueCounts{n: make(map[string]int)}
+}
+
+func (c *queueCounts) record(queue string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.n[queue]++
+}
+
+// total returns a copy, so the caller reads a stable snapshot rather
+// than the live map.
+func (c *queueCounts) total() map[string]int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return maps.Clone(c.n)
 }
 
 func main() {
@@ -133,7 +161,7 @@ func run() error {
 	workers := drover.NewWorkers()
 	drover.Register(workers, EmailWorker{})
 
-	counts := &sync.Map{}
+	counts := newQueueCounts()
 	client, err := drover.NewClient(pool, drover.Config{
 		Workers:     workers,
 		Concurrency: workerConcurrency,
@@ -178,10 +206,10 @@ func run() error {
 	}
 	log.Print("shutdown complete: every in-flight job finished and recorded its outcome")
 
-	counts.Range(func(queue, n any) bool {
-		log.Printf("completed %d job(s) on queue %q", atomic.LoadInt64(n.(*int64)), queue)
-		return true
-	})
+	total := counts.total()
+	for _, queue := range slices.Sorted(maps.Keys(total)) {
+		log.Printf("completed %d job(s) on queue %q", total[queue], queue)
+	}
 	return nil
 }
 
