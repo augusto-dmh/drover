@@ -794,3 +794,149 @@ func TestMiddlewareRunsForAnUnregisteredKind(t *testing.T) {
 		t.Errorf("the logging middleware did not run for an unregistered kind\nlogs:\n%s", logs.String())
 	}
 }
+
+// The chain's return value is the attempt's verdict — that is what
+// Middleware's doc promises, and it is the property an implementation
+// that finalized on the *worker's* error instead would break while the
+// mirror case (a middleware refusing before calling next) stayed green.
+func TestChainVerdictDecidesTheAttempt(t *testing.T) {
+	tests := []struct {
+		name      string
+		worker    error
+		mw        Middleware
+		wantState string
+	}{
+		{
+			name:   "a middleware that swallows the worker's error completes the job",
+			worker: errors.New("worker failed"),
+			mw: func(next Handler) Handler {
+				return func(ctx context.Context, job *JobRow) error {
+					_ = next(ctx, job)
+					return nil
+				}
+			},
+			wantState: "completed",
+		},
+		{
+			name:   "a middleware that replaces success with an error fails the job",
+			worker: nil,
+			mw: func(next Handler) Handler {
+				return func(ctx context.Context, job *JobRow) error {
+					if err := next(ctx, job); err != nil {
+						return err
+					}
+					return errors.New("rejected after the fact")
+				}
+			},
+			wantState: "retryable",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+			mem := memdriver.New()
+			ws := NewWorkers()
+			Register(ws, &funcWorker{fn: func(context.Context, *Job[greetArgs]) error {
+				return tt.worker
+			}})
+			h := startLoopWith(t, mem, mem, ws, func(cfg *Config) {
+				cfg.Middleware = []Middleware{tt.mw}
+				cfg.RetryPolicy = atTimePolicy{at: time.Now().Add(time.Hour)}
+			})
+
+			row, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"}, nil)
+			if err != nil {
+				t.Fatalf("Insert: %v", err)
+			}
+			waitFor(t, h.rowInState(row.ID, tt.wantState), "the chain's verdict to decide the attempt")
+			h.stop(t)
+		})
+	}
+}
+
+// Calling next more than once is permitted: the chain decides, and the
+// error it finally returns is what the job is disposed on.
+func TestMiddlewareMayCallTheHandlerMoreThanOnce(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	mem := memdriver.New()
+
+	var calls atomic.Int32
+	ws := NewWorkers()
+	Register(ws, &funcWorker{fn: func(context.Context, *Job[greetArgs]) error {
+		// Fails once, then succeeds — so the job completes only if the
+		// middleware's second call actually reached the worker.
+		if calls.Add(1) == 1 {
+			return errors.New("first attempt failed")
+		}
+		return nil
+	}})
+	h := startLoopWith(t, mem, mem, ws, func(cfg *Config) {
+		cfg.Middleware = []Middleware{func(next Handler) Handler {
+			return func(ctx context.Context, job *JobRow) error {
+				if err := next(ctx, job); err != nil {
+					return next(ctx, job)
+				}
+				return nil
+			}
+		}}
+	})
+
+	row, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"}, nil)
+	if err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	waitFor(t, h.rowInState(row.ID, "completed"), "the retried call inside the middleware to complete the job")
+	h.stop(t)
+
+	if got := calls.Load(); got != 2 {
+		t.Errorf("worker ran %d times, want 2 — the middleware's second call did not reach it", got)
+	}
+}
+
+// The same value appearing twice must run at both positions, which also
+// pins that wrap composes per element rather than deduplicating.
+func TestTheSameMiddlewareValueRunsAtEveryPositionItOccupies(t *testing.T) {
+	t.Parallel()
+
+	var trace []string
+	base := func(ctx context.Context, job *JobRow) error {
+		trace = append(trace, "handler")
+		return nil
+	}
+	repeated := record(&trace, "a")
+
+	h := wrap(base, []Middleware{repeated, record(&trace, "b"), repeated})
+	if err := h(context.Background(), &JobRow{ID: 1}); err != nil {
+		t.Fatalf("chain returned %v, want nil", err)
+	}
+
+	want := "a,b,a,handler,a:out,b:out,a:out"
+	if got := strings.Join(trace, ","); got != want {
+		t.Errorf("trace = %q, want %q", got, want)
+	}
+}
+
+// Logging is exported so callers can install it themselves, which makes
+// the nil-logger fallback the path an outside user hits first. Nothing
+// else exercises it: the client always passes its own logger.
+func TestLoggingWithANilLoggerFallsBackToTheDefault(t *testing.T) {
+	t.Parallel()
+
+	sentinel := errors.New("handler failed")
+	for _, tt := range []struct {
+		name string
+		ret  error
+	}{{"success", nil}, {"failure", sentinel}} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			h := wrap(func(ctx context.Context, job *JobRow) error {
+				return tt.ret
+			}, []Middleware{Logging(nil)})
+
+			if err := h(context.Background(), &JobRow{ID: 1, Kind: "greet"}); !errors.Is(err, tt.ret) {
+				t.Errorf("chain returned %v, want %v", err, tt.ret)
+			}
+		})
+	}
+}

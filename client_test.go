@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -301,7 +302,18 @@ func TestScheduledJobRunsOnlyOnceItIsDue(t *testing.T) {
 	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 	mem := memdriver.New()
 	ws := NewWorkers()
-	Register(ws, &funcWorker{fn: func(context.Context, *Job[greetArgs]) error { return nil }})
+
+	// Recorded by the worker itself, because when the job *ran* is the
+	// only thing that can show the schedule was honoured. Reading the
+	// clock after the test has already waited for completion measures
+	// when the assertion executed, which is unconditionally later than
+	// the due time and so can never fail.
+	var ranAt atomic.Pointer[time.Time]
+	Register(ws, &funcWorker{fn: func(context.Context, *Job[greetArgs]) error {
+		now := time.Now()
+		ranAt.CompareAndSwap(nil, &now)
+		return nil
+	}})
 	h := startLoop(t, mem, mem, ws)
 
 	due := time.Now().Add(150 * time.Millisecond)
@@ -313,14 +325,22 @@ func TestScheduledJobRunsOnlyOnceItIsDue(t *testing.T) {
 	// Long enough for several poll intervals to pass, so an unhonoured
 	// schedule would have been claimed by now.
 	time.Sleep(60 * time.Millisecond)
-	if stored, _ := mem.Row(row.ID); stored.State != "scheduled" {
+	stored, ok := mem.Row(row.ID)
+	if !ok {
+		t.Fatal("job disappeared before its scheduled time")
+	}
+	if stored.State != "scheduled" {
 		t.Fatalf("state = %q before the scheduled time, want scheduled", stored.State)
 	}
 
 	waitFor(t, h.rowInState(row.ID, "completed"), "scheduled job to run once it came due")
 	h.stop(t)
 
-	if time.Since(due) < 0 {
-		t.Error("job ran before its scheduled time")
+	at := ranAt.Load()
+	if at == nil {
+		t.Fatal("worker never recorded a run time")
+	}
+	if at.Before(due) {
+		t.Errorf("job ran at %v, before its scheduled time %v", at, due)
 	}
 }

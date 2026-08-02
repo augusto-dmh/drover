@@ -58,6 +58,41 @@ func TestCheckedQueuesSortsByNameAndCorrectsWeights(t *testing.T) {
 	}
 }
 
+// A weight large enough to overflow the running total would reach
+// rand.Int64N as a non-positive bound and panic on the fetch goroutine,
+// which has nothing above it to recover — so an absurd but legal config
+// would terminate the process on its first round. The ceiling makes that
+// unreachable rather than merely commented about.
+func TestCheckedQueuesClampsAnEnormousWeight(t *testing.T) {
+	t.Parallel()
+
+	logs := &syncWriter{}
+	got := checkedQueues(map[string]int{
+		"huge":   math.MaxInt,
+		"bigger": math.MaxInt - 1,
+		"normal": 3,
+	}, newTestLogger(logs))
+
+	for _, q := range got {
+		if q.weight > maxQueueWeight {
+			t.Errorf("queue %q kept weight %d, want it clamped to %d", q.name, q.weight, maxQueueWeight)
+		}
+	}
+	if !strings.Contains(logs.String(), "queue=huge") {
+		t.Errorf("no warning naming the clamped queue\nlogs:\n%s", logs.String())
+	}
+
+	// The clamped set must still order without overflowing or panicking.
+	var dst []string
+	var scratch []weightedQueue
+	for i := 0; i < 200; i++ {
+		dst, scratch = weightedOrder(got, dst, scratch)
+		if len(dst) != len(got) {
+			t.Fatalf("ordering %v dropped a queue", dst)
+		}
+	}
+}
+
 func TestEmptyQueueNamePanics(t *testing.T) {
 	t.Parallel()
 
@@ -83,8 +118,9 @@ func TestWeightedOrderIsAlwaysAFullPermutation(t *testing.T) {
 	want := []string{"bulk", "high", "mid"}
 
 	var dst []string
+	var scratch []weightedQueue
 	for i := 0; i < 500; i++ {
-		dst = weightedOrder(qs, dst)
+		dst, scratch = weightedOrder(qs, dst, scratch)
 		got := slices.Clone(dst)
 		slices.Sort(got)
 		if !slices.Equal(got, want) {
@@ -96,7 +132,7 @@ func TestWeightedOrderIsAlwaysAFullPermutation(t *testing.T) {
 func TestWeightedOrderWithOneQueueYieldsThatQueue(t *testing.T) {
 	t.Parallel()
 
-	got := weightedOrder([]weightedQueue{{name: "only", weight: 3}}, nil)
+	got, _ := weightedOrder([]weightedQueue{{name: "only", weight: 3}}, nil, nil)
 	if !slices.Equal(got, []string{"only"}) {
 		t.Errorf("weightedOrder = %v, want [only]", got)
 	}
@@ -105,7 +141,7 @@ func TestWeightedOrderWithOneQueueYieldsThatQueue(t *testing.T) {
 func TestWeightedOrderWithNoQueuesYieldsNothing(t *testing.T) {
 	t.Parallel()
 
-	if got := weightedOrder(nil, nil); len(got) != 0 {
+	if got, _ := weightedOrder(nil, nil, nil); len(got) != 0 {
 		t.Errorf("weightedOrder(nil) = %v, want empty", got)
 	}
 }
@@ -126,8 +162,9 @@ func TestWeightedOrderPicksFirstInProportionToWeight(t *testing.T) {
 
 	first := map[string]int{}
 	var dst []string
+	var scratch []weightedQueue
 	for i := 0; i < rounds; i++ {
-		dst = weightedOrder(qs, dst)
+		dst, scratch = weightedOrder(qs, dst, scratch)
 		first[dst[0]]++
 	}
 
@@ -153,8 +190,9 @@ func TestWeightedOrderSurvivesAVeryLargeWeight(t *testing.T) {
 	// Whatever the weighting, "tiny" is still reached in every round —
 	// which is what the fetch loop relies on.
 	var dst []string
+	var scratch []weightedQueue
 	for i := 0; i < 2000; i++ {
-		dst = weightedOrder(qs, dst)
+		dst, scratch = weightedOrder(qs, dst, scratch)
 		if len(dst) != 2 {
 			t.Fatalf("ordering %v dropped a queue", dst)
 		}
@@ -331,6 +369,66 @@ func TestOneQueueIssuesOneFetchPerRound(t *testing.T) {
 	for _, q := range asked {
 		if q != "default" {
 			t.Fatalf("queried queue %q, want only default", q)
+		}
+	}
+	// An upper bound as well as a lower one. Without it a loop issuing
+	// ten queries per round, or one that dropped its poll-interval sleep
+	// and spun, passes unchanged. A 5ms interval over ~60ms should yield
+	// on the order of a dozen queries; a spinning loop yields thousands,
+	// so the bound is loose enough not to be timing-sensitive and tight
+	// enough to catch either fault.
+	if len(asked) > 40 {
+		t.Errorf("fetch loop issued %d queries in ~60ms at a 5ms interval — it is not sleeping between rounds", len(asked))
+	}
+}
+
+// The surplus clamp is bounded by what is left of the round, not by the
+// round's original capacity. Only a multi-queue round can tell those
+// apart: with one queue the remaining capacity is always the full
+// capacity, so the existing single-queue coverage would stay green while
+// a multi-queue round handed the pool more rows than it has workers.
+func TestSurplusIsClampedToWhatIsLeftOfTheRound(t *testing.T) {
+	t.Parallel()
+
+	const capacity = 4
+	for i := 0; i < 200; i++ {
+		mem := memdriver.New()
+		seed := func(queue string, n int) {
+			for j := 0; j < n; j++ {
+				if _, err := mem.Insert(context.Background(), driver.InsertParams{
+					Kind: "greet", Queue: queue, Args: []byte(`{"name":"ada"}`),
+				}); err != nil {
+					t.Fatalf("seed job: %v", err)
+				}
+			}
+		}
+		seed("thin", 1)
+		seed("fat", 10)
+
+		// Overshoots every limit it is given, so the clamp runs on
+		// whichever queue is visited second.
+		drv := &overshootDriver{Driver: mem, extra: 3}
+		c := newClient(drv, Config{
+			Logger: newTestLogger(&syncWriter{}),
+			Queues: map[string]int{"thin": 1, "fat": 1},
+		})
+		r := newRunner(context.Background(), c)
+
+		got := r.claimRound(capacity)
+		if len(got) > capacity {
+			t.Fatalf("claimRound(%d) kept %d rows after ordering %v", capacity, len(got), r.order)
+		}
+
+		// Everything beyond the capacity must have gone back, not been
+		// left running with nothing to execute it.
+		running := 0
+		for id := int64(1); id <= 11; id++ {
+			if row, ok := mem.Row(id); ok && row.State == "running" {
+				running++
+			}
+		}
+		if running > capacity {
+			t.Fatalf("%d rows left running after a round of capacity %d (ordering %v)", running, capacity, r.order)
 		}
 	}
 }
