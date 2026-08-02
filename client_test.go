@@ -148,6 +148,30 @@ func TestConfigZeroValuesGetDefaults(t *testing.T) {
 	}
 }
 
+// Prometheus refuses the same collector twice on one registry, so a
+// client that registered its metrics on a shared or global one could not
+// be constructed twice in a process: the second would panic at
+// construction. Every client gets a registry of its own instead.
+func TestTwoClientsInOneProcessBothConstruct(t *testing.T) {
+	t.Parallel()
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("constructing a second client panicked: %v", r)
+		}
+	}()
+
+	first := newClient(memdriver.New(), Config{})
+	second := newClient(memdriver.New(), Config{})
+
+	if first.metrics == nil || second.metrics == nil {
+		t.Fatal("a client was built without a metric set")
+	}
+	if first.metrics == second.metrics {
+		t.Error("both clients were given the same metric set")
+	}
+}
+
 func TestConcurrencyConfigFallsBackToTheDefault(t *testing.T) {
 	t.Parallel()
 

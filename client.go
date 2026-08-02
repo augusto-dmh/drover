@@ -11,6 +11,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/augusto-dmh/drover/internal/driver"
 	"github.com/augusto-dmh/drover/internal/pgdriver"
@@ -55,8 +56,9 @@ type JobRow struct {
 // Config configures a Client. Zero values get defaults: slog.Default()
 // for Logger, one second for PollInterval, an empty registry for
 // Workers, ExponentialRetryPolicy for RetryPolicy, one minute for
-// LeaseDuration, a third of the lease for HeartbeatInterval, and the
-// lease duration itself for RescueInterval.
+// LeaseDuration, a third of the lease for HeartbeatInterval, the lease
+// duration itself for RescueInterval, and a registry of the client's own
+// for MetricsRegistry.
 type Config struct {
 	Workers      *Workers
 	Logger       *slog.Logger
@@ -143,6 +145,20 @@ type Config struct {
 	// shortening the lease to recover faster does not leave the sweep
 	// running on the old, slower cadence.
 	RescueInterval time.Duration
+
+	// MetricsRegistry is where this client registers its metrics. Unset,
+	// it gets a registry of its own.
+	//
+	// A private registry by default is what lets two clients exist in one
+	// process: prometheus rejects the same collector twice, so a shared
+	// registry would panic the second construction. For the same reason,
+	// handing the *same* registry to two clients is a programmer error
+	// and panics — give each its own, or give the second one nothing.
+	//
+	// Pass a registry to have drover's metrics gathered by an endpoint
+	// you already serve; the client's own ops server is the alternative,
+	// not a requirement.
+	MetricsRegistry *prometheus.Registry
 }
 
 // Client enqueues jobs and runs the worker loop.
@@ -158,6 +174,7 @@ type Client struct {
 	concurrency       int
 	queues            []weightedQueue
 	inflight          *inflightSet
+	metrics           *metricSet
 
 	// chain is the composed middleware stack with dispatch at its
 	// centre. It is built once at construction and never rebuilt: every
@@ -238,11 +255,23 @@ func newClient(drv driver.Driver, cfg Config) *Client {
 	// After the logger is settled, so a corrected weight is reported
 	// through the logger the caller configured.
 	c.queues = checkedQueues(cfg.Queues, c.logger)
+	// After the concurrency is settled too: the pool gauge publishes the
+	// number this client will actually run, not the one it was handed.
+	registry := cfg.MetricsRegistry
+	if registry == nil {
+		registry = prometheus.NewRegistry()
+	}
+	c.metrics = newMetricSet(registry, c.concurrency, c.logger)
 	// Logging goes outermost, ahead of whatever the caller configured, so
 	// that per-job logging survives a caller adding middleware of their
-	// own — and so its duration covers their middleware too.
+	// own — and so its duration covers their middleware too. Metrics go
+	// immediately inside it and ahead of the caller's middleware for the
+	// same reason: an operator's dashboards should not go blank because
+	// someone configured a middleware. Recording them there also means
+	// the counters agree with the chain's verdict, which is what actually
+	// decides the attempt.
 	c.chain = wrap(c.dispatch, append(
-		[]Middleware{Logging(c.logger)},
+		[]Middleware{Logging(c.logger), metricsMiddleware(c.metrics)},
 		checkedMiddleware(cfg.Middleware)...,
 	))
 	return c
