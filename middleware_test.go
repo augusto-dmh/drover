@@ -504,3 +504,172 @@ func TestLoggingRunsEvenWhenTheCallerConfiguresMiddleware(t *testing.T) {
 		t.Error("the built-in logging did not run outside the configured middleware")
 	}
 }
+
+func TestTimeoutGivesTheHandlerADeadline(t *testing.T) {
+	t.Parallel()
+
+	var got error
+	h := wrap(func(ctx context.Context, job *JobRow) error {
+		<-ctx.Done()
+		got = ctx.Err()
+		return got
+	}, []Middleware{Timeout(20 * time.Millisecond)})
+
+	start := time.Now()
+	if err := h(context.Background(), &JobRow{ID: 1}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("chain returned %v, want context.DeadlineExceeded", err)
+	}
+	if !errors.Is(got, context.DeadlineExceeded) {
+		t.Errorf("handler's context reported %v, want context.DeadlineExceeded", got)
+	}
+	// Upper bound, not merely "it finished": without one, a middleware
+	// that never applied a deadline and simply waited for the handler
+	// would pass just as happily.
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("handler ran for %v, want it cut off near 20ms", elapsed)
+	}
+}
+
+func TestTimeoutPassesAFastHandlerThroughUntouched(t *testing.T) {
+	t.Parallel()
+
+	sentinel := errors.New("the handler's own error")
+	tests := []struct {
+		name string
+		ret  error
+	}{
+		{"success", nil},
+		{"failure", sentinel},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var deadline bool
+			h := wrap(func(ctx context.Context, job *JobRow) error {
+				_, deadline = ctx.Deadline()
+				return tt.ret
+			}, []Middleware{Timeout(time.Hour)})
+
+			if err := h(context.Background(), &JobRow{ID: 1}); !errors.Is(err, tt.ret) {
+				t.Errorf("chain returned %v, want %v", err, tt.ret)
+			}
+			if !deadline {
+				t.Error("handler's context carried no deadline")
+			}
+		})
+	}
+}
+
+// A handler that ignores cancellation and reports its own failure after
+// the deadline must have *that* error recorded. Substituting the
+// middleware's would misreport what actually happened.
+func TestTimeoutKeepsTheErrorOfAHandlerThatOverranIt(t *testing.T) {
+	t.Parallel()
+
+	own := errors.New("what the handler decided")
+	h := wrap(func(ctx context.Context, job *JobRow) error {
+		<-ctx.Done()
+		return own
+	}, []Middleware{Timeout(10 * time.Millisecond)})
+
+	err := h(context.Background(), &JobRow{ID: 1})
+	if !errors.Is(err, own) {
+		t.Errorf("chain returned %v, want the handler's own error %v", err, own)
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Error("the middleware substituted its own error for the handler's")
+	}
+}
+
+func TestTimeoutOfZeroOrLessAppliesNoDeadline(t *testing.T) {
+	t.Parallel()
+
+	for _, d := range []time.Duration{0, -time.Second} {
+		t.Run(d.String(), func(t *testing.T) {
+			t.Parallel()
+			var deadline bool
+			h := wrap(func(ctx context.Context, job *JobRow) error {
+				_, deadline = ctx.Deadline()
+				return nil
+			}, []Middleware{Timeout(d)})
+
+			if err := h(context.Background(), &JobRow{ID: 1}); err != nil {
+				t.Fatalf("chain returned %v, want nil", err)
+			}
+			if deadline {
+				t.Errorf("Timeout(%v) applied a deadline, want none", d)
+			}
+		})
+	}
+}
+
+// The whole point of a timeout in a queue: the job has to end up
+// finalized, not left running for the rescuer to collect a lease later.
+func TestTimedOutJobIsFinalizedAndRetried(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	mem := memdriver.New()
+	drv := &ctxDriver{Driver: mem}
+
+	ws := NewWorkers()
+	Register(ws, &funcWorker{fn: func(ctx context.Context, _ *Job[greetArgs]) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}})
+	h := startLoopWith(t, drv, mem, ws, func(cfg *Config) {
+		cfg.Middleware = []Middleware{Timeout(20 * time.Millisecond)}
+		cfg.RetryPolicy = atTimePolicy{at: time.Now().Add(time.Hour)}
+	})
+
+	row, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"})
+	if err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	waitFor(t, h.rowInState(row.ID, "retryable"), "timed-out job to be queued for retry")
+	h.stop(t)
+
+	recorded := decodeAttemptErrors(t, mem, row.ID)
+	if len(recorded) != 1 || !strings.Contains(recorded[0].Error, context.DeadlineExceeded.Error()) {
+		t.Fatalf("errors = %+v, want one entry naming the deadline", recorded)
+	}
+}
+
+// Shutdown must still reach a handler that a timeout has already wrapped:
+// the deadline narrows the context, it does not detach it.
+func TestShutdownCancellationReachesAHandlerUnderATimeout(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	mem := memdriver.New()
+
+	running := make(chan struct{})
+	var once sync.Once
+	ws := NewWorkers()
+	Register(ws, &funcWorker{fn: func(ctx context.Context, _ *Job[greetArgs]) error {
+		once.Do(func() { close(running) })
+		<-ctx.Done()
+		return ctx.Err()
+	}})
+	h := startLoopWith(t, mem, mem, ws, func(cfg *Config) {
+		// Far longer than the test will wait, so only the shutdown can
+		// end this handler.
+		cfg.Middleware = []Middleware{Timeout(time.Hour)}
+	})
+
+	if _, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"}); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	select {
+	case <-running:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler never started")
+	}
+
+	// A budget that is already spent, so the shutdown escalates straight
+	// to cancelling the job context.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_ = h.client.Stop(ctx)
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("shutdown took %v — cancellation did not reach the handler under the timeout", elapsed)
+	}
+	h.cancel()
+}
