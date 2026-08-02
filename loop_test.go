@@ -126,21 +126,27 @@ func startLoopWith(t *testing.T, drv driver.Driver, mem *memdriver.Driver, worke
 	c := newClient(drv, cfg)
 	ctx, cancel := context.WithCancel(context.Background())
 	h := &loopHarness{mem: mem, client: c, logs: logs, cancel: cancel, done: make(chan error, 1)}
-	go func() { h.done <- c.Start(ctx) }()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	// Start no longer blocks for the pool's lifetime, so the harness
+	// mirrors the shutdown onto done: a test cancels, then watches the
+	// shutdown finish, exactly as it did when Start returned at the end.
+	go func() { <-ctx.Done(); h.done <- c.Stop(context.WithoutCancel(ctx)) }()
 	return h
 }
 
-// stop cancels the loop and asserts it returns nil promptly.
+// stop cancels the pool and asserts the shutdown completes cleanly.
 func (h *loopHarness) stop(t *testing.T) {
 	t.Helper()
 	h.cancel()
 	select {
 	case err := <-h.done:
 		if err != nil {
-			t.Fatalf("Start returned %v, want nil", err)
+			t.Fatalf("shutdown returned %v, want nil", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("Start did not return after cancellation")
+		t.Fatal("shutdown did not complete after cancellation")
 	}
 }
 
@@ -174,6 +180,194 @@ func decodeAttemptErrors(t *testing.T, mem *memdriver.Driver, id int64) []driver
 		t.Fatalf("decode errors: %v", err)
 	}
 	return recorded
+}
+
+// ctxDriver refuses writes on a cancelled context, the way a real
+// database driver does. memdriver ignores context entirely, so a test
+// that used it directly could not tell a finalization deliberately
+// protected from cancellation from one that merely never noticed.
+type ctxDriver struct{ *memdriver.Driver }
+
+func (d *ctxDriver) MarkCompleted(ctx context.Context, lease driver.Lease) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return d.Driver.MarkCompleted(ctx, lease)
+}
+
+func (d *ctxDriver) MarkRetryable(ctx context.Context, lease driver.Lease, retryAt time.Time, errDetail []byte) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return d.Driver.MarkRetryable(ctx, lease, retryAt, errDetail)
+}
+
+// A cancelled job context is what shutdown escalation looks like from
+// inside a worker. The handler must see it — otherwise cancellation is
+// decorative — and the outcome must still be recorded, because a job
+// left running after a clean shutdown is a job nobody can touch until
+// its lease lapses.
+func TestJobOutcomeIsRecordedEvenWhenItsContextWasCancelled(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		handler      error
+		unregistered bool
+		wantState    string
+	}{
+		{name: "a job that succeeds is still completed", handler: nil, wantState: "completed"},
+		{name: "a job that fails is still scheduled to retry", handler: errors.New("send failed"), wantState: "retryable"},
+		// Mid-deploy is when a kind this binary does not know turns up and
+		// when a shutdown escalates, so the two conditions arrive together
+		// rather than independently.
+		{name: "a job with no registered worker is still scheduled to retry", unregistered: true, wantState: "retryable"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			mem := memdriver.New()
+			ws := NewWorkers()
+			sawCancellation := make(chan bool, 1)
+			if !tt.unregistered {
+				Register(ws, &funcWorker{fn: func(ctx context.Context, _ *Job[greetArgs]) error {
+					sawCancellation <- ctx.Err() != nil
+					return tt.handler
+				}})
+			}
+			c := newClient(&ctxDriver{mem}, Config{Workers: ws, Logger: newTestLogger(&syncWriter{})})
+
+			row, err := c.Insert(context.Background(), greetArgs{Name: "ada"})
+			if err != nil {
+				t.Fatalf("Insert: %v", err)
+			}
+			claimed, err := mem.FetchAvailable(context.Background(), defaultQueue, time.Minute, 1)
+			if err != nil {
+				t.Fatalf("FetchAvailable: %v", err)
+			}
+
+			jobCtx, cancel := context.WithCancel(context.Background())
+			cancel()
+			c.runJob(jobCtx, claimed[0])
+
+			if !tt.unregistered && !<-sawCancellation {
+				t.Error("handler ran on an uncancelled context, so shutdown could never reach a running job")
+			}
+			stored, ok := mem.Row(row.ID)
+			if !ok {
+				t.Fatalf("job %d not found", row.ID)
+			}
+			if stored.State != tt.wantState {
+				t.Errorf("state = %q, want %q", stored.State, tt.wantState)
+			}
+		})
+	}
+}
+
+// A handler may legitimately run for far longer than a lease — that is
+// what the heartbeat is for. The deadline bounding the write that
+// records its outcome must therefore start at the write, not at the
+// claim, or every long job would finish successfully and then fail to
+// say so, and sit running until the rescuer collected it.
+func TestALongRunningJobCanStillRecordItsOutcome(t *testing.T) {
+	t.Parallel()
+
+	mem := memdriver.New()
+	ws := NewWorkers()
+	Register(ws, &funcWorker{fn: func(context.Context, *Job[greetArgs]) error {
+		time.Sleep(40 * time.Millisecond)
+		return nil
+	}})
+	// A lease far shorter than the job it covers.
+	c := newClient(&ctxDriver{mem}, Config{
+		Workers:       ws,
+		Logger:        newTestLogger(&syncWriter{}),
+		LeaseDuration: 10 * time.Millisecond,
+	})
+
+	row, err := c.Insert(context.Background(), greetArgs{Name: "slow"})
+	if err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	claimed, err := mem.FetchAvailable(context.Background(), defaultQueue, time.Minute, 1)
+	if err != nil {
+		t.Fatalf("FetchAvailable: %v", err)
+	}
+
+	c.runJob(context.Background(), claimed[0])
+
+	stored, ok := mem.Row(row.ID)
+	if !ok {
+		t.Fatalf("job %d not found", row.ID)
+	}
+	if stored.State != "completed" {
+		t.Errorf("state = %q, want completed — a job outliving its lease could not record its result", stored.State)
+	}
+}
+
+// refusingDriver rejects every completion with a fixed error, standing
+// in for the two ways a job stops being this worker's to finish.
+type refusingDriver struct {
+	*memdriver.Driver
+	err error
+}
+
+func (d *refusingDriver) MarkCompleted(context.Context, driver.Lease) error {
+	return d.err
+}
+
+// Neither refusal is a fault, and both must stay out of the error log.
+//
+// A lost lease is the fence working: the job was rescued and re-claimed
+// while this attempt ran. An invalid transition is usually this
+// process's own shutdown — a bounded Stop hands its unfinished jobs back
+// to the queue, and the handler that ignored its cancelled context then
+// arrives here to find the row waiting rather than running. Reporting
+// either as a failed write puts an error in the log for something the
+// system chose to do, which teaches operators to ignore the line that
+// matters when a write genuinely does fail.
+func TestARefusedOutcomeIsReportedAsATakeoverNotAFailure(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "the lease was lost to another worker", err: driver.ErrLeaseLost},
+		{name: "shutdown already handed the job back", err: driver.ErrInvalidTransition},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			mem := memdriver.New()
+			logs := &syncWriter{}
+			ws := NewWorkers()
+			Register(ws, &funcWorker{fn: func(context.Context, *Job[greetArgs]) error { return nil }})
+			c := newClient(&refusingDriver{Driver: mem, err: tt.err}, Config{Workers: ws, Logger: newTestLogger(logs)})
+
+			if _, err := c.Insert(context.Background(), greetArgs{Name: "ada"}); err != nil {
+				t.Fatalf("Insert: %v", err)
+			}
+			claimed, err := mem.FetchAvailable(context.Background(), defaultQueue, time.Minute, 1)
+			if err != nil {
+				t.Fatalf("FetchAvailable: %v", err)
+			}
+
+			c.runJob(context.Background(), claimed[0])
+
+			out := logs.String()
+			if !strings.Contains(out, "no longer this worker's to finish") {
+				t.Errorf("log does not report the outcome as a takeover:\n%s", out)
+			}
+			if strings.Contains(out, `msg="drover: finalize job"`) {
+				t.Errorf("a refused outcome was reported as a failed write:\n%s", out)
+			}
+		})
+	}
 }
 
 func TestStartExecutesJobToCompletion(t *testing.T) {
@@ -710,19 +904,15 @@ func TestStartKeepsPollingWhileIdle(t *testing.T) {
 		PollInterval: 30 * time.Millisecond,
 	})
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- c.Start(ctx) }()
+	defer cancel()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
 
 	const window = 150 * time.Millisecond
 	time.Sleep(window)
-	cancel()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("Start returned %v, want nil", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("Start did not return after cancellation")
+	if err := c.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop returned %v, want nil", err)
 	}
 
 	fetches := counting.fetches.Load()

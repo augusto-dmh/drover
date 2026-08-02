@@ -25,7 +25,7 @@ Chosen: **at-least-once with lease + heartbeat + rescuer**, with handlers docume
 
 - **Claim**: committed claim with a lease (`leased_until`); running workers heartbeat to extend it; a rescuer sweep re-queues jobs whose lease expired. Rationale over connection-scoped locks: long-open transactions pin the xmin horizon and hold a backend slot per in-flight job.
 - **Retries**: `attempt^4` seconds with ±10% jitter (Sidekiq/River lineage), default max 25 attempts, pluggable `RetryPolicy`. `Cancel` and `Snooze` sentinel errors classify non-retryable and deferred outcomes. Exhausted jobs land in a retained `dead` state with scoped redrive (`drover retry`).
-- **Executor**: fixed pool of N goroutines fed by a fetch loop over channels — not `errgroup` (cancel-on-first-error is the wrong semantic for a queue). Per-job child context with timeout; panic recovery at the job boundary with `debug.Stack()`.
+- **Executor**: fixed pool of N goroutines fed by a fetch loop over channels — not `errgroup` (cancel-on-first-error is the wrong semantic for a queue). Per-job child context with timeout; panic recovery at the job boundary with `debug.Stack()`. (The cancellable child context ships with the worker pool; the per-job *timeout* is deferred to the middleware chain, where RFC-0001 places timeout middleware.)
 - **Shutdown**: stop fetching → drain in-flight with deadline (`WaitGroup`) → cancel per-job contexts → best-effort requeue of still-running jobs. Lease expiry is the crash-path backstop; both paths are required.
 - **Queues**: named queues with weighted random fetch (starvation-free) and an optional strict flag.
 

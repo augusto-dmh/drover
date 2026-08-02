@@ -29,16 +29,29 @@ type e2eWorker struct {
 	mu   sync.Mutex
 	runs map[int64]int
 	fail func(args e2eArgs) error
+	// enter, when set, is called as the job starts, so a test can wait
+	// for work to be genuinely under way rather than sleeping.
+	enter func(id int64)
 }
 
 func (w *e2eWorker) Work(_ context.Context, job *Job[e2eArgs]) error {
 	w.mu.Lock()
 	w.runs[job.ID]++
 	w.mu.Unlock()
+	if w.enter != nil {
+		w.enter(job.ID)
+	}
 	if w.fail != nil {
 		return w.fail(job.Args)
 	}
 	return nil
+}
+
+// waitForState blocks until exactly n rows sit in the given state.
+func waitForState(t *testing.T, pool *pgxpool.Pool, state string, n int) {
+	t.Helper()
+	waitFor(t, func() bool { return countInState(t, pool, state) == n },
+		fmt.Sprintf("%d job(s) to reach %s", n, state))
 }
 
 func newE2EClient(t *testing.T, pool *pgxpool.Pool, worker *e2eWorker) *Client {
@@ -61,23 +74,26 @@ func newE2EClientWith(t *testing.T, pool *pgxpool.Pool, worker *e2eWorker, tune 
 	return c
 }
 
-// runLoop starts c's loop and returns a function that stops it and
-// asserts a clean return.
+// runLoop starts c's pool and returns a function that stops it and
+// asserts a clean shutdown.
 func runLoop(t *testing.T, ctx context.Context, c *Client) func() {
 	t.Helper()
 	loopCtx, cancel := context.WithCancel(ctx)
-	done := make(chan error, 1)
-	go func() { done <- c.Start(loopCtx) }()
+	if err := c.Start(loopCtx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
 	return func() {
 		t.Helper()
-		cancel()
+		defer cancel()
+		done := make(chan error, 1)
+		go func() { done <- c.Stop(context.Background()) }()
 		select {
 		case err := <-done:
 			if err != nil {
-				t.Fatalf("Start returned %v, want nil", err)
+				t.Fatalf("Stop returned %v, want nil", err)
 			}
 		case <-time.After(5 * time.Second):
-			t.Fatal("loop did not stop after cancellation")
+			t.Fatal("pool did not stop")
 		}
 	}
 }
@@ -123,24 +139,13 @@ func TestEndToEndConcurrentLoopsExecuteEachJobExactlyOnce(t *testing.T) {
 		}
 	}
 
-	loopCtx, cancel := context.WithCancel(ctx)
-	done := make(chan error, 2)
-	go func() { done <- first.Start(loopCtx) }()
-	go func() { done <- second.Start(loopCtx) }()
+	stopFirst := runLoop(t, ctx, first)
+	stopSecond := runLoop(t, ctx, second)
 
 	waitFor(t, func() bool { return countInState(t, pool, "completed") == jobs },
 		fmt.Sprintf("all %d jobs to complete", jobs))
-	cancel()
-	for range 2 {
-		select {
-		case err := <-done:
-			if err != nil {
-				t.Fatalf("Start returned %v, want nil", err)
-			}
-		case <-time.After(5 * time.Second):
-			t.Fatal("a loop did not stop after cancellation")
-		}
-	}
+	stopFirst()
+	stopSecond()
 
 	worker.mu.Lock()
 	defer worker.mu.Unlock()
@@ -171,16 +176,11 @@ func TestEndToEndFailedJobIsQueuedForRetryInPostgres(t *testing.T) {
 		t.Fatalf("Insert: %v", err)
 	}
 
-	loopCtx, cancel := context.WithCancel(ctx)
-	done := make(chan error, 1)
-	go func() { done <- c.Start(loopCtx) }()
+	stop := runLoop(t, ctx, c)
 	// An unreachable mail server is the archetypal transient failure: the
 	// job waits out its backoff rather than dying on the first attempt.
 	waitFor(t, func() bool { return countInState(t, pool, "retryable") == 1 }, "job to be queued for retry")
-	cancel()
-	if err := <-done; err != nil {
-		t.Fatalf("Start returned %v, want nil", err)
-	}
+	stop()
 
 	var state string
 	var finalizedAt *time.Time
@@ -467,4 +467,156 @@ func TestEndToEndHandlerSentinelsInPostgres(t *testing.T) {
 	if len(recorded) != 0 {
 		t.Errorf("snoozed job errors = %+v, want none — a snooze is not a failure", recorded)
 	}
+}
+
+// A pool claims through the same SELECT ... FOR UPDATE SKIP LOCKED path
+// a single worker used, so the exactly-once property has to survive
+// several of this process's own workers racing each other for rows —
+// not just several processes.
+func TestEndToEndPoolExecutesEachJobExactlyOnce(t *testing.T) {
+	pool := testdb.NewDB(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+
+	worker := &e2eWorker{runs: make(map[int64]int)}
+	c := newE2EClientWith(t, pool, worker, func(cfg *Config) {
+		cfg.Concurrency = 8
+	})
+
+	const queued = 60
+	ids := make([]int64, 0, queued)
+	for i := 0; i < queued; i++ {
+		row, err := c.Insert(ctx, e2eArgs{N: i})
+		if err != nil {
+			t.Fatalf("Insert: %v", err)
+		}
+		ids = append(ids, row.ID)
+	}
+
+	stop := runLoop(t, ctx, c)
+	waitForState(t, pool, "completed", queued)
+	stop()
+
+	worker.mu.Lock()
+	defer worker.mu.Unlock()
+	for _, id := range ids {
+		if worker.runs[id] != 1 {
+			t.Errorf("job %d ran %d times, want exactly 1", id, worker.runs[id])
+		}
+	}
+}
+
+// A clean shutdown must leave nothing behind: no row still claimed, and
+// therefore nothing waiting out a lease before another worker can touch
+// it.
+func TestEndToEndCleanShutdownLeavesNothingRunning(t *testing.T) {
+	pool := testdb.NewDB(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+
+	worker := &e2eWorker{runs: make(map[int64]int)}
+	c := newE2EClientWith(t, pool, worker, func(cfg *Config) {
+		cfg.Concurrency = 4
+	})
+
+	const queued = 20
+	for i := 0; i < queued; i++ {
+		if _, err := c.Insert(ctx, e2eArgs{N: i}); err != nil {
+			t.Fatalf("Insert: %v", err)
+		}
+	}
+
+	stop := runLoop(t, ctx, c)
+	waitForState(t, pool, "completed", queued)
+	stop()
+
+	if running := countInState(t, pool, "running"); running != 0 {
+		t.Errorf("running rows after a clean shutdown = %d, want 0", running)
+	}
+}
+
+// The shutdown promise that matters under a deploy: work this process
+// could not finish is claimable by another process straight away,
+// instead of sitting claimed until its lease lapses.
+func TestEndToEndUnfinishedJobsAreClaimableByAnotherClient(t *testing.T) {
+	pool := testdb.NewDB(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+
+	entered := make(chan int64, 2)
+	release := make(chan struct{})
+	stubborn := &e2eWorker{
+		runs:  make(map[int64]int),
+		enter: func(id int64) { entered <- id },
+		fail: func(e2eArgs) error {
+			// Ignores cancellation entirely — the case a bounded shutdown
+			// exists for.
+			<-release
+			return nil
+		},
+	}
+
+	first := newE2EClientWith(t, pool, stubborn, func(cfg *Config) {
+		cfg.Concurrency = 2
+		// Long enough that lease expiry cannot be what rescues these jobs:
+		// if they become claimable, the shutdown requeue is why.
+		cfg.LeaseDuration = 10 * time.Minute
+		cfg.RescueInterval = 10 * time.Minute
+	})
+
+	const queued = 2
+	ids := make([]int64, 0, queued)
+	for i := 0; i < queued; i++ {
+		row, err := first.Insert(ctx, e2eArgs{N: i})
+		if err != nil {
+			t.Fatalf("Insert: %v", err)
+		}
+		ids = append(ids, row.ID)
+	}
+
+	loopCtx, cancelLoop := context.WithCancel(ctx)
+	defer cancelLoop()
+	if err := first.Start(loopCtx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	for i := 0; i < queued; i++ {
+		select {
+		case <-entered:
+		case <-time.After(10 * time.Second):
+			t.Fatal("pool did not pick up the jobs")
+		}
+	}
+
+	budget, cancelBudget := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancelBudget()
+	if err := first.Stop(budget); !errors.Is(err, ErrDrainIncomplete) {
+		t.Fatalf("Stop = %v, want an error wrapping ErrDrainIncomplete", err)
+	}
+
+	for _, id := range ids {
+		state, attempt, _ := readJob(t, pool, id)
+		if state != "retryable" {
+			t.Errorf("job %d state = %q after an incomplete shutdown, want retryable", id, state)
+		}
+		if attempt != 1 {
+			t.Errorf("job %d attempt = %d, want it left at 1 by the requeue", id, attempt)
+		}
+	}
+
+	// A second client, standing in for the replacement process a deploy
+	// brings up, finishes the work without waiting out any lease.
+	second := newE2EClientWith(t, pool, &e2eWorker{runs: make(map[int64]int)}, func(cfg *Config) {
+		cfg.Concurrency = 2
+	})
+	stopSecond := runLoop(t, ctx, second)
+	waitForState(t, pool, "completed", queued)
+	stopSecond()
+
+	close(release)
 }

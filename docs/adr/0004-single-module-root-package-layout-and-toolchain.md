@@ -19,7 +19,7 @@ Drover is a library with an optional binary. Go has no enforced project structur
 
 Following `go.dev/doc/modules/layout` and the verified structure of River and Asynq:
 
-- **Layout**: root-package library (`client.go`, `job.go`, `worker.go` at repo root, with runnable `example_*_test.go` files), private code in `internal/`, binary in `cmd/drover/`. Single module; no `pkg/` (absent from the official layout guidance and from River/Asynq alike); multi-module splits deferred until a real consumer needs them.
+- **Layout**: root-package library (`client.go`, `job.go`, `worker.go` at repo root, with runnable `example_*_test.go` files), private code in `internal/`, binary in `cmd/drover/`, runnable demonstrations in `examples/<name>/` (`main` packages only, and never a source of new module dependencies — added for the example app RFC-0001 locks to Cycle C). Single module; no `pkg/` (absent from the official layout guidance and from River/Asynq alike); multi-module splits deferred until a real consumer needs them.
 - **Data access**: pgx v5 native + sqlc — queries in `.sql` files, generated code committed under `internal/dbsqlc/` (no runtime codegen deps), behind a thin driver interface. `database/sql` support is documented future work.
 - **HTTP**: stdlib `net/http` ServeMux (1.22+ patterns) with a hand-rolled `func(Handler) Handler` middleware chain.
 - **Logging/config**: `*slog.Logger` injected via a config struct (config struct over functional options, River-style); binary config via `flag` + env + optional YAML with explicit precedence.

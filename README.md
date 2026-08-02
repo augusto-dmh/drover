@@ -26,6 +26,7 @@ flowchart LR
 
 - **Transactional enqueue** — jobs insert inside your own transaction; no ghost jobs, no outbox needed ([ADR-0002](docs/adr/0002-postgres-only-backend-behind-narrow-storage-interface.md)).
 - **At-least-once, stated plainly** — lease + heartbeat + rescuer; every duplicate source is named and bounded; handlers are idempotent by contract ([ADR-0003](docs/adr/0003-at-least-once-delivery-lease-heartbeat-rescuer.md)).
+- **A real worker pool** — a fixed, configurable number of goroutines claim and run jobs concurrently over a channel, and `Stop` drains in-flight work within a caller-supplied budget instead of leaving shutdown to lease expiry.
 - **Typed jobs** — `JobArgs` + `Worker[T]` generics, no `[]byte` payloads, no reflection.
 - **Stdlib-first** — pgx + sqlc and the standard library; the dependency list stays short enough to read ([ADR-0004](docs/adr/0004-single-module-root-package-layout-and-toolchain.md)).
 
@@ -41,9 +42,22 @@ func (SendEmail) Kind() string { return "send_email" }
 // Worker
 drover.Register(workers, &EmailWorker{}) // implements drover.Worker[SendEmail]
 
+// Concurrency sizes the worker pool; it defaults to 10. A running job
+// holds no connection, so it need not match the database pool's size.
+client, err := drover.NewClient(pool, drover.Config{Workers: workers, Concurrency: 8})
+
 // Enqueue atomically with your own writes
-err := client.InsertTx(ctx, tx, SendEmail{To: user.Email, Template: "welcome"})
+err = client.InsertTx(ctx, tx, SendEmail{To: user.Email, Template: "welcome"})
+
+// Start returns once the pool is running. Stop stops claiming, drains
+// in-flight jobs within the given budget, and returns nil once every
+// one of them has recorded its outcome — or an error naming how many
+// did not finish and were returned to the queue instead.
+err = client.Start(ctx)
+err = client.Stop(shutdownCtx)
 ```
+
+A full runnable version of this, including the retry path and shutdown on SIGINT, lives in [`examples/email`](examples/email).
 
 ## Roadmap
 

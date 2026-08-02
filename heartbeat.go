@@ -15,10 +15,10 @@ import (
 // Beating on a fraction of the lease leaves room to miss one and still
 // renew in time.
 //
-// stop is closed only after the fetch loop has returned, not when the
-// loop's context is cancelled: a cancelled loop is still draining its
-// last job, and that job needs its lease for as long as it runs
-// (AD-018).
+// stop is closed only after every worker has drained, not when the
+// pool's context is cancelled: a cancelled pool is still finishing the
+// jobs it had claimed, and each of them needs its lease for as long as
+// it runs (AD-018).
 func (c *Client) heartbeat(stop <-chan struct{}) {
 	ticker := time.NewTicker(c.heartbeatInterval)
 	defer ticker.Stop()

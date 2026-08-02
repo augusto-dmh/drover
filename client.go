@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -18,6 +19,12 @@ import (
 const (
 	defaultQueue        = "default"
 	defaultPollInterval = time.Second
+
+	// defaultConcurrency is how many jobs one client runs at once when
+	// the caller does not say. It is deliberately not one: a queue that
+	// executes serially by default makes throughput a property of the
+	// slowest handler rather than a choice.
+	defaultConcurrency = 10
 
 	// heartbeatsPerLease is how many renewals fit in one lease by
 	// default. Three leaves two beats of slack: a job survives a missed
@@ -56,6 +63,27 @@ type Config struct {
 	PollInterval time.Duration
 	RetryPolicy  RetryPolicy
 
+	// Concurrency is how many jobs this client executes at once. It
+	// defaults to ten; a value of zero or less is treated as unset.
+	//
+	// It need not match the connection count of the pool the client was
+	// built with. A running job holds no connection: drover takes one to
+	// claim the job and one to record its outcome, and the handler's own
+	// work happens in between, holding nothing.
+	//
+	// That is not the same as the pool size being irrelevant. Claims and
+	// finalizations arrive in bursts — up to Concurrency workers can want
+	// a connection at the same instant — and the heartbeat competes for
+	// the same connections on a deadline of HeartbeatInterval. A renewal
+	// that cannot get a connection in time lets a lease lapse, which is
+	// how a slow database turns into a duplicated job. Leave the
+	// connection pool some headroom above the fetch loop, the heartbeat
+	// and the rescuer rather than sizing it to Concurrency exactly.
+	//
+	// The other cost of a high concurrency is handler-side: sockets,
+	// memory, and load on whatever the handler talks to.
+	Concurrency int
+
 	// LeaseDuration is how long a claimed job may run before the rescuer
 	// treats its worker as dead. It bounds how long work sits idle after
 	// a crash, so a shorter lease recovers faster and a longer one
@@ -86,7 +114,15 @@ type Client struct {
 	leaseDuration     time.Duration
 	heartbeatInterval time.Duration
 	rescueInterval    time.Duration
+	concurrency       int
 	inflight          *inflightSet
+
+	// mu guards runner, which is nil until Start and holds the running
+	// pool thereafter. It is the whole of the client's lifecycle state:
+	// everything else above is configuration and is never written after
+	// construction.
+	mu     sync.Mutex
+	runner *runner
 }
 
 // NewClient returns a Client backed by the given PostgreSQL pool.
@@ -109,6 +145,7 @@ func newClient(drv driver.Driver, cfg Config) *Client {
 		leaseDuration:     cfg.LeaseDuration,
 		heartbeatInterval: cfg.HeartbeatInterval,
 		rescueInterval:    cfg.RescueInterval,
+		concurrency:       cfg.Concurrency,
 		inflight:          newInflightSet(),
 	}
 	if c.workers == nil {
@@ -146,6 +183,9 @@ func newClient(drv driver.Driver, cfg Config) *Client {
 	}
 	if c.rescueInterval <= 0 {
 		c.rescueInterval = c.leaseDuration
+	}
+	if c.concurrency <= 0 {
+		c.concurrency = defaultConcurrency
 	}
 	return c
 }
