@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -62,6 +63,18 @@ type Config struct {
 	Logger       *slog.Logger
 	PollInterval time.Duration
 	RetryPolicy  RetryPolicy
+
+	// Middleware wraps every job this client executes, whatever its
+	// kind. The first element is outermost: it sees a job before the
+	// others and its result after them.
+	//
+	// The chain is composed once, when the client is built, and the
+	// slice is copied — appending to the caller's slice afterwards
+	// changes nothing. A nil element is a programmer error and panics,
+	// because the alternative is a middleware the caller believes is
+	// running: a timeout that was silently dropped looks exactly like a
+	// timeout that has not fired yet.
+	Middleware []Middleware
 
 	// Concurrency is how many jobs this client executes at once. It
 	// defaults to ten; a value of zero or less is treated as unset.
@@ -193,8 +206,20 @@ func newClient(drv driver.Driver, cfg Config) *Client {
 	if c.concurrency <= 0 {
 		c.concurrency = defaultConcurrency
 	}
-	c.chain = wrap(c.dispatch, nil)
+	c.chain = wrap(c.dispatch, checkedMiddleware(cfg.Middleware))
 	return c
+}
+
+// checkedMiddleware validates the configured chain and returns a copy of
+// it. The copy is what makes the client's behaviour independent of a
+// caller who keeps appending to the slice they passed.
+func checkedMiddleware(mws []Middleware) []Middleware {
+	for i, mw := range mws {
+		if mw == nil {
+			panic(fmt.Sprintf("drover: Config.Middleware[%d] is nil", i))
+		}
+	}
+	return slices.Clone(mws)
 }
 
 // Insert enqueues a job in its own transaction. The job is available
