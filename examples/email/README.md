@@ -1,8 +1,10 @@
 # Email pipeline example
 
 A runnable program that shows drover end to end: enqueue a batch of jobs,
-work them concurrently on a pool of workers, retry the ones that fail
-their first delivery attempt, and shut down cleanly on Ctrl-C.
+work them concurrently on a pool of workers wrapped in a middleware
+chain, retry the ones that fail their first delivery attempt, run a
+delayed job on a second, lower-priority queue, and shut down cleanly on
+Ctrl-C.
 
 ## Running it
 
@@ -37,10 +39,28 @@ DATABASE_URL="postgres://postgres:drover@localhost:5432/postgres" \
   would wait sixteen), and a `delivered ... attempt 2` line follows
   shortly after the
   matching failure log.
+- **Middleware chain**: `Config.Middleware` wraps every job with
+  `drover.Timeout` (bounding each delivery, though the stub in
+  `delivery.go` returns too quickly to ever hit it) and `perQueueCounts`,
+  a custom middleware defined in `main.go` that tallies successful
+  deliveries by queue. The client also installs `drover.Logging`
+  outermost of both automatically, which is why every delivery still
+  gets its own "job started"/"job execution finished" log lines without
+  either of those two middleware doing anything about logging
+  themselves.
+- **Delayed job, second queue**: alongside the welcome emails, one
+  digest email is enqueued on a queue named `"digests"`, held back for
+  five seconds by `InsertOpts.ScheduledAt`. `Config.Queues` gives
+  `"default"` four times the weight of `"digests"`, so welcome emails
+  are usually claimed first, but the digest is still worked by the same
+  pool once its five seconds are up — look for a `delivered
+  digest-subscribers@example.com` line shortly after startup.
 - **Shutdown**: press Ctrl-C. The program stops claiming new jobs
   immediately, waits up to 30 seconds for whatever is already running to
   finish, and prints either that everything drained or, if the budget
   ran out, how many jobs did not finish and were returned to the queue.
+  It then prints how many jobs each queue completed, from the counts
+  `perQueueCounts` kept.
 
 ## No external dependencies
 

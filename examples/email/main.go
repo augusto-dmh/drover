@@ -1,8 +1,10 @@
 // Command email is a small, runnable drover pipeline: it enqueues a
-// batch of "welcome email" jobs, works them concurrently on a pool of
-// workers, and retries the deliveries that the flaky stub in delivery.go
-// fails on their first attempt. Send SIGINT (Ctrl-C) to see the
-// graceful shutdown drain whatever is still in flight.
+// batch of "welcome email" jobs plus one delayed "digest" job on a
+// second, lower-priority queue, works them concurrently on a pool of
+// workers wrapped in a small middleware chain, and retries the
+// deliveries that the flaky stub in delivery.go fails on their first
+// attempt. Send SIGINT (Ctrl-C) to see the graceful shutdown drain
+// whatever is still in flight.
 //
 // It needs a reachable PostgreSQL database; see README.md for how to
 // run it.
@@ -14,6 +16,8 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -34,6 +38,22 @@ const recipientCount = 20
 // one job at a time.
 const workerConcurrency = 4
 
+// digestQueue is a second, lower-priority queue: it shares the same
+// worker pool as "default" rather than getting workers of its own, and
+// is only claimed about a fifth as often — see the Queues weight below.
+const digestQueue = "digests"
+
+// digestDelay is how long after startup the one digest job becomes
+// claimable. It is short enough that a reader watching the log does not
+// have to wait long to see a scheduled job come due.
+const digestDelay = 5 * time.Second
+
+// handlerTimeout bounds how long any one delivery may run, enforced by
+// the built-in Timeout middleware. The flaky stub in delivery.go
+// returns immediately either way, so this timeout never actually fires
+// here — it is wired up to show the configuration, not to be exercised.
+const handlerTimeout = 10 * time.Second
+
 // SendWelcomeEmail is the job payload: who to email and which template
 // to render.
 type SendWelcomeEmail struct {
@@ -51,13 +71,34 @@ type EmailWorker struct {
 	drover.WorkerDefaults[SendWelcomeEmail]
 }
 
-// Work implements drover.Worker[SendWelcomeEmail].
+// Work implements drover.Worker[SendWelcomeEmail]. It handles both the
+// immediate "welcome" jobs and the delayed "digest" job the same way:
+// the worker does not need to know which queue a job arrived on.
 func (EmailWorker) Work(_ context.Context, job *drover.Job[SendWelcomeEmail]) error {
 	if err := deliver(job.Args.To, job.Attempt); err != nil {
 		return fmt.Errorf("send %s to %s (attempt %d): %w", job.Args.Template, job.Args.To, job.Attempt, err)
 	}
 	log.Printf("delivered %-24s attempt %d", job.Args.To, job.Attempt)
 	return nil
+}
+
+// perQueueCounts is a custom middleware — the smallest useful one this
+// example can show, wrapping the handler drover already built for
+// logging and the timeout below to add one more concern of its own. It
+// counts each successful delivery by the queue it ran on, so the totals
+// printed at shutdown show the two queues configured in run() being
+// worked from the one shared pool.
+func perQueueCounts(counts *sync.Map) drover.Middleware {
+	return func(next drover.Handler) drover.Handler {
+		return func(ctx context.Context, job *drover.JobRow) error {
+			err := next(ctx, job)
+			if err == nil {
+				n, _ := counts.LoadOrStore(job.Queue, new(int64))
+				atomic.AddInt64(n.(*int64), 1)
+			}
+			return err
+		}
+	}
 }
 
 func main() {
@@ -92,9 +133,18 @@ func run() error {
 	workers := drover.NewWorkers()
 	drover.Register(workers, EmailWorker{})
 
+	counts := &sync.Map{}
 	client, err := drover.NewClient(pool, drover.Config{
 		Workers:     workers,
 		Concurrency: workerConcurrency,
+		// "default" (unset in InsertOpts) is claimed about four times as
+		// often as "digests" — never exclusively, so digests still get
+		// worked promptly even while welcome emails are flowing.
+		Queues: map[string]int{"default": 4, digestQueue: 1},
+		// Timeout is one of the two built-in middleware; perQueueCounts
+		// is a custom one. The client always installs Logging outermost
+		// of both, so per-job logging is unaffected by either.
+		Middleware: []drover.Middleware{drover.Timeout(handlerTimeout), perQueueCounts(counts)},
 	})
 	if err != nil {
 		return fmt.Errorf("build client: %w", err)
@@ -102,6 +152,9 @@ func run() error {
 
 	if err := enqueueBatch(ctx, client); err != nil {
 		return fmt.Errorf("enqueue batch: %w", err)
+	}
+	if err := enqueueDigest(ctx, client); err != nil {
+		return fmt.Errorf("enqueue digest: %w", err)
 	}
 
 	if err := client.Start(ctx); err != nil {
@@ -124,6 +177,11 @@ func run() error {
 		return fmt.Errorf("shutdown incomplete: %w", err)
 	}
 	log.Print("shutdown complete: every in-flight job finished and recorded its outcome")
+
+	counts.Range(func(queue, n any) bool {
+		log.Printf("completed %d job(s) on queue %q", atomic.LoadInt64(n.(*int64)), queue)
+		return true
+	})
 	return nil
 }
 
@@ -143,5 +201,22 @@ func enqueueBatch(ctx context.Context, client *drover.Client) error {
 	}
 	log.Printf("enqueued %d emails; %d of them will fail their first delivery attempt and retry",
 		recipientCount, flaky)
+	return nil
+}
+
+// enqueueDigest inserts one digest email on digestQueue, held back by
+// digestDelay: InsertOpts is what lets a caller pick a job's queue and
+// earliest run time, instead of every job running immediately on
+// "default".
+func enqueueDigest(ctx context.Context, client *drover.Client) error {
+	digest := SendWelcomeEmail{To: "digest-subscribers@example.com", Template: "digest"}
+	_, err := client.Insert(ctx, digest, &drover.InsertOpts{
+		Queue:       digestQueue,
+		ScheduledAt: time.Now().Add(digestDelay),
+	})
+	if err != nil {
+		return err
+	}
+	log.Printf("scheduled a digest email on queue %q, claimable in %s", digestQueue, digestDelay)
 	return nil
 }
