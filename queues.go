@@ -8,6 +8,17 @@ import (
 	"strings"
 )
 
+// maxQueueWeight bounds a configured weight. It is far past any ratio a
+// priority scheme expresses — a queue weighted a thousand against one is
+// already served first virtually always — and it makes the running total
+// in weightedOrder unable to overflow however many queues are
+// configured. Widening int64 over int does not achieve that: int is 64
+// bits on every 64-bit build, so the conversion is a no-op and two
+// enormous weights are enough to wrap the sum negative. A negative total
+// reaches rand.Int64N, which panics, on the fetch goroutine, which has
+// nothing above it to recover.
+const maxQueueWeight = 100_000
+
 // weightedQueue is one configured queue and its relative share of the
 // fetch loop's attention.
 type weightedQueue struct {
@@ -39,10 +50,15 @@ func checkedQueues(queues map[string]int, logger *slog.Logger) []weightedQueue {
 		if name == "" {
 			panic("drover: Config.Queues contains an empty queue name")
 		}
-		if weight < 1 {
+		switch {
+		case weight < 1:
 			logger.Warn("drover: queue weight must be at least one; using one instead",
 				"queue", name, "weight", weight)
 			weight = 1
+		case weight > maxQueueWeight:
+			logger.Warn("drover: queue weight is above the maximum; using the maximum instead",
+				"queue", name, "weight", weight, "maximum", maxQueueWeight)
+			weight = maxQueueWeight
 		}
 		out = append(out, weightedQueue{name: name, weight: weight})
 	}
@@ -64,24 +80,24 @@ func checkedQueues(queues map[string]int, logger *slog.Logger) []weightedQueue {
 // within the same round, rather than waiting for a sampling that may not
 // come for a long time.
 //
-// dst, if it has room, is reused so a fetch loop running every poll
-// interval does not allocate a fresh slice each time.
+// dst and scratch are both reused when they have room, so a fetch loop
+// running every poll interval allocates nothing per round. scratch holds
+// the queues still unpicked; dst receives the ordering.
 //
 // The randomness comes from math/rand/v2 directly and is not injectable.
 // A test proves the distribution over many samples rather than pinning
 // one draw, the same way the retry jitter is tested (AD-017).
-func weightedOrder(qs []weightedQueue, dst []string) []string {
-	dst = dst[:0]
+func weightedOrder(qs []weightedQueue, dst []string, scratch []weightedQueue) ([]string, []weightedQueue) {
+	dst, scratch = dst[:0], scratch[:0]
 	if len(qs) == 0 {
-		return dst
+		return dst, scratch
 	}
 	if len(qs) == 1 {
-		return append(dst, qs[0].name)
+		return append(dst, qs[0].name), scratch
 	}
 
-	// Summed as int64 so a caller who expresses priority with very large
-	// weights cannot overflow the running total and invert the ordering
-	// they asked for.
+	// Cannot overflow: checkedQueues caps each weight at maxQueueWeight,
+	// so the total is bounded by that times the number of queues.
 	var total int64
 	for _, q := range qs {
 		total += int64(q.weight)
@@ -89,8 +105,7 @@ func weightedOrder(qs []weightedQueue, dst []string) []string {
 
 	// Copied because selection consumes the set: each pick is removed so
 	// the next is drawn from what is left.
-	remaining := make([]weightedQueue, len(qs))
-	copy(remaining, qs)
+	remaining := append(scratch, qs...)
 
 	for len(remaining) > 0 {
 		pick := rand.Int64N(total) //nolint:gosec // queue selection, not a secret
@@ -110,9 +125,15 @@ func weightedOrder(qs []weightedQueue, dst []string) []string {
 
 		dst = append(dst, remaining[idx].name)
 		total -= int64(remaining[idx].weight)
-		remaining = slices.Delete(remaining, idx, idx+1)
+
+		// Swap-removed rather than shifted: the accumulator above walks
+		// whatever order the set happens to be in, so reordering what is
+		// left cannot change any queue's probability, and this keeps the
+		// whole selection linear per pick instead of copying the tail.
+		remaining[idx] = remaining[len(remaining)-1]
+		remaining = remaining[:len(remaining)-1]
 	}
-	return dst
+	return dst, remaining
 }
 
 // queueNames is the configured order, for a log record that has to name
