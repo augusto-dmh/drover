@@ -186,4 +186,14 @@ type Driver interface {
 	// no error and gives back the attempt the claim consumed, floored at
 	// zero, so snoozing can never exhaust a job's attempts.
 	MarkSnoozed(ctx context.Context, lease Lease, runAt time.Time) error
+
+	// Stats reports what the queues hold at this instant: a depth per
+	// queue and state, and how long the oldest job each queue could hand a
+	// worker has been waiting.
+	//
+	// Both readings are taken by the store, and the age in particular is
+	// subtracted there, for the same reason lease durations are passed
+	// rather than deadlines: the clock that decides a job is due is the
+	// only one that can say how late it is.
+	Stats(ctx context.Context) (*Stats, error)
 }
