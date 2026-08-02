@@ -110,10 +110,10 @@ explain *why* the index exists and what breaks without it.
 **Requirement**: OBS-07
 
 **Done when**:
-- [ ] Migration applies cleanly on a fresh database and on one already at version 002
-- [ ] An integration test asserts the index exists after migration
-- [ ] The file carries a comment explaining the sequential-scan problem it solves (D-11)
-- [ ] Gate passes: `go test -race ./... && go test -race -tags=integration ./...`
+- [x] Migration applies cleanly on a fresh database and on one already at version 002
+- [x] An integration test asserts the index exists after migration
+- [x] The file carries a comment explaining the sequential-scan problem it solves (D-11)
+- [x] Gate passes: `go test -race ./... && go test -race -tags=integration ./...`
 
 **Tests**: integration
 **Gate**: full
@@ -131,9 +131,9 @@ claimability predicate, not a re-derived one.
 **Requirement**: OBS-06, OBS-07
 
 **Done when**:
-- [ ] `QueueDepths :many` and `OldestClaimable :many` exist per the design's SQL
-- [ ] `sqlc generate` run and `internal/dbsqlc` committed; `git diff --exit-code internal/dbsqlc` is clean after a regenerate
-- [ ] Gate passes: `go build ./... && go vet ./...`
+- [x] `QueueDepths :many` and `OldestClaimable :many` exist per the design's SQL
+- [x] `sqlc generate` run and `internal/dbsqlc` committed; `git diff --exit-code internal/dbsqlc` is clean after a regenerate
+- [x] Gate passes: `go build ./... && go vet ./...`
 
 **Tests**: none (generated code is never asserted on directly — T4 covers the behaviour)
 **Gate**: build
@@ -151,12 +151,12 @@ claimability predicate, not a re-derived one.
 **Requirement**: OBS-06, OBS-07
 
 **Done when**:
-- [ ] `driver.QueueDepth`, `driver.QueueAge`, `driver.Stats` types defined per the design
-- [ ] `memdriver.Stats` counts only `available`, `scheduled`, `retryable`, `running`, `dead`
-- [ ] Oldest age uses the claimable predicate — a future-scheduled job does not contribute
-- [ ] A queue with no claimable jobs yields no age row (the caller seeds zero — spec ASM-07)
-- [ ] Adding `Stats` here does **not** yet change the `Driver` interface, so the tree builds
-- [ ] Gate passes: `go test -race ./...`
+- [x] `driver.QueueDepth`, `driver.QueueAge`, `driver.Stats` types defined per the design
+- [x] `memdriver.Stats` counts only `available`, `scheduled`, `retryable`, `running`, `dead`
+- [x] Oldest age uses the claimable predicate — a future-scheduled job does not contribute
+- [x] A queue with no claimable jobs yields no age row (the caller seeds zero — spec ASM-07)
+- [x] Adding `Stats` here does **not** yet change the `Driver` interface, so the tree builds
+- [x] Gate passes: `go test -race ./...`
 
 **Tests**: unit
 **Gate**: quick
@@ -173,10 +173,10 @@ claimability predicate, not a re-derived one.
 **Requirement**: OBS-06, OBS-07
 
 **Done when**:
-- [ ] Returns the same shape as `memdriver.Stats` for the same data — this equivalence is the point of D-4
-- [ ] Ages are computed by the database clock, never in Go (AD-020, ASM-09)
-- [ ] Integration tests cover: depth per state and queue; a future-scheduled job excluded from age; a `dead` job counted; an empty database yielding empty slices rather than an error
-- [ ] Gate passes: `go test -race ./... && go test -race -tags=integration ./...`
+- [x] Returns the same shape as `memdriver.Stats` for the same data — this equivalence is the point of D-4
+- [x] Ages are computed by the database clock, never in Go (AD-020, ASM-09)
+- [x] Integration tests cover: depth per state and queue; a future-scheduled job excluded from age; a `dead` job counted; an empty database yielding empty slices rather than an error
+- [x] Gate passes: `go test -race ./... && go test -race -tags=integration ./...`
 
 **Tests**: integration
 **Gate**: full
@@ -192,10 +192,10 @@ claimability predicate, not a re-derived one.
 **Requirement**: OBS-06, OBS-07
 
 **Done when**:
-- [ ] `Stats(ctx context.Context) (*Stats, error)` on the interface, documented in the
+- [x] `Stats(ctx context.Context) (*Stats, error)` on the interface, documented in the
       style of its neighbours
-- [ ] Whole tree builds; no test changes needed
-- [ ] Gate passes: `go build ./... && go vet ./...` plus `go test -race ./...`, plus lint (phase close)
+- [x] Whole tree builds; no test changes needed
+- [x] Gate passes: `go build ./... && go vet ./...` plus `go test -race ./...`, plus lint (phase close)
 
 **Tests**: none (no new behaviour — both implementations and their tests already exist)
 **Gate**: build
