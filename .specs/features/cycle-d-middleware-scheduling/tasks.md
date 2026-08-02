@@ -90,7 +90,10 @@ Covers: SCHED-02, SCHED-03 · Story 4 AC4, AC7, AC8, AC9
 Verify: quick gate, plus `go test -race -tags=integration ./internal/pgdriver/...`. Tests
 assert a future time stores `scheduled` and is not returned by a fetch before it is due but
 is after, that zero and past times store `available` and are immediately claimable, and that
-both drivers agree. Integration asserts the state is decided by the database clock.
+both drivers agree. Integration exercises the state against a real Postgres, but does **not**
+prove the decision is the database's: the container and the test share a host clock, so a
+client-side decision would pass identically. That property is asserted by the SQL and by
+AD-035, and remains unsensed — see the G-5 entry in `validation.md`.
 
 **T3.2 — `InsertOpts` on the public API**
 Files: `client.go`, all call sites (`client_test.go`, `client_integration_test.go`,

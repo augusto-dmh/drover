@@ -246,6 +246,10 @@ func newClient(drv driver.Driver, cfg Config) *Client {
 // composed here and now: wrap closes over each middleware, not over the
 // slice, so once construction returns there is nothing left for a later
 // append to reach. A defensive copy would only look like the reason.
+//
+// The returned slice is therefore the caller's, and must stay
+// composed-from and never stored. Anything that retained it would
+// reintroduce the aliasing this note explains away.
 func checkedMiddleware(mws []Middleware) []Middleware {
 	for i, mw := range mws {
 		if mw == nil {
