@@ -50,7 +50,7 @@ func Example() {
 		log.Fatal(err)
 	}
 
-	if _, err := client.Insert(ctx, SendEmail{To: "ada@example.com", Template: "welcome"}); err != nil {
+	if _, err := client.Insert(ctx, SendEmail{To: "ada@example.com", Template: "welcome"}, nil); err != nil {
 		log.Fatal(err)
 	}
 

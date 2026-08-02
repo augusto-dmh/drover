@@ -137,7 +137,7 @@ func enqueueBatch(ctx context.Context, client *drover.Client) error {
 		if isFlaky(to) {
 			flaky++
 		}
-		if _, err := client.Insert(ctx, SendWelcomeEmail{To: to, Template: "welcome"}); err != nil {
+		if _, err := client.Insert(ctx, SendWelcomeEmail{To: to, Template: "welcome"}, nil); err != nil {
 			return err
 		}
 	}

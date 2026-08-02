@@ -153,7 +153,7 @@ func TestConfiguredMiddlewareWrapsTheWorkerOutermostFirst(t *testing.T) {
 		cfg.Middleware = []Middleware{note("outer"), note("inner")}
 	})
 
-	row, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"})
+	row, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"}, nil)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
@@ -189,7 +189,7 @@ func TestMiddlewareCanRefuseAJobWithoutRunningTheWorker(t *testing.T) {
 		}}
 	})
 
-	row, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"})
+	row, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"}, nil)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
@@ -226,7 +226,7 @@ func TestMiddlewareContextReachesTheWorker(t *testing.T) {
 		}}
 	})
 
-	row, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"})
+	row, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"}, nil)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
@@ -267,7 +267,7 @@ func TestMiddlewareCancellationDoesNotReachTheFinalizeContext(t *testing.T) {
 		}}
 	})
 
-	row, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"})
+	row, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"}, nil)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
@@ -299,11 +299,11 @@ func TestPanickingMiddlewareDoesNotKillThePool(t *testing.T) {
 		}}
 	})
 
-	bad, err := h.client.Insert(context.Background(), greetArgs{Name: "explode"})
+	bad, err := h.client.Insert(context.Background(), greetArgs{Name: "explode"}, nil)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
-	good, err := h.client.Insert(context.Background(), greetArgs{Name: "fine"})
+	good, err := h.client.Insert(context.Background(), greetArgs{Name: "fine"}, nil)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
@@ -392,7 +392,7 @@ func TestLoggingReportsOneStartAndOneEndPerSuccessfulJob(t *testing.T) {
 	Register(ws, &funcWorker{fn: func(context.Context, *Job[greetArgs]) error { return nil }})
 	h := startLoop(t, mem, mem, ws)
 
-	row, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"})
+	row, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"}, nil)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
@@ -432,7 +432,7 @@ func TestLoggingReportsAFailedExecutionAtWarnNotError(t *testing.T) {
 		cfg.RetryPolicy = atTimePolicy{at: time.Now().Add(time.Hour)}
 	})
 
-	row, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"})
+	row, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"}, nil)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
@@ -489,7 +489,7 @@ func TestLoggingRunsEvenWhenTheCallerConfiguresMiddleware(t *testing.T) {
 		}}
 	})
 
-	row, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"})
+	row, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"}, nil)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
@@ -620,7 +620,7 @@ func TestTimedOutJobIsFinalizedAndRetried(t *testing.T) {
 		cfg.RetryPolicy = atTimePolicy{at: time.Now().Add(time.Hour)}
 	})
 
-	row, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"})
+	row, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"}, nil)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
@@ -653,7 +653,7 @@ func TestShutdownCancellationReachesAHandlerUnderATimeout(t *testing.T) {
 		cfg.Middleware = []Middleware{Timeout(time.Hour)}
 	})
 
-	if _, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"}); err != nil {
+	if _, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"}, nil); err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
 	select {

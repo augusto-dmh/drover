@@ -36,7 +36,7 @@ func insertN(t *testing.T, c *Client, n int) []int64 {
 	t.Helper()
 	ids := make([]int64, 0, n)
 	for i := 0; i < n; i++ {
-		row, err := c.Insert(context.Background(), greetArgs{Name: "ada"})
+		row, err := c.Insert(context.Background(), greetArgs{Name: "ada"}, nil)
 		if err != nil {
 			t.Fatalf("Insert: %v", err)
 		}
@@ -214,13 +214,13 @@ func TestOneMisbehavingJobDoesNotStallThePool(t *testing.T) {
 
 	c := newPoolClient(mem, ws, 3, nil)
 	for _, name := range []string{"panic", "block"} {
-		if _, err := c.Insert(context.Background(), greetArgs{Name: name}); err != nil {
+		if _, err := c.Insert(context.Background(), greetArgs{Name: name}, nil); err != nil {
 			t.Fatalf("Insert: %v", err)
 		}
 	}
 	healthy := make([]int64, 0, 4)
 	for i := 0; i < 4; i++ {
-		row, err := c.Insert(context.Background(), greetArgs{Name: "ada"})
+		row, err := c.Insert(context.Background(), greetArgs{Name: "ada"}, nil)
 		if err != nil {
 			t.Fatalf("Insert: %v", err)
 		}

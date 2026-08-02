@@ -228,10 +228,32 @@ func checkedMiddleware(mws []Middleware) []Middleware {
 	return slices.Clone(mws)
 }
 
-// Insert enqueues a job in its own transaction. The job is available
-// to workers as soon as Insert returns.
-func (c *Client) Insert(ctx context.Context, args JobArgs) (*JobRow, error) {
-	params, err := insertParamsFor(args)
+// InsertOpts are the per-job choices made at enqueue time. A nil
+// *InsertOpts, or a zero value, means the defaults: the "default" queue,
+// runnable immediately.
+type InsertOpts struct {
+	// Queue is which named queue the job waits in. Empty means
+	// "default".
+	//
+	// A queue no running client is configured to work is not an error:
+	// the process that enqueues a job is very often not the one that
+	// runs it, so the job simply waits until something works that queue.
+	Queue string
+
+	// ScheduledAt is the earliest time the job may run. The zero value
+	// means as soon as possible.
+	//
+	// It is a floor, not a promise: the job becomes claimable then, and
+	// runs once a worker is free to take it. A time in the past is
+	// treated as now rather than rejected, so a caller computing a delay
+	// from a stale clock still enqueues a runnable job.
+	ScheduledAt time.Time
+}
+
+// Insert enqueues a job in its own transaction. The job is available to
+// workers as soon as Insert returns, unless opts delays it.
+func (c *Client) Insert(ctx context.Context, args JobArgs, opts *InsertOpts) (*JobRow, error) {
+	params, err := insertParamsFor(args, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -245,8 +267,8 @@ func (c *Client) Insert(ctx context.Context, args JobArgs) (*JobRow, error) {
 // InsertTx enqueues a job inside the caller's transaction: the job
 // exists if and only if tx commits, so a domain write and its job are
 // atomic.
-func (c *Client) InsertTx(ctx context.Context, tx pgx.Tx, args JobArgs) (*JobRow, error) {
-	params, err := insertParamsFor(args)
+func (c *Client) InsertTx(ctx context.Context, tx pgx.Tx, args JobArgs, opts *InsertOpts) (*JobRow, error) {
+	params, err := insertParamsFor(args, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -257,7 +279,7 @@ func (c *Client) InsertTx(ctx context.Context, tx pgx.Tx, args JobArgs) (*JobRow
 	return rowFromDriver(row), nil
 }
 
-func insertParamsFor(args JobArgs) (driver.InsertParams, error) {
+func insertParamsFor(args JobArgs, opts *InsertOpts) (driver.InsertParams, error) {
 	kind := args.Kind()
 	if kind == "" {
 		return driver.InsertParams{}, ErrInvalidKind
@@ -266,7 +288,17 @@ func insertParamsFor(args JobArgs) (driver.InsertParams, error) {
 	if err != nil {
 		return driver.InsertParams{}, fmt.Errorf("drover: marshal args for kind %q: %w", kind, err)
 	}
-	return driver.InsertParams{Kind: kind, Queue: defaultQueue, Args: encoded}, nil
+
+	params := driver.InsertParams{Kind: kind, Queue: defaultQueue, Args: encoded}
+	if opts != nil {
+		if opts.Queue != "" {
+			params.Queue = opts.Queue
+		}
+		// Passed through as the zero time when unset, which the driver
+		// reads as "now" and resolves against the store's own clock.
+		params.ScheduledAt = opts.ScheduledAt
+	}
+	return params, nil
 }
 
 func rowFromDriver(row *driver.JobRow) *JobRow {
