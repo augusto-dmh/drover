@@ -1,6 +1,29 @@
+-- A null scheduled_at means "now". The state follows from the same
+-- comparison the fetch predicate makes, evaluated by the database rather
+-- than the client: a job due later waits in scheduled, one due now is
+-- available. Deciding this on the client would let a machine running
+-- fast or slow write a state this database disagrees with, and the state
+-- column is what an operator is shown.
+--
+-- now() is transaction_timestamp(), so both readings here are the same
+-- instant and the stored time can never disagree with the state derived
+-- from it. On the InsertTx path that instant is the caller's transaction
+-- start, not the insert, so a job enqueued late in a long transaction
+-- can be recorded scheduled while already due. Nothing is delayed by it:
+-- the fetch predicate compares scheduled_at against its own now() and
+-- claims the row on the next poll. clock_timestamp() would fix the label
+-- and break the guarantee — being volatile, its two occurrences would
+-- evaluate at different instants and could disagree for real.
 -- name: InsertJob :one
-INSERT INTO drover_jobs (kind, queue, args)
-VALUES ($1, $2, $3)
+INSERT INTO drover_jobs (kind, queue, args, scheduled_at, state)
+VALUES (
+    $1, $2, $3,
+    coalesce(sqlc.narg(scheduled_at)::timestamptz, now()),
+    CASE WHEN coalesce(sqlc.narg(scheduled_at)::timestamptz, now()) > now()
+         THEN 'scheduled'::drover_job_state
+         ELSE 'available'::drover_job_state
+    END
+)
 RETURNING *;
 
 -- Lease deadlines are computed here, from the database clock, because

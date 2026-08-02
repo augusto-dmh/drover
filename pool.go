@@ -11,20 +11,30 @@ import (
 	"github.com/augusto-dmh/drover/internal/driver"
 )
 
-// runner is one queue's running pool: a fetch loop, a fixed set of
-// worker goroutines, and the lifecycle state that starts and stops them
-// as a unit.
+// runner is one running pool: a fetch loop, a fixed set of worker
+// goroutines, and the lifecycle state that starts and stops them as a
+// unit.
 //
 // It is a value created by Start and finished by Stop rather than a set
 // of fields on Client, because all of it is per-run state. A client that
 // has never started holds none of it, so there is no half-initialized
-// pool to reason about — and the queue is a field rather than an
-// assumption, so a second queue is a second runner rather than a rewrite
-// of this one.
+// pool to reason about.
+//
+// One runner serves every configured queue. A second queue is another
+// entry in the weighted set the fetch loop samples, not another pool:
+// splitting the pool per queue would pin workers to a queue that may be
+// idle while another backs up.
 type runner struct {
 	client      *Client
-	queue       string
+	queues      []weightedQueue
 	concurrency int
+
+	// order is the ordering weightedOrder fills each round, and pick is
+	// the scratch it consumes while drawing it. Both belong to the fetch
+	// loop goroutine alone, and both are reused so a round allocates
+	// nothing.
+	order []string
+	pick  []weightedQueue
 
 	// jobs is deliberately unbuffered: a completed send means a worker
 	// has taken the row, so no claimed job is ever parked in a buffer
@@ -72,8 +82,10 @@ func newRunner(ctx context.Context, c *Client) *runner {
 
 	r := &runner{
 		client:           c,
-		queue:            defaultQueue,
+		queues:           c.queues,
 		concurrency:      c.concurrency,
+		order:            make([]string, 0, len(c.queues)),
+		pick:             make([]weightedQueue, 0, len(c.queues)),
 		jobs:             make(chan *driver.JobRow),
 		slots:            make(chan struct{}, c.concurrency),
 		stopFetch:        make(chan struct{}),
@@ -155,7 +167,7 @@ func (r *runner) stop(ctx context.Context) error {
 // already running, then release the machinery that supported it.
 func (r *runner) drain(ctx context.Context) error {
 	c := r.client
-	c.logger.Info("drover: worker pool stopping", "queue", r.queue)
+	c.logger.Info("drover: worker pool stopping", "queues", queueNames(r.queues))
 
 	// Released once nothing is left to run under it.
 	defer r.cancelJobs()
@@ -188,7 +200,7 @@ func (r *runner) drain(ctx context.Context) error {
 	close(r.stopHeartbeat)
 	r.background.Wait()
 
-	c.logger.Info("drover: worker pool stopped", "queue", r.queue)
+	c.logger.Info("drover: worker pool stopped", "queues", queueNames(r.queues))
 	return err
 }
 
@@ -226,7 +238,7 @@ func (r *runner) escalate() error {
 	r.cancelJobs()
 
 	r.client.logger.Warn("drover: shutdown deadline reached with jobs still running",
-		"queue", r.queue, "jobs", len(stranded))
+		"queues", queueNames(r.queues), "jobs", len(stranded))
 	r.requeueAll(stranded)
 
 	return fmt.Errorf("%w: %d job(s) still running, returned to the queue",
@@ -347,33 +359,13 @@ func (r *runner) fetch() {
 			return
 		}
 
-		rows, err := c.drv.FetchAvailable(r.fetchCtx, r.queue, c.leaseDuration, n)
-		if err != nil {
+		rows := r.claimRound(n)
+		if rows == nil && r.stopping() {
 			r.releaseSlots(n)
-			if r.stopping() {
-				return
-			}
-			c.logger.Error("drover: fetch jobs", "error", err)
-			if !r.sleep() {
-				return
-			}
-			continue
+			return
 		}
 
-		// A driver that hands back more rows than the limit allowed has
-		// claimed work this pool has no worker for. Holding it would
-		// recreate exactly the state the slot accounting exists to
-		// prevent — rows running and leased with nothing executing them —
-		// so the surplus goes straight back (AD-022).
-		if len(rows) > n {
-			surplus := rows[n:]
-			c.logger.Warn("drover: driver returned more jobs than requested; returning the surplus",
-				"queue", r.queue, "requested", n, "returned", len(rows))
-			r.requeueAll(leasesOf(surplus))
-			rows = rows[:n]
-		}
-
-		// The driver may also hand back fewer rows than there was room for.
+		// The round may claim fewer jobs than there was room for.
 		r.releaseSlots(n - len(rows))
 		if len(rows) == 0 {
 			if !r.sleep() {
@@ -383,11 +375,10 @@ func (r *runner) fetch() {
 		}
 
 		for i, row := range rows {
-			// Tracked from the claim, not from the start of execution: a
-			// row waiting to be handed to a worker is already running and
-			// already leased, and the heartbeat has to cover that window
-			// or the rescuer will take the job away from a pool that is
-			// about to run it.
+			// Already tracked by claimRound, from the moment the claim
+			// returned. Re-added because the set is keyed by job id, so
+			// this is idempotent, and because it keeps the invariant
+			// legible at the point a row changes hands.
 			c.inflight.add(driver.Lease{ID: row.ID, Attempt: row.Attempt})
 			select {
 			case r.jobs <- row:
@@ -397,6 +388,79 @@ func (r *runner) fetch() {
 			}
 		}
 	}
+}
+
+// claimRound claims up to capacity jobs for one pass of the fetch loop,
+// visiting the queues in a freshly weighted order.
+//
+// The remaining capacity is what bounds each individual claim, so the
+// round as a whole never takes more jobs than the pool has idle workers
+// — AD-022's invariant, held across queues rather than within one.
+//
+// Every configured queue is visited before the round gives up, so an
+// empty queue that happened to be sampled first costs one query rather
+// than a whole poll interval of latency for the queues behind it. That
+// is also what keeps weighting from starving anything: a low weight
+// makes a queue likely to be tried last, never skipped.
+//
+// A claim that fails ends the round rather than failing it. Rows already
+// claimed from earlier queues are running and leased, so abandoning them
+// here would strand each one until its lease lapsed; they are returned
+// for dispatch and the error is reported. A round that claimed nothing
+// returns nil, which the caller distinguishes from an empty result only
+// to notice shutdown.
+func (r *runner) claimRound(capacity int) []*driver.JobRow {
+	c := r.client
+	var claimed []*driver.JobRow
+	remaining := capacity
+
+	r.order, r.pick = weightedOrder(r.queues, r.order, r.pick)
+	for _, queue := range r.order {
+		rows, err := c.drv.FetchAvailable(r.fetchCtx, queue, c.leaseDuration, remaining)
+		if err != nil {
+			if r.stopping() {
+				return claimed
+			}
+			c.logger.Error("drover: fetch jobs", "queue", queue, "error", err)
+			return claimed
+		}
+
+		// Tracked here rather than when the row is handed to a worker,
+		// because the lease starts the instant the claim returns. A round
+		// walks the remaining queues before it dispatches anything, so
+		// leaving this to the dispatch loop would hold rows claimed from
+		// the first queue unheartbeated across every later claim — and
+		// hide them from the snapshot a shutdown takes to decide what is
+		// still in flight.
+		for _, row := range rows {
+			c.inflight.add(driver.Lease{ID: row.ID, Attempt: row.Attempt})
+		}
+
+		// A driver that hands back more rows than the limit allowed has
+		// claimed work this pool has no worker for. Holding it would
+		// recreate exactly the state the slot accounting exists to
+		// prevent — rows running and leased with nothing executing them —
+		// so the surplus goes straight back (AD-022).
+		if len(rows) > remaining {
+			surplus := rows[remaining:]
+			c.logger.Warn("drover: driver returned more jobs than requested; returning the surplus",
+				"queue", queue, "requested", remaining, "returned", len(rows))
+			surplusLeases := leasesOf(surplus)
+			r.requeueAll(surplusLeases)
+			// Handed back, so no longer this pool's to keep alive.
+			for _, lease := range surplusLeases {
+				c.inflight.remove(lease)
+			}
+			rows = rows[:remaining]
+		}
+
+		claimed = append(claimed, rows...)
+		remaining -= len(rows)
+		if remaining == 0 || r.stopping() {
+			break
+		}
+	}
+	return claimed
 }
 
 // work runs jobs off the hand-off channel until it closes, returning the

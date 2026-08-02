@@ -5,8 +5,11 @@ import (
 	"errors"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"go.uber.org/goleak"
 
 	"github.com/augusto-dmh/drover/internal/memdriver"
 )
@@ -37,7 +40,7 @@ func TestInsertPersistsTypedJob(t *testing.T) {
 	mem := memdriver.New()
 	c := newClient(mem, Config{})
 
-	row, err := c.Insert(context.Background(), greetArgs{Name: "ada"})
+	row, err := c.Insert(context.Background(), greetArgs{Name: "ada"}, nil)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
@@ -64,7 +67,7 @@ func TestInsertRejectsEmptyKind(t *testing.T) {
 	mem := memdriver.New()
 	c := newClient(mem, Config{})
 
-	_, err := c.Insert(context.Background(), emptyKindArgs{})
+	_, err := c.Insert(context.Background(), emptyKindArgs{}, nil)
 
 	if !errors.Is(err, ErrInvalidKind) {
 		t.Fatalf("error = %v, want ErrInvalidKind", err)
@@ -77,7 +80,7 @@ func TestInsertWrapsMarshalFailure(t *testing.T) {
 	mem := memdriver.New()
 	c := newClient(mem, Config{})
 
-	_, err := c.Insert(context.Background(), badArgs{})
+	_, err := c.Insert(context.Background(), badArgs{}, nil)
 
 	if err == nil {
 		t.Fatal("Insert succeeded with unmarshalable args")
@@ -93,10 +96,10 @@ func TestInsertTxValidatesBeforeTouchingTransaction(t *testing.T) {
 	mem := memdriver.New()
 	c := newClient(mem, Config{})
 
-	if _, err := c.InsertTx(context.Background(), nil, emptyKindArgs{}); !errors.Is(err, ErrInvalidKind) {
+	if _, err := c.InsertTx(context.Background(), nil, emptyKindArgs{}, nil); !errors.Is(err, ErrInvalidKind) {
 		t.Fatalf("InsertTx empty kind: %v, want ErrInvalidKind", err)
 	}
-	if _, err := c.InsertTx(context.Background(), nil, badArgs{}); err == nil || !strings.Contains(err.Error(), `kind "bad"`) {
+	if _, err := c.InsertTx(context.Background(), nil, badArgs{}, nil); err == nil || !strings.Contains(err.Error(), `kind "bad"`) {
 		t.Fatalf("InsertTx marshal failure: %v, want wrapped error naming the kind", err)
 	}
 	assertNothingPersisted(t, mem)
@@ -242,5 +245,102 @@ func TestTimingConfigFallsBackToUsableValues(t *testing.T) {
 					c.heartbeatInterval, c.leaseDuration)
 			}
 		})
+	}
+}
+
+func TestInsertOptsChooseQueueAndSchedule(t *testing.T) {
+	t.Parallel()
+
+	future := time.Now().Add(time.Hour)
+	tests := []struct {
+		name      string
+		opts      *InsertOpts
+		wantQueue string
+		wantState JobState
+		scheduled bool
+	}{
+		{"nil opts keep today's defaults", nil, "default", StateAvailable, false},
+		{"a zero value is the same as nil", &InsertOpts{}, "default", StateAvailable, false},
+		{"an empty queue name means default", &InsertOpts{Queue: ""}, "default", StateAvailable, false},
+		{"a named queue is stored", &InsertOpts{Queue: "critical"}, "critical", StateAvailable, false},
+		{"a future time waits", &InsertOpts{ScheduledAt: future}, "default", StateScheduled, true},
+		{
+			"a queue and a delay together",
+			&InsertOpts{Queue: "digest", ScheduledAt: future},
+			"digest", StateScheduled, true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			c := newClient(memdriver.New(), Config{})
+
+			row, err := c.Insert(context.Background(), greetArgs{Name: "ada"}, tt.opts)
+			if err != nil {
+				t.Fatalf("Insert: %v", err)
+			}
+			if row.Queue != tt.wantQueue {
+				t.Errorf("Queue = %q, want %q", row.Queue, tt.wantQueue)
+			}
+			if row.State != tt.wantState {
+				t.Errorf("State = %q, want %q", row.State, tt.wantState)
+			}
+			if tt.scheduled && !row.ScheduledAt.Equal(future) {
+				t.Errorf("ScheduledAt = %v, want %v", row.ScheduledAt, future)
+			}
+			if !tt.scheduled && row.ScheduledAt.After(time.Now().Add(time.Minute)) {
+				t.Errorf("ScheduledAt = %v, want a job due now", row.ScheduledAt)
+			}
+		})
+	}
+}
+
+// A delayed job must not be handed to a worker before its time, and must
+// be once it passes — with nothing having to promote it in between.
+func TestScheduledJobRunsOnlyOnceItIsDue(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	mem := memdriver.New()
+	ws := NewWorkers()
+
+	// Recorded by the worker itself, because when the job *ran* is the
+	// only thing that can show the schedule was honoured. Reading the
+	// clock after the test has already waited for completion measures
+	// when the assertion executed, which is unconditionally later than
+	// the due time and so can never fail.
+	var ranAt atomic.Pointer[time.Time]
+	Register(ws, &funcWorker{fn: func(context.Context, *Job[greetArgs]) error {
+		now := time.Now()
+		ranAt.CompareAndSwap(nil, &now)
+		return nil
+	}})
+	h := startLoop(t, mem, mem, ws)
+
+	due := time.Now().Add(150 * time.Millisecond)
+	row, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"}, &InsertOpts{ScheduledAt: due})
+	if err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+
+	// Long enough for several poll intervals to pass, so an unhonoured
+	// schedule would have been claimed by now.
+	time.Sleep(60 * time.Millisecond)
+	stored, ok := mem.Row(row.ID)
+	if !ok {
+		t.Fatal("job disappeared before its scheduled time")
+	}
+	if stored.State != "scheduled" {
+		t.Fatalf("state = %q before the scheduled time, want scheduled", stored.State)
+	}
+
+	waitFor(t, h.rowInState(row.ID, "completed"), "scheduled job to run once it came due")
+	h.stop(t)
+
+	at := ranAt.Load()
+	if at == nil {
+		t.Fatal("worker never recorded a run time")
+	}
+	if at.Before(due) {
+		t.Errorf("job ran at %v, before its scheduled time %v", at, due)
 	}
 }

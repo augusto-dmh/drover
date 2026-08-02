@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -863,5 +864,88 @@ func TestConcurrentFetchExpiredReclaimsEachJobExactlyOnce(t *testing.T) {
 		if n != 1 {
 			t.Fatalf("job %d reclaimed %d times, want exactly once", id, n)
 		}
+	}
+}
+
+func TestInsertHonoursScheduledAt(t *testing.T) {
+	d, _ := newDriver(t)
+
+	now := time.Now()
+	tests := []struct {
+		name      string
+		at        time.Time
+		wantState string
+		claimable bool
+	}{
+		{"zero means now", time.Time{}, "available", true},
+		{"a past time is due already", now.Add(-time.Hour), "available", true},
+		{"a future time waits", now.Add(time.Hour), "scheduled", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			queue := "sched_" + strings.ReplaceAll(tt.name, " ", "_")
+			row, err := d.Insert(context.Background(), driver.InsertParams{
+				Kind:        "send_email",
+				Queue:       queue,
+				Args:        []byte(`{"n":1}`),
+				ScheduledAt: tt.at,
+			})
+			if err != nil {
+				t.Fatalf("Insert: %v", err)
+			}
+			if row.State != tt.wantState {
+				t.Errorf("State = %q, want %q", row.State, tt.wantState)
+			}
+			// timestamptz keeps microseconds, so the stored instant is the
+			// requested one truncated — not a different time.
+			if want := tt.at.Truncate(time.Microsecond); !tt.at.IsZero() && !row.ScheduledAt.Equal(want) {
+				t.Errorf("ScheduledAt = %v, want %v", row.ScheduledAt.UTC(), want.UTC())
+			}
+
+			claimed, err := d.FetchAvailable(context.Background(), queue, time.Minute, 10)
+			if err != nil {
+				t.Fatalf("FetchAvailable: %v", err)
+			}
+			if got := len(claimed) == 1; got != tt.claimable {
+				t.Errorf("claimed %d job(s), want claimable=%v", len(claimed), tt.claimable)
+			}
+		})
+	}
+}
+
+// The stored state has to agree with the fetch predicate, and the
+// predicate is evaluated by the database. A job inserted just far enough
+// ahead that only one clock could call it due must come back scheduled
+// and unclaimable, then claimable once that time passes — without
+// anything promoting it out of the scheduled state.
+func TestScheduledJobBecomesClaimableWhenItsTimeArrives(t *testing.T) {
+	d, _ := newDriver(t)
+
+	due := time.Now().Add(400 * time.Millisecond)
+	row, err := d.Insert(context.Background(), driver.InsertParams{
+		Kind: "send_email", Queue: "sched_arrival", Args: []byte(`{"n":1}`), ScheduledAt: due,
+	})
+	if err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	if row.State != "scheduled" {
+		t.Fatalf("State = %q, want scheduled", row.State)
+	}
+
+	claimed, err := d.FetchAvailable(context.Background(), "sched_arrival", time.Minute, 10)
+	if err != nil {
+		t.Fatalf("FetchAvailable: %v", err)
+	}
+	if len(claimed) != 0 {
+		t.Fatalf("claimed %d job(s) before the scheduled time", len(claimed))
+	}
+
+	time.Sleep(time.Until(due) + 200*time.Millisecond)
+	claimed, err = d.FetchAvailable(context.Background(), "sched_arrival", time.Minute, 10)
+	if err != nil {
+		t.Fatalf("FetchAvailable: %v", err)
+	}
+	if len(claimed) != 1 || claimed[0].ID != row.ID {
+		t.Fatalf("claimed %d job(s) after the scheduled time, want job %d", len(claimed), row.ID)
 	}
 }

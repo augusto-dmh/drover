@@ -32,22 +32,36 @@ func New() *Driver {
 // Migrate is a no-op: the in-memory store has no schema.
 func (d *Driver) Migrate(context.Context) error { return nil }
 
-// Insert stores a new available job and returns a copy of its row.
+// Insert stores a new job — available, or scheduled when it is due
+// later — and returns a copy of its row.
 func (d *Driver) Insert(_ context.Context, params driver.InsertParams) (*driver.JobRow, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
 	d.nextID++
 	now := time.Now()
+
+	// The same rule the SQL driver applies, against this store's clock:
+	// the zero time means now, and a job due later waits in scheduled
+	// rather than claiming to be available for a run it cannot have yet.
+	scheduledAt := params.ScheduledAt
+	if scheduledAt.IsZero() {
+		scheduledAt = now
+	}
+	state := "available"
+	if scheduledAt.After(now) {
+		state = "scheduled"
+	}
+
 	row := &driver.JobRow{
 		ID:          d.nextID,
 		Kind:        params.Kind,
 		Queue:       params.Queue,
 		Args:        params.Args,
-		State:       "available",
+		State:       state,
 		MaxAttempts: 25,
 		Errors:      json.RawMessage("[]"),
-		ScheduledAt: now,
+		ScheduledAt: scheduledAt,
 		CreatedAt:   now,
 	}
 	d.jobs[row.ID] = row

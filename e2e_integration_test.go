@@ -134,7 +134,7 @@ func TestEndToEndConcurrentLoopsExecuteEachJobExactlyOnce(t *testing.T) {
 
 	const jobs = 50
 	for i := range jobs {
-		if _, err := first.Insert(ctx, e2eArgs{N: i}); err != nil {
+		if _, err := first.Insert(ctx, e2eArgs{N: i}, nil); err != nil {
 			t.Fatalf("Insert %d: %v", i, err)
 		}
 	}
@@ -171,7 +171,7 @@ func TestEndToEndFailedJobIsQueuedForRetryInPostgres(t *testing.T) {
 	}
 	c := newE2EClient(t, pool, worker)
 
-	row, err := c.Insert(ctx, e2eArgs{N: 1})
+	row, err := c.Insert(ctx, e2eArgs{N: 1}, nil)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
@@ -230,7 +230,7 @@ func TestEndToEndTransientFailuresEventuallySucceedInPostgres(t *testing.T) {
 		cfg.RetryPolicy = immediatePolicy{}
 	})
 
-	row, err := c.Insert(ctx, e2eArgs{N: 1})
+	row, err := c.Insert(ctx, e2eArgs{N: 1}, nil)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
@@ -268,7 +268,7 @@ func TestEndToEndJobDiesOnlyAfterExhaustingAttemptsInPostgres(t *testing.T) {
 		cfg.RetryPolicy = immediatePolicy{}
 	})
 
-	row, err := c.Insert(ctx, e2eArgs{N: 1})
+	row, err := c.Insert(ctx, e2eArgs{N: 1}, nil)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
@@ -312,7 +312,7 @@ func TestEndToEndAbandonedJobIsRescuedAndRerunInPostgres(t *testing.T) {
 		cfg.RescueInterval = 50 * time.Millisecond
 	})
 
-	row, err := c.Insert(ctx, e2eArgs{N: 1})
+	row, err := c.Insert(ctx, e2eArgs{N: 1}, nil)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
@@ -378,7 +378,7 @@ func TestEndToEndLongRunningJobIsNeverRescuedInPostgres(t *testing.T) {
 		cfg.RescueInterval = 100 * time.Millisecond
 	})
 
-	row, err := c.Insert(ctx, e2eArgs{N: 1})
+	row, err := c.Insert(ctx, e2eArgs{N: 1}, nil)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
@@ -433,11 +433,11 @@ func TestEndToEndHandlerSentinelsInPostgres(t *testing.T) {
 		cfg.RetryPolicy = immediatePolicy{}
 	})
 
-	cancelled, err := c.Insert(ctx, e2eArgs{N: 0})
+	cancelled, err := c.Insert(ctx, e2eArgs{N: 0}, nil)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
-	snoozed, err := c.Insert(ctx, e2eArgs{N: 1})
+	snoozed, err := c.Insert(ctx, e2eArgs{N: 1}, nil)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
@@ -488,7 +488,7 @@ func TestEndToEndPoolExecutesEachJobExactlyOnce(t *testing.T) {
 	const queued = 60
 	ids := make([]int64, 0, queued)
 	for i := 0; i < queued; i++ {
-		row, err := c.Insert(ctx, e2eArgs{N: i})
+		row, err := c.Insert(ctx, e2eArgs{N: i}, nil)
 		if err != nil {
 			t.Fatalf("Insert: %v", err)
 		}
@@ -525,7 +525,7 @@ func TestEndToEndCleanShutdownLeavesNothingRunning(t *testing.T) {
 
 	const queued = 20
 	for i := 0; i < queued; i++ {
-		if _, err := c.Insert(ctx, e2eArgs{N: i}); err != nil {
+		if _, err := c.Insert(ctx, e2eArgs{N: i}, nil); err != nil {
 			t.Fatalf("Insert: %v", err)
 		}
 	}
@@ -573,7 +573,7 @@ func TestEndToEndUnfinishedJobsAreClaimableByAnotherClient(t *testing.T) {
 	const queued = 2
 	ids := make([]int64, 0, queued)
 	for i := 0; i < queued; i++ {
-		row, err := first.Insert(ctx, e2eArgs{N: i})
+		row, err := first.Insert(ctx, e2eArgs{N: i}, nil)
 		if err != nil {
 			t.Fatalf("Insert: %v", err)
 		}

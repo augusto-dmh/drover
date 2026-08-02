@@ -239,7 +239,7 @@ func TestJobOutcomeIsRecordedEvenWhenItsContextWasCancelled(t *testing.T) {
 			}
 			c := newClient(&ctxDriver{mem}, Config{Workers: ws, Logger: newTestLogger(&syncWriter{})})
 
-			row, err := c.Insert(context.Background(), greetArgs{Name: "ada"})
+			row, err := c.Insert(context.Background(), greetArgs{Name: "ada"}, nil)
 			if err != nil {
 				t.Fatalf("Insert: %v", err)
 			}
@@ -287,7 +287,7 @@ func TestALongRunningJobCanStillRecordItsOutcome(t *testing.T) {
 		LeaseDuration: 10 * time.Millisecond,
 	})
 
-	row, err := c.Insert(context.Background(), greetArgs{Name: "slow"})
+	row, err := c.Insert(context.Background(), greetArgs{Name: "slow"}, nil)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
@@ -349,7 +349,7 @@ func TestARefusedOutcomeIsReportedAsATakeoverNotAFailure(t *testing.T) {
 			Register(ws, &funcWorker{fn: func(context.Context, *Job[greetArgs]) error { return nil }})
 			c := newClient(&refusingDriver{Driver: mem, err: tt.err}, Config{Workers: ws, Logger: newTestLogger(logs)})
 
-			if _, err := c.Insert(context.Background(), greetArgs{Name: "ada"}); err != nil {
+			if _, err := c.Insert(context.Background(), greetArgs{Name: "ada"}, nil); err != nil {
 				t.Fatalf("Insert: %v", err)
 			}
 			claimed, err := mem.FetchAvailable(context.Background(), defaultQueue, time.Minute, 1)
@@ -377,7 +377,7 @@ func TestStartExecutesJobToCompletion(t *testing.T) {
 	Register(ws, &funcWorker{fn: func(context.Context, *Job[greetArgs]) error { return nil }})
 	h := startLoop(t, mem, mem, ws)
 
-	row, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"})
+	row, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"}, nil)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
@@ -390,7 +390,7 @@ func TestStartExecutesJobToCompletion(t *testing.T) {
 	}
 	logs := h.logs.String()
 	for _, want := range []string{
-		`msg="drover: job started"`, `msg="drover: job completed"`,
+		`msg="drover: job started"`, `msg="drover: job execution finished"`,
 		"job_id=" + fmt.Sprint(row.ID), "kind=greet", "attempt=1", "duration=",
 	} {
 		if !strings.Contains(logs, want) {
@@ -408,7 +408,7 @@ func TestStartRetriesFailedJobInsteadOfKillingIt(t *testing.T) {
 	}})
 	h := startLoop(t, mem, mem, ws)
 
-	row, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"})
+	row, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"}, nil)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
@@ -462,7 +462,7 @@ func TestStartCompletesJobThatFailsThenSucceeds(t *testing.T) {
 		cfg.RetryPolicy = immediatePolicy{}
 	})
 
-	row, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"})
+	row, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"}, nil)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
@@ -496,7 +496,7 @@ func TestStartKillsJobOnlyAfterAttemptsAreExhausted(t *testing.T) {
 		cfg.RetryPolicy = immediatePolicy{}
 	})
 
-	row, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"})
+	row, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"}, nil)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
@@ -531,7 +531,7 @@ func TestStartKillsJobWithNonPositiveAttemptCeiling(t *testing.T) {
 		cfg.RetryPolicy = immediatePolicy{}
 	})
 
-	row, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"})
+	row, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"}, nil)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
@@ -556,11 +556,11 @@ func TestStartRetriesPanickedJobAndKeepsRunning(t *testing.T) {
 	}})
 	h := startLoop(t, mem, mem, ws)
 
-	bad, err := h.client.Insert(context.Background(), greetArgs{Name: "explode"})
+	bad, err := h.client.Insert(context.Background(), greetArgs{Name: "explode"}, nil)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
-	good, err := h.client.Insert(context.Background(), greetArgs{Name: "fine"})
+	good, err := h.client.Insert(context.Background(), greetArgs{Name: "fine"}, nil)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
@@ -582,7 +582,7 @@ func TestStartRetriesUnregisteredKind(t *testing.T) {
 	mem := memdriver.New()
 	h := startLoop(t, mem, mem, NewWorkers())
 
-	row, err := h.client.Insert(context.Background(), ghostArgs{})
+	row, err := h.client.Insert(context.Background(), ghostArgs{}, nil)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
@@ -634,7 +634,7 @@ func TestStartCancelsJobOnCancelSentinel(t *testing.T) {
 		cfg.RetryPolicy = immediatePolicy{}
 	})
 
-	row, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"})
+	row, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"}, nil)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
@@ -669,7 +669,7 @@ func TestStartSnoozesJobWithoutSpendingAnAttempt(t *testing.T) {
 	}})
 	h := startLoop(t, mem, mem, ws)
 
-	row, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"})
+	row, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"}, nil)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
@@ -709,7 +709,7 @@ func TestStartSnoozeNeverExhaustsAttempts(t *testing.T) {
 	}})
 	h := startLoop(t, capped, mem, ws)
 
-	row, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"})
+	row, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"}, nil)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
@@ -740,7 +740,7 @@ func TestStartSchedulesRetryFromConfiguredPolicy(t *testing.T) {
 		cfg.RetryPolicy = atTimePolicy{at: want}
 	})
 
-	row, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"})
+	row, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"}, nil)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
@@ -787,7 +787,7 @@ func TestStartHandsTheFailedJobRowToTheRetryPolicy(t *testing.T) {
 		cfg.RetryPolicy = policy
 	})
 
-	row, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"})
+	row, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"}, nil)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
@@ -833,7 +833,7 @@ func TestStartSurvivesFailureToRecordARetry(t *testing.T) {
 	}})
 	h := startLoop(t, blocked, mem, ws)
 
-	doomed, err := h.client.Insert(context.Background(), greetArgs{Name: "doomed"})
+	doomed, err := h.client.Insert(context.Background(), greetArgs{Name: "doomed"}, nil)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
@@ -842,7 +842,7 @@ func TestStartSurvivesFailureToRecordARetry(t *testing.T) {
 	// The loop must still be serving other work after a write it could
 	// not land; the stranded job is the rescuer's problem, not a reason
 	// to stop.
-	fine, err := h.client.Insert(context.Background(), greetArgs{Name: "fine"})
+	fine, err := h.client.Insert(context.Background(), greetArgs{Name: "fine"}, nil)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
@@ -871,7 +871,7 @@ func TestStartDrainsInFlightJobBeforeReturning(t *testing.T) {
 	}})
 	h := startLoop(t, mem, mem, ws)
 
-	row, err := h.client.Insert(context.Background(), greetArgs{Name: "slow"})
+	row, err := h.client.Insert(context.Background(), greetArgs{Name: "slow"}, nil)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
@@ -935,7 +935,7 @@ func TestStartLogsAndRetriesAfterFetchErrors(t *testing.T) {
 	Register(ws, &funcWorker{fn: func(context.Context, *Job[greetArgs]) error { return nil }})
 	h := startLoop(t, flaky, mem, ws)
 
-	row, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"})
+	row, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"}, nil)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
 	}

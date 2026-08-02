@@ -2,7 +2,9 @@ package drover_test
 
 import (
 	"context"
+	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -45,12 +47,30 @@ func Example() {
 	client, err := drover.NewClient(pool, drover.Config{
 		Workers:     workers,
 		Concurrency: 8,
+		// Two named queues sharing the one pool above, "default" claimed
+		// roughly four times as often as "bulk" — never exclusively, so
+		// "bulk" is slower but not starved.
+		Queues: map[string]int{"default": 4, "bulk": 1},
+		// Timeout is one of the two built-in middleware; the client
+		// always installs Logging outermost of whatever is configured
+		// here, so job logging survives regardless.
+		Middleware: []drover.Middleware{drover.Timeout(30 * time.Second)},
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	if _, err := client.Insert(ctx, SendEmail{To: "ada@example.com", Template: "welcome"}); err != nil {
+	if _, err := client.Insert(ctx, SendEmail{To: "ada@example.com", Template: "welcome"}, nil); err != nil {
+		log.Fatal(err)
+	}
+
+	// A nil *InsertOpts means the "default" queue, runnable now; here a
+	// reminder is routed to "bulk" and held back for a day.
+	reminder := SendEmail{To: "ada@example.com", Template: "reminder"}
+	if _, err := client.Insert(ctx, reminder, &drover.InsertOpts{
+		Queue:       "bulk",
+		ScheduledAt: time.Now().Add(24 * time.Hour),
+	}); err != nil {
 		log.Fatal(err)
 	}
 
@@ -68,4 +88,37 @@ func Example() {
 	if err := client.Stop(shutdown); err != nil {
 		log.Printf("drover: shutdown incomplete: %v", err)
 	}
+}
+
+// ExampleMiddleware builds a chain by hand, the same way a Client
+// builds Config.Middleware around its dispatch: the first middleware
+// applied is outermost, so it sees the job first and its result last.
+func ExampleMiddleware() {
+	var trace []string
+	record := func(name string) drover.Middleware {
+		return func(next drover.Handler) drover.Handler {
+			return func(ctx context.Context, job *drover.JobRow) error {
+				trace = append(trace, name+":start")
+				err := next(ctx, job)
+				trace = append(trace, name+":end")
+				return err
+			}
+		}
+	}
+
+	base := func(ctx context.Context, job *drover.JobRow) error {
+		trace = append(trace, "handler")
+		return nil
+	}
+
+	// outer wraps inner wraps Timeout wraps base — outer runs first and
+	// last, exactly as Config.Middleware's index 0 would.
+	chain := record("outer")(drover.Timeout(time.Second)(record("inner")(base)))
+
+	if err := chain(context.Background(), &drover.JobRow{ID: 1, Kind: "demo"}); err != nil {
+		fmt.Println("error:", err)
+	}
+	fmt.Println(strings.Join(trace, " "))
+	// Output:
+	// outer:start inner:start handler inner:end outer:end
 }

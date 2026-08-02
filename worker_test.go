@@ -5,8 +5,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/augusto-dmh/drover/internal/driver"
 )
 
 type greetArgs struct {
@@ -36,7 +34,7 @@ func TestRegisterDispatchesDecodedJobToWorker(t *testing.T) {
 	if !ok {
 		t.Fatal("no handler registered for kind greet")
 	}
-	err := fn(context.Background(), &driver.JobRow{
+	err := fn(context.Background(), &JobRow{
 		ID:        42,
 		Kind:      "greet",
 		Args:      []byte(`{"name":"ada"}`),
@@ -84,7 +82,7 @@ func TestWorkFuncReturnsDecodeErrorForMalformedArgs(t *testing.T) {
 	Register(ws, worker)
 
 	fn, _ := ws.handler("greet")
-	err := fn(context.Background(), &driver.JobRow{ID: 7, Kind: "greet", Args: []byte(`{not-json`)})
+	err := fn(context.Background(), &JobRow{ID: 7, Kind: "greet", Args: []byte(`{not-json`)})
 
 	if err == nil {
 		t.Fatal("workFunc returned nil for malformed args")

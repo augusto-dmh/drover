@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"runtime/debug"
 	"slices"
 	"time"
 
@@ -51,7 +50,7 @@ func (c *Client) Start(ctx context.Context) error {
 	c.mu.Unlock()
 
 	c.logger.Info("drover: worker pool started",
-		"queue", r.queue, "concurrency", r.concurrency,
+		"queues", queueNames(r.queues), "concurrency", r.concurrency,
 		"poll_interval", c.pollInterval, "lease_duration", c.leaseDuration,
 		"heartbeat_interval", c.heartbeatInterval, "rescue_interval", c.rescueInterval)
 
@@ -102,8 +101,6 @@ func (c *Client) Stop(ctx context.Context) error {
 // records an outcome never is (AD-027).
 func (c *Client) runJob(jobCtx context.Context, row *driver.JobRow) {
 	start := time.Now()
-	c.logger.Info("drover: job started",
-		"job_id", row.ID, "kind", row.Kind, "attempt", row.Attempt)
 
 	// Tracked from claim to finalize, which is exactly the window in
 	// which this job's lease must not lapse.
@@ -111,36 +108,74 @@ func (c *Client) runJob(jobCtx context.Context, row *driver.JobRow) {
 	c.inflight.add(lease)
 	defer c.inflight.remove(lease)
 
-	fn, registered := c.workers.handler(row.Kind)
-	if !registered {
-		// A kind this binary does not know is an ordinary failure, not a
-		// death sentence: mid-deploy, workers on the old build
-		// legitimately claim kinds only the new build registers, and the
-		// job has to survive until one of those runs it (AD-014).
-		err := fmt.Errorf("no worker registered for kind %q", row.Kind)
-		ctx, cancel := c.finalizeContext(jobCtx)
-		defer cancel()
-		c.dispose(ctx, row, err, nil, time.Since(start))
-		return
-	}
+	err := c.execute(jobCtx, rowFromDriver(row))
 
-	stack, err := runProtected(jobCtx, fn, row)
-	if err != nil {
-		ctx, cancel := c.finalizeContext(jobCtx)
-		defer cancel()
-		c.dispose(ctx, row, err, stack, time.Since(start))
-		return
-	}
-
+	// Derived from jobCtx, deliberately not from whatever context the
+	// chain passed down. A timeout middleware narrows the context it
+	// hands to the next handler, and finalizing on that one would make
+	// every job that ran out of time fail to record its outcome and sit
+	// running until its lease lapsed — the clean path turned into the
+	// crash path (AD-027).
 	ctx, cancel := c.finalizeContext(jobCtx)
 	defer cancel()
-	if err := c.drv.MarkCompleted(ctx, lease); err != nil {
-		c.writeFailed(row, err)
+
+	if err != nil {
+		c.dispose(ctx, row, err, time.Since(start))
 		return
 	}
-	c.logger.Info("drover: job completed",
-		"job_id", row.ID, "kind", row.Kind, "attempt", row.Attempt,
-		"duration", time.Since(start))
+	// No record on the way out: the logging middleware already reported
+	// the execution and its duration, and a second success line here
+	// would be the same event told twice. A write that does not land is
+	// still reported, by writeFailed.
+	if err := c.drv.MarkCompleted(ctx, lease); err != nil {
+		c.writeFailed(row, err)
+	}
+}
+
+// execute runs the middleware chain for one job.
+//
+// The recover here is the outer of two: it catches a panic thrown by a
+// middleware, which dispatch's own recover cannot see because it is
+// deeper in the chain. Without it a middleware panic would unwind past
+// this frame with nothing above it to catch, and an unrecovered panic in
+// any goroutine terminates the whole process — taking every other
+// in-flight job with it, each left running until its lease lapses and a
+// rescuer collects it. One misbehaving middleware would be a crash, not
+// a degradation.
+func (c *Client) execute(ctx context.Context, job *JobRow) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = newPanicError(r)
+		}
+	}()
+	return c.chain(ctx, job)
+}
+
+// dispatch is the innermost handler: it finds the worker registered for
+// the job's kind and runs it.
+//
+// Its recover is what makes a panicking worker an ordinary error to
+// every middleware wrapped around it, so a chain can log, time, and
+// count a panic like any other failure rather than watching a stack
+// unwind past it (AD-013).
+//
+// The unregistered-kind branch lives here, inside the chain, so that
+// middleware observes it too. A kind this binary does not know is an
+// ordinary failure, not a death sentence: mid-deploy, workers on the old
+// build legitimately claim kinds only the new build registers, and the
+// job has to survive until one of those runs it (AD-014).
+func (c *Client) dispatch(ctx context.Context, job *JobRow) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = newPanicError(r)
+		}
+	}()
+
+	fn, registered := c.workers.handler(job.Kind)
+	if !registered {
+		return fmt.Errorf("no worker registered for kind %q", job.Kind)
+	}
+	return fn(ctx, job)
 }
 
 // finalizeContext bounds one attempt at recording a job's outcome.
@@ -156,18 +191,6 @@ func (c *Client) finalizeContext(jobCtx context.Context) (context.Context, conte
 	return context.WithTimeout(context.WithoutCancel(jobCtx), c.leaseDuration)
 }
 
-// runProtected calls the worker and converts a panic into an error
-// carrying the stack, so one misbehaving job never kills the loop.
-func runProtected(ctx context.Context, fn workFunc, row *driver.JobRow) (stack []byte, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("job panicked: %v", r)
-			stack = debug.Stack()
-		}
-	}()
-	return nil, fn(ctx, row)
-}
-
 // dispose ends an attempt that did not succeed, deciding what becomes of
 // the job: cancelled if the handler declared it hopeless, deferred if it
 // asked to be called back, dead once its attempts are spent, and
@@ -181,7 +204,7 @@ func runProtected(ctx context.Context, fn workFunc, row *driver.JobRow) (stack [
 // ran is how long the attempt executed for; the rescuer passes zero,
 // because a job abandoned by a dead worker has no duration this process
 // can honestly report.
-func (c *Client) dispose(ctx context.Context, row *driver.JobRow, jobErr error, stack []byte, ran time.Duration) {
+func (c *Client) dispose(ctx context.Context, row *driver.JobRow, jobErr error, ran time.Duration) {
 	attrs := func(rest ...any) []any {
 		base := []any{"job_id", row.ID, "kind", row.Kind, "attempt", row.Attempt}
 		if ran > 0 {
@@ -210,7 +233,9 @@ func (c *Client) dispose(ctx context.Context, row *driver.JobRow, jobErr error, 
 		Attempt: row.Attempt,
 		At:      time.Now().UTC(),
 		Error:   jobErr.Error(),
-		Trace:   string(stack),
+		// Carried by the error itself, so it survives a middleware that
+		// wraps a panicking worker's failure with %w.
+		Trace: string(stackOf(jobErr)),
 	})
 	if err != nil {
 		// Nothing is written, so the job stays running until its lease

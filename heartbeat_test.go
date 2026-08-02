@@ -226,7 +226,7 @@ func TestStartKeepsLeaseAliveWhileJobRuns(t *testing.T) {
 		cfg.HeartbeatInterval = 15 * time.Millisecond
 	})
 
-	row, err := h.client.Insert(context.Background(), greetArgs{Name: "slow"})
+	row, err := h.client.Insert(context.Background(), greetArgs{Name: "slow"}, nil)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
@@ -270,7 +270,7 @@ func TestHeartbeatOutlivesCancellationUntilTheDrainFinishes(t *testing.T) {
 		cfg.HeartbeatInterval = 15 * time.Millisecond
 	})
 
-	row, err := h.client.Insert(context.Background(), greetArgs{Name: "slow"})
+	row, err := h.client.Insert(context.Background(), greetArgs{Name: "slow"}, nil)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
 	}

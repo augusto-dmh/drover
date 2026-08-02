@@ -338,7 +338,7 @@ func TestStartDoesNotRescueAJobThatIsStillRunning(t *testing.T) {
 		cfg.RescueInterval = 20 * time.Millisecond
 	})
 
-	row, err := h.client.Insert(context.Background(), greetArgs{Name: "slow"})
+	row, err := h.client.Insert(context.Background(), greetArgs{Name: "slow"}, nil)
 	if err != nil {
 		t.Fatalf("Insert: %v", err)
 	}

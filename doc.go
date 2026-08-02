@@ -66,6 +66,29 @@
 // lease means the same thing to every worker regardless of what their
 // own clocks say.
 //
+// # Middleware
+//
+// Config.Middleware wraps every job a Client runs, whatever its kind,
+// as a chain of func(Handler) Handler — the same shape as an HTTP
+// middleware chain, and composed the same way: index 0 is outermost,
+// seeing a job first and its result last. The client always installs
+// Logging outermost of everything, including a caller's own
+// middleware, so per-job logging cannot be silently dropped by
+// configuration; Timeout bounds how long a handler may run before its
+// context is cancelled. Both are exported, ordinary middleware, so
+// they double as the reference examples for writing another.
+//
+// # Queues and scheduling
+//
+// InsertOpts, passed to Insert or InsertTx, chooses which named queue
+// a job waits in and the earliest time it may run; nil, or a zero
+// value, means the "default" queue, runnable as soon as a worker is
+// free. Config.Queues maps every queue a Client works to a weight:
+// the queues share one pool of Config.Concurrency workers rather than
+// each getting a slice of it, and weight decides how often a queue is
+// tried first in a fetch round, never whether it is tried at all, so
+// no configured queue is starved.
+//
 // # Concurrency and shutdown
 //
 // Jobs run on a fixed pool of Config.Concurrency goroutines, fed by a
@@ -97,7 +120,6 @@
 //
 // # Current limitations
 //
-// Named queues, weighted per-queue priorities, per-job timeout
-// middleware, and metrics are not implemented yet; they arrive in later
-// cycles of docs/rfc/0001 in the repository.
+// Metrics are not implemented yet; they arrive in a later cycle of
+// docs/rfc/0001 in the repository.
 package drover

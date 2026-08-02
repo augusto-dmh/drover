@@ -63,6 +63,47 @@ type Config struct {
 	PollInterval time.Duration
 	RetryPolicy  RetryPolicy
 
+	// Middleware wraps every job this client executes, whatever its
+	// kind. The first element is outermost: it sees a job before the
+	// others and its result after them.
+	//
+	// The chain is composed once, when the client is built, so appending
+	// to the slice afterwards changes nothing about what the client runs.
+	// A nil element is a programmer error and panics,
+	// because the alternative is a middleware the caller believes is
+	// running: a timeout that was silently dropped looks exactly like a
+	// timeout that has not fired yet.
+	Middleware []Middleware
+
+	// Queues maps each queue this client works to its weight. An unset
+	// or empty map means the single queue "default".
+	//
+	// Weight decides how often a queue is tried *first* in a fetch round,
+	// not whether it is tried at all: every configured queue is visited
+	// in every round, so no weighting can starve one. Giving "critical"
+	// nine times the weight of "bulk" means critical jobs are usually
+	// claimed before bulk ones — it does not mean bulk waits for critical
+	// to empty.
+	//
+	// The queues share one pool of Concurrency workers rather than each
+	// getting a slice of it, so a busy queue can use the whole pool while
+	// the others are idle.
+	//
+	// A weight below one is corrected to one and reported, as is one
+	// above the internal maximum — priority is a ratio, and an enormous
+	// weight buys nothing a large one does not.
+	//
+	// An empty queue name panics: an empty Queue at enqueue time means
+	// "default", so no caller could ever address it.
+	//
+	// Cost scales with the map. A round asks each queue in turn until the
+	// idle workers are spoken for, so an idle client polls once per
+	// configured queue per interval where a single-queue client polls
+	// once. The queries are cheap — each is served by the fetch index and
+	// one matching no rows does no write — but they are round trips, so
+	// widen PollInterval as the map grows.
+	Queues map[string]int
+
 	// Concurrency is how many jobs this client executes at once. It
 	// defaults to ten; a value of zero or less is treated as unset.
 	//
@@ -115,7 +156,14 @@ type Client struct {
 	heartbeatInterval time.Duration
 	rescueInterval    time.Duration
 	concurrency       int
+	queues            []weightedQueue
 	inflight          *inflightSet
+
+	// chain is the composed middleware stack with dispatch at its
+	// centre. It is built once at construction and never rebuilt: every
+	// pool worker calls it concurrently, so anything mutable in here
+	// would be a data race on every job.
+	chain Handler
 
 	// mu guards runner, which is nil until Start and holds the running
 	// pool thereafter. It is the whole of the client's lifecycle state:
@@ -187,13 +235,66 @@ func newClient(drv driver.Driver, cfg Config) *Client {
 	if c.concurrency <= 0 {
 		c.concurrency = defaultConcurrency
 	}
+	// After the logger is settled, so a corrected weight is reported
+	// through the logger the caller configured.
+	c.queues = checkedQueues(cfg.Queues, c.logger)
+	// Logging goes outermost, ahead of whatever the caller configured, so
+	// that per-job logging survives a caller adding middleware of their
+	// own — and so its duration covers their middleware too.
+	c.chain = wrap(c.dispatch, append(
+		[]Middleware{Logging(c.logger)},
+		checkedMiddleware(cfg.Middleware)...,
+	))
 	return c
 }
 
-// Insert enqueues a job in its own transaction. The job is available
-// to workers as soon as Insert returns.
-func (c *Client) Insert(ctx context.Context, args JobArgs) (*JobRow, error) {
-	params, err := insertParamsFor(args)
+// checkedMiddleware rejects a chain that cannot be composed, and returns
+// it unchanged.
+//
+// It deliberately does not copy. What keeps the client independent of a
+// caller who goes on appending to their slice is that the chain is
+// composed here and now: wrap closes over each middleware, not over the
+// slice, so once construction returns there is nothing left for a later
+// append to reach. A defensive copy would only look like the reason.
+//
+// The returned slice is therefore the caller's, and must stay
+// composed-from and never stored. Anything that retained it would
+// reintroduce the aliasing this note explains away.
+func checkedMiddleware(mws []Middleware) []Middleware {
+	for i, mw := range mws {
+		if mw == nil {
+			panic(fmt.Sprintf("drover: Config.Middleware[%d] is nil", i))
+		}
+	}
+	return mws
+}
+
+// InsertOpts are the per-job choices made at enqueue time. A nil
+// *InsertOpts, or a zero value, means the defaults: the "default" queue,
+// runnable immediately.
+type InsertOpts struct {
+	// Queue is which named queue the job waits in. Empty means
+	// "default".
+	//
+	// A queue no running client is configured to work is not an error:
+	// the process that enqueues a job is very often not the one that
+	// runs it, so the job simply waits until something works that queue.
+	Queue string
+
+	// ScheduledAt is the earliest time the job may run. The zero value
+	// means as soon as possible.
+	//
+	// It is a floor, not a promise: the job becomes claimable then, and
+	// runs once a worker is free to take it. A time in the past is
+	// treated as now rather than rejected, so a caller computing a delay
+	// from a stale clock still enqueues a runnable job.
+	ScheduledAt time.Time
+}
+
+// Insert enqueues a job in its own transaction. The job is available to
+// workers as soon as Insert returns, unless opts delays it.
+func (c *Client) Insert(ctx context.Context, args JobArgs, opts *InsertOpts) (*JobRow, error) {
+	params, err := insertParamsFor(args, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -207,8 +308,8 @@ func (c *Client) Insert(ctx context.Context, args JobArgs) (*JobRow, error) {
 // InsertTx enqueues a job inside the caller's transaction: the job
 // exists if and only if tx commits, so a domain write and its job are
 // atomic.
-func (c *Client) InsertTx(ctx context.Context, tx pgx.Tx, args JobArgs) (*JobRow, error) {
-	params, err := insertParamsFor(args)
+func (c *Client) InsertTx(ctx context.Context, tx pgx.Tx, args JobArgs, opts *InsertOpts) (*JobRow, error) {
+	params, err := insertParamsFor(args, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -219,7 +320,7 @@ func (c *Client) InsertTx(ctx context.Context, tx pgx.Tx, args JobArgs) (*JobRow
 	return rowFromDriver(row), nil
 }
 
-func insertParamsFor(args JobArgs) (driver.InsertParams, error) {
+func insertParamsFor(args JobArgs, opts *InsertOpts) (driver.InsertParams, error) {
 	kind := args.Kind()
 	if kind == "" {
 		return driver.InsertParams{}, ErrInvalidKind
@@ -228,7 +329,17 @@ func insertParamsFor(args JobArgs) (driver.InsertParams, error) {
 	if err != nil {
 		return driver.InsertParams{}, fmt.Errorf("drover: marshal args for kind %q: %w", kind, err)
 	}
-	return driver.InsertParams{Kind: kind, Queue: defaultQueue, Args: encoded}, nil
+
+	params := driver.InsertParams{Kind: kind, Queue: defaultQueue, Args: encoded}
+	if opts != nil {
+		if opts.Queue != "" {
+			params.Queue = opts.Queue
+		}
+		// Passed through as the zero time when unset, which the driver
+		// reads as "now" and resolves against the store's own clock.
+		params.ScheduledAt = opts.ScheduledAt
+	}
+	return params, nil
 }
 
 func rowFromDriver(row *driver.JobRow) *JobRow {
