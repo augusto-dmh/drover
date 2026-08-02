@@ -211,14 +211,14 @@ claimability predicate, not a re-derived one.
 **Requirement**: OBS-03, OBS-04, OBS-06, OBS-07, OBS-12
 
 **Done when**:
-- [ ] `github.com/prometheus/client_golang` added as a direct dependency
-- [ ] All seven metric families from the design exist with exactly the documented names, types, and labels
-- [ ] Histogram buckets are the documented explicit set, not `DefBuckets`
-- [ ] `drover_pool_concurrency` is set at construction from the configured concurrency
-- [ ] Every label-taking accessor uses the error-returning `GetMetricWith*` family — a
+- [x] `github.com/prometheus/client_golang` added as a direct dependency
+- [x] All seven metric families from the design exist with exactly the documented names, types, and labels
+- [x] Histogram buckets are the documented explicit set, not `DefBuckets`
+- [x] `drover_pool_concurrency` is set at construction from the configured concurrency
+- [x] Every label-taking accessor uses the error-returning `GetMetricWith*` family — a
       test proves an unusable queue name logs and skips rather than panicking (EDGE-08)
-- [ ] Two metric sets on two distinct registries construct without error (EDGE-07)
-- [ ] Gate passes: `go test -race ./...`
+- [x] Two metric sets on two distinct registries construct without error (EDGE-07)
+- [x] Gate passes: `go test -race ./...`
 
 **Tests**: unit
 **Gate**: quick
@@ -236,13 +236,13 @@ in-flight executions.
 **Requirement**: OBS-03, OBS-04, OBS-05, OBS-12
 
 **Done when**:
-- [ ] A nil-returning execution increments completed by exactly one and failed by zero
-- [ ] An error-returning execution increments failed by exactly one and completed by zero
-- [ ] Both cases observe exactly one histogram sample on the job's queue label
-- [ ] A panicking registered worker is counted as failed (it reaches the middleware as an
+- [x] A nil-returning execution increments completed by exactly one and failed by zero
+- [x] An error-returning execution increments failed by exactly one and completed by zero
+- [x] Both cases observe exactly one histogram sample on the job's queue label
+- [x] A panicking registered worker is counted as failed (it reaches the middleware as an
       ordinary error via the existing inner recover)
-- [ ] The in-flight gauge returns to zero after execution and never exceeds concurrency
-- [ ] Gate passes: `go test -race ./...`
+- [x] The in-flight gauge returns to zero after execution and never exceeds concurrency
+- [x] Gate passes: `go test -race ./...`
 
 **Tests**: unit
 **Gate**: quick
@@ -259,12 +259,12 @@ in-flight executions.
 **Requirement**: OBS-05, OBS-12
 
 **Done when**:
-- [ ] `Config.MetricsRegistry *prometheus.Registry`; nil yields a fresh private registry
-- [ ] The middleware sits immediately inside `Logging` and ahead of `Config.Middleware`,
+- [x] `Config.MetricsRegistry *prometheus.Registry`; nil yields a fresh private registry
+- [x] The middleware sits immediately inside `Logging` and ahead of `Config.Middleware`,
       asserted by an ordering test, not by reading the source
-- [ ] A client configured with user middleware still records metrics (spec OBS-03.6)
-- [ ] Two clients constructed in one process do not collide (EDGE-07)
-- [ ] Gate passes: `go test -race ./...`, plus lint (phase close)
+- [x] A client configured with user middleware still records metrics (spec OBS-03.6)
+- [x] Two clients constructed in one process do not collide (EDGE-07)
+- [x] Gate passes: `go test -race ./...`, plus lint (phase close)
 
 **Tests**: unit
 **Gate**: quick
