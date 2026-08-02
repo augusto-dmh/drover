@@ -29,9 +29,12 @@ type runner struct {
 	queues      []weightedQueue
 	concurrency int
 
-	// order is the scratch buffer weightedOrder fills each round. It
-	// belongs to the fetch loop goroutine alone.
+	// order is the ordering weightedOrder fills each round, and pick is
+	// the scratch it consumes while drawing it. Both belong to the fetch
+	// loop goroutine alone, and both are reused so a round allocates
+	// nothing.
 	order []string
+	pick  []weightedQueue
 
 	// jobs is deliberately unbuffered: a completed send means a worker
 	// has taken the row, so no claimed job is ever parked in a buffer
@@ -82,6 +85,7 @@ func newRunner(ctx context.Context, c *Client) *runner {
 		queues:           c.queues,
 		concurrency:      c.concurrency,
 		order:            make([]string, 0, len(c.queues)),
+		pick:             make([]weightedQueue, 0, len(c.queues)),
 		jobs:             make(chan *driver.JobRow),
 		slots:            make(chan struct{}, c.concurrency),
 		stopFetch:        make(chan struct{}),
@@ -371,11 +375,10 @@ func (r *runner) fetch() {
 		}
 
 		for i, row := range rows {
-			// Tracked from the claim, not from the start of execution: a
-			// row waiting to be handed to a worker is already running and
-			// already leased, and the heartbeat has to cover that window
-			// or the rescuer will take the job away from a pool that is
-			// about to run it.
+			// Already tracked by claimRound, from the moment the claim
+			// returned. Re-added because the set is keyed by job id, so
+			// this is idempotent, and because it keeps the invariant
+			// legible at the point a row changes hands.
 			c.inflight.add(driver.Lease{ID: row.ID, Attempt: row.Attempt})
 			select {
 			case r.jobs <- row:
@@ -411,7 +414,7 @@ func (r *runner) claimRound(capacity int) []*driver.JobRow {
 	var claimed []*driver.JobRow
 	remaining := capacity
 
-	r.order = weightedOrder(r.queues, r.order)
+	r.order, r.pick = weightedOrder(r.queues, r.order, r.pick)
 	for _, queue := range r.order {
 		rows, err := c.drv.FetchAvailable(r.fetchCtx, queue, c.leaseDuration, remaining)
 		if err != nil {
@@ -420,6 +423,17 @@ func (r *runner) claimRound(capacity int) []*driver.JobRow {
 			}
 			c.logger.Error("drover: fetch jobs", "queue", queue, "error", err)
 			return claimed
+		}
+
+		// Tracked here rather than when the row is handed to a worker,
+		// because the lease starts the instant the claim returns. A round
+		// walks the remaining queues before it dispatches anything, so
+		// leaving this to the dispatch loop would hold rows claimed from
+		// the first queue unheartbeated across every later claim — and
+		// hide them from the snapshot a shutdown takes to decide what is
+		// still in flight.
+		for _, row := range rows {
+			c.inflight.add(driver.Lease{ID: row.ID, Attempt: row.Attempt})
 		}
 
 		// A driver that hands back more rows than the limit allowed has
@@ -431,7 +445,12 @@ func (r *runner) claimRound(capacity int) []*driver.JobRow {
 			surplus := rows[remaining:]
 			c.logger.Warn("drover: driver returned more jobs than requested; returning the surplus",
 				"queue", queue, "requested", remaining, "returned", len(rows))
-			r.requeueAll(leasesOf(surplus))
+			surplusLeases := leasesOf(surplus)
+			r.requeueAll(surplusLeases)
+			// Handed back, so no longer this pool's to keep alive.
+			for _, lease := range surplusLeases {
+				c.inflight.remove(lease)
+			}
 			rows = rows[:remaining]
 		}
 
