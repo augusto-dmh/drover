@@ -50,7 +50,7 @@ func (c *Client) Start(ctx context.Context) error {
 	c.mu.Unlock()
 
 	c.logger.Info("drover: worker pool started",
-		"queue", r.queue, "concurrency", r.concurrency,
+		"queues", queueNames(r.queues), "concurrency", r.concurrency,
 		"poll_interval", c.pollInterval, "lease_duration", c.leaseDuration,
 		"heartbeat_interval", c.heartbeatInterval, "rescue_interval", c.rescueInterval)
 

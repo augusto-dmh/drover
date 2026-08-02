@@ -76,6 +76,25 @@ type Config struct {
 	// timeout that has not fired yet.
 	Middleware []Middleware
 
+	// Queues maps each queue this client works to its weight. An unset
+	// or empty map means the single queue "default".
+	//
+	// Weight decides how often a queue is tried *first* in a fetch round,
+	// not whether it is tried at all: every configured queue is visited
+	// in every round, so no weighting can starve one. Giving "critical"
+	// nine times the weight of "bulk" means critical jobs are usually
+	// claimed before bulk ones — it does not mean bulk waits for critical
+	// to empty.
+	//
+	// The queues share one pool of Concurrency workers rather than each
+	// getting a slice of it, so a busy queue can use the whole pool while
+	// the others are idle.
+	//
+	// A weight below one is corrected to one and reported. An empty queue
+	// name panics: an empty Queue at enqueue time means "default", so no
+	// caller could ever address it.
+	Queues map[string]int
+
 	// Concurrency is how many jobs this client executes at once. It
 	// defaults to ten; a value of zero or less is treated as unset.
 	//
@@ -128,6 +147,7 @@ type Client struct {
 	heartbeatInterval time.Duration
 	rescueInterval    time.Duration
 	concurrency       int
+	queues            []weightedQueue
 	inflight          *inflightSet
 
 	// chain is the composed middleware stack with dispatch at its
@@ -206,6 +226,9 @@ func newClient(drv driver.Driver, cfg Config) *Client {
 	if c.concurrency <= 0 {
 		c.concurrency = defaultConcurrency
 	}
+	// After the logger is settled, so a corrected weight is reported
+	// through the logger the caller configured.
+	c.queues = checkedQueues(cfg.Queues, c.logger)
 	// Logging goes outermost, ahead of whatever the caller configured, so
 	// that per-job logging survives a caller adding middleware of their
 	// own — and so its duration covers their middleware too.
