@@ -1,6 +1,19 @@
+-- A null scheduled_at means "now". The state follows from the same
+-- comparison the fetch predicate makes, evaluated against the same
+-- clock: a job due later waits in scheduled, one due now is available.
+-- Deciding this on the client would let a machine running fast or slow
+-- write a state this database disagrees with, and the state column is
+-- what an operator is shown.
 -- name: InsertJob :one
-INSERT INTO drover_jobs (kind, queue, args)
-VALUES ($1, $2, $3)
+INSERT INTO drover_jobs (kind, queue, args, scheduled_at, state)
+VALUES (
+    $1, $2, $3,
+    coalesce(sqlc.narg(scheduled_at)::timestamptz, now()),
+    CASE WHEN coalesce(sqlc.narg(scheduled_at)::timestamptz, now()) > now()
+         THEN 'scheduled'::drover_job_state
+         ELSE 'available'::drover_job_state
+    END
+)
 RETURNING *;
 
 -- Lease deadlines are computed here, from the database clock, because

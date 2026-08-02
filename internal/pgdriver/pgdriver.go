@@ -238,7 +238,14 @@ func attemptArg(attempt int) int32 {
 }
 
 func insertParams(params driver.InsertParams) dbsqlc.InsertJobParams {
-	return dbsqlc.InsertJobParams{Kind: params.Kind, Queue: params.Queue, Args: params.Args}
+	out := dbsqlc.InsertJobParams{Kind: params.Kind, Queue: params.Queue, Args: params.Args}
+	// Left null for the zero time so the statement substitutes now() and
+	// the database decides both the scheduled time and the state.
+	if !params.ScheduledAt.IsZero() {
+		at := params.ScheduledAt
+		out.ScheduledAt = &at
+	}
+	return out
 }
 
 func rowFromDB(job dbsqlc.DroverJob) *driver.JobRow {

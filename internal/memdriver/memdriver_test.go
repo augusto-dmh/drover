@@ -860,3 +860,83 @@ func TestConcurrentFetchClaimsEachJobExactlyOnce(t *testing.T) {
 		}
 	}
 }
+
+func TestInsertHonoursScheduledAt(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	tests := []struct {
+		name      string
+		at        time.Time
+		wantState string
+		claimable bool
+	}{
+		{"zero means now", time.Time{}, "available", true},
+		{"a past time is due already", now.Add(-time.Hour), "available", true},
+		{"a future time waits", now.Add(time.Hour), "scheduled", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			d := New()
+			row, err := d.Insert(context.Background(), driver.InsertParams{
+				Kind:        "greet",
+				Queue:       "default",
+				Args:        []byte(`{}`),
+				ScheduledAt: tt.at,
+			})
+			if err != nil {
+				t.Fatalf("Insert: %v", err)
+			}
+			if row.State != tt.wantState {
+				t.Errorf("state = %q, want %q", row.State, tt.wantState)
+			}
+			if !tt.at.IsZero() && !row.ScheduledAt.Equal(tt.at) {
+				t.Errorf("ScheduledAt = %v, want %v", row.ScheduledAt, tt.at)
+			}
+
+			claimed, err := d.FetchAvailable(context.Background(), "default", time.Minute, 10)
+			if err != nil {
+				t.Fatalf("FetchAvailable: %v", err)
+			}
+			if got := len(claimed) == 1; got != tt.claimable {
+				t.Errorf("claimed %d job(s), want claimable=%v", len(claimed), tt.claimable)
+			}
+		})
+	}
+}
+
+// A scheduled job is claimed once its time arrives, without anything
+// having to promote it out of the scheduled state first.
+func TestScheduledJobBecomesClaimableWhenItsTimeArrives(t *testing.T) {
+	t.Parallel()
+
+	d := New()
+	due := time.Now().Add(60 * time.Millisecond)
+	row, err := d.Insert(context.Background(), driver.InsertParams{
+		Kind: "greet", Queue: "default", Args: []byte(`{}`), ScheduledAt: due,
+	})
+	if err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	if row.State != "scheduled" {
+		t.Fatalf("state = %q, want scheduled", row.State)
+	}
+
+	claimed, err := d.FetchAvailable(context.Background(), "default", time.Minute, 10)
+	if err != nil {
+		t.Fatalf("FetchAvailable: %v", err)
+	}
+	if len(claimed) != 0 {
+		t.Fatalf("claimed %d job(s) before the scheduled time", len(claimed))
+	}
+
+	time.Sleep(time.Until(due) + 20*time.Millisecond)
+	claimed, err = d.FetchAvailable(context.Background(), "default", time.Minute, 10)
+	if err != nil {
+		t.Fatalf("FetchAvailable: %v", err)
+	}
+	if len(claimed) != 1 || claimed[0].ID != row.ID {
+		t.Fatalf("claimed %d job(s) after the scheduled time, want job %d", len(claimed), row.ID)
+	}
+}

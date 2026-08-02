@@ -53,6 +53,17 @@ type InsertParams struct {
 	Kind  string
 	Queue string
 	Args  []byte
+
+	// ScheduledAt is when the job first becomes claimable. The zero
+	// value means now.
+	//
+	// Whether that instant has already passed is decided by the store's
+	// own clock, not the caller's, and the stored state follows from it:
+	// a job due later waits in scheduled, one due now is available. The
+	// fetch predicate compares scheduled_at against the same clock, so
+	// letting the caller decide would let a client running fast or slow
+	// record a state its own store disagrees with.
+	ScheduledAt time.Time
 }
 
 // JobRow is the stored representation of a job.

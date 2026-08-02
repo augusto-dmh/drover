@@ -182,19 +182,38 @@ func (q *Queries) GetJob(ctx context.Context, id int64) (DroverJob, error) {
 }
 
 const insertJob = `-- name: InsertJob :one
-INSERT INTO drover_jobs (kind, queue, args)
-VALUES ($1, $2, $3)
+INSERT INTO drover_jobs (kind, queue, args, scheduled_at, state)
+VALUES (
+    $1, $2, $3,
+    coalesce($4::timestamptz, now()),
+    CASE WHEN coalesce($4::timestamptz, now()) > now()
+         THEN 'scheduled'::drover_job_state
+         ELSE 'available'::drover_job_state
+    END
+)
 RETURNING id, kind, queue, args, state, attempt, max_attempts, errors, scheduled_at, leased_until, created_at, finalized_at
 `
 
 type InsertJobParams struct {
-	Kind  string
-	Queue string
-	Args  []byte
+	Kind        string
+	Queue       string
+	Args        []byte
+	ScheduledAt *time.Time
 }
 
+// A null scheduled_at means "now". The state follows from the same
+// comparison the fetch predicate makes, evaluated against the same
+// clock: a job due later waits in scheduled, one due now is available.
+// Deciding this on the client would let a machine running fast or slow
+// write a state this database disagrees with, and the state column is
+// what an operator is shown.
 func (q *Queries) InsertJob(ctx context.Context, arg InsertJobParams) (DroverJob, error) {
-	row := q.db.QueryRow(ctx, insertJob, arg.Kind, arg.Queue, arg.Args)
+	row := q.db.QueryRow(ctx, insertJob,
+		arg.Kind,
+		arg.Queue,
+		arg.Args,
+		arg.ScheduledAt,
+	)
 	var i DroverJob
 	err := row.Scan(
 		&i.ID,
