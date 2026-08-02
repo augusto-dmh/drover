@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"go.uber.org/goleak"
 
@@ -369,4 +370,137 @@ func TestNilMiddlewarePanicsNamingItsIndex(t *testing.T) {
 
 	passthrough := func(next Handler) Handler { return next }
 	newClient(memdriver.New(), Config{Middleware: []Middleware{passthrough, nil}})
+}
+
+// countRecords returns how many logged lines contain each of the given
+// substrings, so a test can assert a record appeared exactly once rather
+// than merely appeared.
+func countRecords(logs, substr string) int {
+	n := 0
+	for _, line := range strings.Split(logs, "\n") {
+		if strings.Contains(line, substr) {
+			n++
+		}
+	}
+	return n
+}
+
+func TestLoggingReportsOneStartAndOneEndPerSuccessfulJob(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	mem := memdriver.New()
+	ws := NewWorkers()
+	Register(ws, &funcWorker{fn: func(context.Context, *Job[greetArgs]) error { return nil }})
+	h := startLoop(t, mem, mem, ws)
+
+	row, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"})
+	if err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	waitFor(t, h.rowInState(row.ID, "completed"), "job to complete")
+	h.stop(t)
+
+	logs := h.logs.String()
+	if got := countRecords(logs, `msg="drover: job started"`); got != 1 {
+		t.Errorf("start records = %d, want 1\nlogs:\n%s", got, logs)
+	}
+	if got := countRecords(logs, `msg="drover: job execution finished"`); got != 1 {
+		t.Errorf("success records = %d, want 1\nlogs:\n%s", got, logs)
+	}
+	// The line the middleware replaced must not also be emitted, or every
+	// successful job would report its success twice.
+	if got := countRecords(logs, `msg="drover: job completed"`); got != 0 {
+		t.Errorf("the replaced success record still appears %d time(s)\nlogs:\n%s", got, logs)
+	}
+	for _, want := range []string{"queue=default", "duration="} {
+		if !strings.Contains(logs, want) {
+			t.Errorf("logs missing %q\nlogs:\n%s", want, logs)
+		}
+	}
+}
+
+// A failed attempt is designed behaviour the retry machinery expects.
+// Reporting it at ERROR would put an entry in an operator's error budget
+// for a queue that is working exactly as intended.
+func TestLoggingReportsAFailedExecutionAtWarnNotError(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	mem := memdriver.New()
+	ws := NewWorkers()
+	Register(ws, &funcWorker{fn: func(context.Context, *Job[greetArgs]) error {
+		return errors.New("boom")
+	}})
+	h := startLoopWith(t, mem, mem, ws, func(cfg *Config) {
+		cfg.RetryPolicy = atTimePolicy{at: time.Now().Add(time.Hour)}
+	})
+
+	row, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"})
+	if err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	waitFor(t, h.rowInState(row.ID, "retryable"), "failed job to be queued for retry")
+	h.stop(t)
+
+	logs := h.logs.String()
+	failure := ""
+	for _, line := range strings.Split(logs, "\n") {
+		if strings.Contains(line, `msg="drover: job execution failed"`) {
+			failure = line
+			break
+		}
+	}
+	if failure == "" {
+		t.Fatalf("no execution-failure record\nlogs:\n%s", logs)
+	}
+	if !strings.Contains(failure, "level=WARN") {
+		t.Errorf("execution failure logged as %q, want level=WARN", failure)
+	}
+	for _, want := range []string{"boom", "duration="} {
+		if !strings.Contains(failure, want) {
+			t.Errorf("execution-failure record missing %q: %s", want, failure)
+		}
+	}
+	// The disposition is still reported separately and exactly once: it
+	// carries what the execution record cannot, namely what became of the
+	// job afterwards.
+	if got := countRecords(logs, `msg="drover: job failed, retry scheduled"`); got != 1 {
+		t.Errorf("retry-scheduled records = %d, want 1\nlogs:\n%s", got, logs)
+	}
+}
+
+func TestLoggingRunsEvenWhenTheCallerConfiguresMiddleware(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	mem := memdriver.New()
+	ws := NewWorkers()
+	Register(ws, &funcWorker{fn: func(context.Context, *Job[greetArgs]) error { return nil }})
+
+	// The harness's own writer cannot be read from inside the middleware —
+	// the harness does not exist yet when the closure is built — so the
+	// test supplies the logger it will assert on.
+	logs := &syncWriter{}
+	var sawStart atomic.Bool
+	h := startLoopWith(t, mem, mem, ws, func(cfg *Config) {
+		cfg.Logger = newTestLogger(logs)
+		cfg.Middleware = []Middleware{func(next Handler) Handler {
+			return func(ctx context.Context, job *JobRow) error {
+				// The built-in logging is outermost, so by the time a
+				// configured middleware runs the start record already exists.
+				sawStart.Store(strings.Contains(logs.String(), `msg="drover: job started"`))
+				return next(ctx, job)
+			}
+		}}
+	})
+
+	row, err := h.client.Insert(context.Background(), greetArgs{Name: "ada"})
+	if err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	waitFor(t, h.rowInState(row.ID, "completed"), "job to complete")
+	h.stop(t)
+
+	out := logs.String()
+	if got := countRecords(out, `msg="drover: job started"`); got != 1 {
+		t.Errorf("start records = %d, want 1 — configuring middleware lost the built-in logging\nlogs:\n%s", got, out)
+	}
+	if !sawStart.Load() {
+		t.Error("the built-in logging did not run outside the configured middleware")
+	}
 }

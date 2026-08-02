@@ -101,8 +101,6 @@ func (c *Client) Stop(ctx context.Context) error {
 // records an outcome never is (AD-027).
 func (c *Client) runJob(jobCtx context.Context, row *driver.JobRow) {
 	start := time.Now()
-	c.logger.Info("drover: job started",
-		"job_id", row.ID, "kind", row.Kind, "attempt", row.Attempt)
 
 	// Tracked from claim to finalize, which is exactly the window in
 	// which this job's lease must not lapse.
@@ -125,13 +123,13 @@ func (c *Client) runJob(jobCtx context.Context, row *driver.JobRow) {
 		c.dispose(ctx, row, err, time.Since(start))
 		return
 	}
+	// No record on the way out: the logging middleware already reported
+	// the execution and its duration, and a second success line here
+	// would be the same event told twice. A write that does not land is
+	// still reported, by writeFailed.
 	if err := c.drv.MarkCompleted(ctx, lease); err != nil {
 		c.writeFailed(row, err)
-		return
 	}
-	c.logger.Info("drover: job completed",
-		"job_id", row.ID, "kind", row.Kind, "attempt", row.Attempt,
-		"duration", time.Since(start))
 }
 
 // execute runs the middleware chain for one job.

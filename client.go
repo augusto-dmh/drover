@@ -206,7 +206,13 @@ func newClient(drv driver.Driver, cfg Config) *Client {
 	if c.concurrency <= 0 {
 		c.concurrency = defaultConcurrency
 	}
-	c.chain = wrap(c.dispatch, checkedMiddleware(cfg.Middleware))
+	// Logging goes outermost, ahead of whatever the caller configured, so
+	// that per-job logging survives a caller adding middleware of their
+	// own — and so its duration covers their middleware too.
+	c.chain = wrap(c.dispatch, append(
+		[]Middleware{Logging(c.logger)},
+		checkedMiddleware(cfg.Middleware)...,
+	))
 	return c
 }
 

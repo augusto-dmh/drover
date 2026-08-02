@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"runtime/debug"
 	"slices"
+	"time"
 )
 
 // Handler executes one job and reports whether the attempt succeeded.
@@ -68,4 +70,79 @@ func stackOf(err error) []byte {
 		return pe.stack
 	}
 	return nil
+}
+
+// Timeout bounds how long a job's handler may run. When d elapses the
+// context passed on to the rest of the chain is cancelled with
+// context.DeadlineExceeded, which is the only way drover can ask a
+// handler to stop: Go offers no way to halt a goroutine, so a handler
+// that ignores its context runs to completion regardless.
+//
+// The handler's own outcome is passed through untouched, including when
+// it returns after its deadline expired. Substituting an error of the
+// middleware's own would misreport a handler that ignored cancellation
+// and genuinely succeeded — work that was really done, recorded as
+// failed and then done again on the retry.
+//
+// A d of zero or less applies no deadline, consistent with how every
+// other duration drover takes treats a non-positive value.
+//
+// The deadline covers the handler alone. The context under which the
+// attempt's outcome is recorded is derived separately and is never
+// cancelled, so a job cut off by its timeout still finalizes rather than
+// sitting running until its lease lapses (AD-027).
+func Timeout(d time.Duration) Middleware {
+	return func(next Handler) Handler {
+		if d <= 0 {
+			return next
+		}
+		return func(ctx context.Context, job *JobRow) error {
+			ctx, cancel := context.WithTimeout(ctx, d)
+			defer cancel()
+			return next(ctx, job)
+		}
+	}
+}
+
+// Logging reports each job execution: one record when it starts and one
+// when it ends, the latter carrying how long it took.
+//
+// A failed execution is reported at WARN rather than ERROR. A handler
+// returning an error is designed behaviour that the retry machinery
+// expects and handles, so logging it at ERROR would fill an operator's
+// error budget with jobs that are working exactly as intended. Whether
+// anything is actually wrong is decided when the attempt is disposed of,
+// and that is where the ERROR lives — on a job that has exhausted its
+// attempts.
+//
+// A nil logger falls back to slog.Default().
+//
+// The client installs this itself, outermost, so job logging does not
+// disappear the moment a caller configures a middleware of their own. It
+// is exported because it is also the smallest complete example of
+// writing one.
+func Logging(logger *slog.Logger) Middleware {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return func(next Handler) Handler {
+		return func(ctx context.Context, job *JobRow) error {
+			attrs := []any{
+				"job_id", job.ID, "kind", job.Kind,
+				"queue", job.Queue, "attempt", job.Attempt,
+			}
+			logger.Info("drover: job started", attrs...)
+
+			start := time.Now()
+			err := next(ctx, job)
+			attrs = append(attrs, "duration", time.Since(start))
+
+			if err != nil {
+				logger.Warn("drover: job execution failed", append(attrs, "error", err)...)
+				return err
+			}
+			logger.Info("drover: job execution finished", attrs...)
+			return nil
+		}
+	}
 }

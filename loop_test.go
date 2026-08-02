@@ -390,7 +390,7 @@ func TestStartExecutesJobToCompletion(t *testing.T) {
 	}
 	logs := h.logs.String()
 	for _, want := range []string{
-		`msg="drover: job started"`, `msg="drover: job completed"`,
+		`msg="drover: job started"`, `msg="drover: job execution finished"`,
 		"job_id=" + fmt.Sprint(row.ID), "kind=greet", "attempt=1", "duration=",
 	} {
 		if !strings.Contains(logs, want) {
