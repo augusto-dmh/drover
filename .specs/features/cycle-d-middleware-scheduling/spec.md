@@ -265,22 +265,22 @@ assert both queues drain while `high` is selected first materially more often th
 
 | Requirement ID | Story | Phase | Status |
 | --- | --- | --- | --- |
-| MW-01 | P1: Middleware chain | Design | Pending |
-| MW-02 | P1: Middleware chain | Design | Pending |
-| MW-03 | P1: Middleware chain | Design | Pending |
-| MW-04 | P1: Middleware chain | Design | Pending |
-| MW-05 | P1: Middleware chain | Design | Pending |
-| TMO-01 | P1: Timeout middleware | Design | Pending |
-| TMO-02 | P1: Timeout middleware | Design | Pending |
-| LOG-01 | P1: Logging middleware | Design | Pending |
-| LOG-02 | P1: Logging middleware | Design | Pending |
-| SCHED-01 | P1: Scheduled and queued enqueue | Design | Pending |
-| SCHED-02 | P1: Scheduled and queued enqueue | Design | Pending |
-| SCHED-03 | P1: Scheduled and queued enqueue | Design | Pending |
-| QUEUE-01 | P1: Named queues with weighted fetch | Design | Pending |
-| QUEUE-02 | P1: Named queues with weighted fetch | Design | Pending |
-| QUEUE-03 | P1: Named queues with weighted fetch | Design | Pending |
-| QUEUE-04 | P1: Named queues with weighted fetch | Design | Pending |
+| MW-01 | P1: Middleware chain | Implementing | Implemented |
+| MW-02 | P1: Middleware chain | Implementing | Implemented |
+| MW-03 | P1: Middleware chain | Implementing | Implemented |
+| MW-04 | P1: Middleware chain | Implementing | Implemented |
+| MW-05 | P1: Middleware chain | Implementing | Implemented |
+| TMO-01 | P1: Timeout middleware | Implementing | Implemented |
+| TMO-02 | P1: Timeout middleware | Implementing | Implemented |
+| LOG-01 | P1: Logging middleware | Implementing | Implemented |
+| LOG-02 | P1: Logging middleware | Implementing | Implemented |
+| SCHED-01 | P1: Scheduled and queued enqueue | Implementing | Implemented |
+| SCHED-02 | P1: Scheduled and queued enqueue | Implementing | Implemented |
+| SCHED-03 | P1: Scheduled and queued enqueue | Implementing | Implemented |
+| QUEUE-01 | P1: Named queues with weighted fetch | Implementing | Implemented |
+| QUEUE-02 | P1: Named queues with weighted fetch | Implementing | Implemented |
+| QUEUE-03 | P1: Named queues with weighted fetch | Implementing | Implemented |
+| QUEUE-04 | P1: Named queues with weighted fetch | Implementing | Implemented |
 
 **Requirement definitions**
 
@@ -322,7 +322,7 @@ assert both queues drain while `high` is selected first materially more often th
 
 **Status values:** Pending → In Design → In Tasks → Implementing → Verified
 
-**Coverage:** 16 total, 0 mapped to tasks yet.
+**Coverage:** 16 total, 16 mapped to tasks, 0 unmapped.
 
 ---
 
