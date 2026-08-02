@@ -1,6 +1,7 @@
 package drover
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"time"
@@ -155,4 +156,35 @@ func (m *metricSet) setOldestAge(queue string, seconds float64) {
 func (m *metricSet) skipSeries(queue string, err error) {
 	m.logger.Warn("drover: queue name cannot be used as a metric label; skipping its series",
 		"queue", queue, "error", err)
+}
+
+// metricsMiddleware records each execution as it happens: that it is
+// running while it runs, how long it took, and which way it went.
+//
+// It reads as a sibling of Logging and sits immediately inside it, which
+// is what lets it observe the failures that never reach a registered
+// worker — a panicking handler, a kind this binary does not know —
+// because both arrive as ordinary errors from further down the chain.
+//
+// The in-flight gauge is decremented from a defer rather than after the
+// call, so an execution that unwinds past this frame still leaves the
+// gauge where it found it. Its counters, though, describe executions
+// rather than jobs: a job that fails four times and then succeeds is
+// four failures and one completion, not one of either.
+//
+// Unexported: the client installs it on every client it builds, so there
+// is nothing for a caller to do with a constructor except install it
+// twice.
+func metricsMiddleware(m *metricSet) Middleware {
+	return func(next Handler) Handler {
+		return func(ctx context.Context, job *JobRow) error {
+			m.executing.Inc()
+			defer m.executing.Dec()
+
+			start := time.Now()
+			err := next(ctx, job)
+			m.observeExecution(job.Queue, time.Since(start), err)
+			return err
+		}
+	}
 }

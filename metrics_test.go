@@ -1,14 +1,18 @@
 package drover
 
 import (
+	"context"
 	"errors"
 	"maps"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/augusto-dmh/drover/internal/memdriver"
 )
 
 // sample is one published series, flattened out of what Gather returns so
@@ -294,6 +298,177 @@ func TestAnUnusableQueueNameSkipsOneSeriesWithoutPanicking(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// An implementation that incremented both counters, or neither, would
+// still satisfy a test that only watched the one it expected to move —
+// so both are asserted on both paths, and the duration alongside them.
+func TestMetricsMiddlewareMovesExactlyOneCounterPerExecution(t *testing.T) {
+	t.Parallel()
+
+	failure := errors.New("the handler's own error")
+	tests := []struct {
+		name          string
+		ret           error
+		wantCompleted float64
+		wantFailed    float64
+	}{
+		{"a handler that returns nil", nil, 1, 0},
+		{"a handler that returns an error", failure, 0, 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			m, reg, _ := newTestMetricSet(t, 4)
+			h := metricsMiddleware(m)(func(ctx context.Context, job *JobRow) error {
+				return tt.ret
+			})
+
+			// A queue of its own, so a label taken from anywhere but the job
+			// fails the assertion rather than matching by coincidence.
+			err := h(context.Background(), &JobRow{ID: 1, Kind: "greet", Queue: "critical"})
+
+			// The chain's error is the attempt's verdict: a middleware that
+			// recorded the failure and then swallowed it would leave every
+			// counter right and every job wrongly completed.
+			if !errors.Is(err, tt.ret) {
+				t.Errorf("middleware returned %v, want the handler's own %v", err, tt.ret)
+			}
+
+			labels := map[string]string{"queue": "critical"}
+			for _, want := range []struct {
+				family string
+				value  float64
+			}{
+				{"drover_jobs_completed_total", tt.wantCompleted},
+				{"drover_jobs_failed_total", tt.wantFailed},
+			} {
+				got, ok := seriesFor(t, reg, want.family, labels)
+				if !ok && want.value != 0 {
+					t.Errorf("%s published no series for queue critical, want %v", want.family, want.value)
+					continue
+				}
+				if got.value != want.value {
+					t.Errorf("%s{queue=critical} = %v, want %v", want.family, got.value, want.value)
+				}
+			}
+
+			duration, ok := seriesFor(t, reg, "drover_job_duration_seconds", labels)
+			if !ok {
+				t.Fatal("no drover_job_duration_seconds series for queue critical")
+			}
+			if duration.value != 1 {
+				t.Errorf("drover_job_duration_seconds{queue=critical} holds %v observations, want 1", duration.value)
+			}
+		})
+	}
+}
+
+// A panicking worker must be counted, and counted as a failure. The
+// recovery around the registered worker is what turns its panic into an
+// ordinary error for everything wrapped around it; without that, the
+// panic would unwind past this middleware and the execution would be
+// missing from the metrics entirely rather than merely miscounted. The
+// real dispatch is used here because that recovery is the thing under
+// test.
+func TestMetricsMiddlewareCountsAPanickingWorkerAsFailed(t *testing.T) {
+	t.Parallel()
+
+	ws := NewWorkers()
+	Register(ws, &funcWorker{fn: func(context.Context, *Job[greetArgs]) error {
+		panic("kaboom")
+	}})
+	c := newClient(memdriver.New(), Config{Workers: ws})
+	m, reg, _ := newTestMetricSet(t, 4)
+
+	// Args the registered kind can decode: without them the typed worker
+	// is never reached, and the execution would be counted for a decoding
+	// failure while claiming to be about a panic.
+	job := &JobRow{ID: 1, Kind: "greet", Queue: "default", Args: []byte(`{"name":"ada"}`)}
+	h := wrap(c.dispatch, []Middleware{metricsMiddleware(m)})
+	err := h(context.Background(), job)
+	if err == nil {
+		t.Fatal("the chain returned nil for a panicking worker")
+	}
+	if !strings.Contains(err.Error(), "kaboom") {
+		t.Fatalf("the chain returned %q, want the worker's panic", err)
+	}
+
+	labels := map[string]string{"queue": "default"}
+	failed, ok := seriesFor(t, reg, "drover_jobs_failed_total", labels)
+	if !ok {
+		t.Fatal("a panicking worker was not counted at all")
+	}
+	if failed.value != 1 {
+		t.Errorf("drover_jobs_failed_total{queue=default} = %v, want 1", failed.value)
+	}
+	if completed, ok := seriesFor(t, reg, "drover_jobs_completed_total", labels); ok && completed.value != 0 {
+		t.Errorf("drover_jobs_completed_total{queue=default} = %v, want 0 — a panic was counted as a success", completed.value)
+	}
+	if duration, ok := seriesFor(t, reg, "drover_job_duration_seconds", labels); !ok || duration.value != 1 {
+		t.Errorf("drover_job_duration_seconds{queue=default} holds %v observations (published: %t), want 1", duration.value, ok)
+	}
+}
+
+// The gauge answers "how much of the pool is busy", so it has to reach
+// the number of jobs actually inside the chain and come back down. A
+// decrement that ran only on the success path would drift upwards until
+// the gauge read saturated forever.
+func TestExecutingGaugeRisesWithJobsInTheChainAndReturnsToZero(t *testing.T) {
+	t.Parallel()
+
+	const concurrency = 3
+	m, reg, _ := newTestMetricSet(t, concurrency)
+
+	entered := make(chan struct{}, concurrency)
+	release := make(chan struct{})
+	failure := errors.New("boom")
+	h := metricsMiddleware(m)(func(ctx context.Context, job *JobRow) error {
+		entered <- struct{}{}
+		<-release
+		// One of the three fails, so the decrement is exercised on both
+		// paths within the same run.
+		if job.ID == 1 {
+			return failure
+		}
+		return nil
+	})
+
+	var wg sync.WaitGroup
+	for i := range concurrency {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = h(context.Background(), &JobRow{ID: int64(i) + 1, Kind: "greet", Queue: "default"})
+		}()
+	}
+	for range concurrency {
+		<-entered
+	}
+
+	peak, ok := seriesFor(t, reg, "drover_jobs_executing", map[string]string{})
+	if !ok {
+		t.Fatal("drover_jobs_executing was not published")
+	}
+	// Equality, not "at least": the gauge counts executions inside the
+	// chain, and a value above the pool's concurrency would be reporting
+	// jobs that cannot exist.
+	if peak.value != concurrency {
+		t.Errorf("drover_jobs_executing = %v with %d jobs in the chain, want %d", peak.value, concurrency, concurrency)
+	}
+
+	close(release)
+	wg.Wait()
+
+	settled, ok := seriesFor(t, reg, "drover_jobs_executing", map[string]string{})
+	if !ok {
+		t.Fatal("drover_jobs_executing was not published after the jobs finished")
+	}
+	if settled.value != 0 {
+		t.Errorf("drover_jobs_executing = %v once nothing is running, want 0", settled.value)
 	}
 }
 
