@@ -82,7 +82,7 @@ func (c *Client) rescueOnce(ctx context.Context) (int, error) {
 			c.logger.Warn("drover: job lease expired, worker presumed dead",
 				"job_id", row.ID, "kind", row.Kind, "attempt", row.Attempt,
 				"max_attempts", row.MaxAttempts)
-			c.dispose(disposeCtx, row, errLeaseExpired, nil, 0)
+			c.dispose(disposeCtx, row, errLeaseExpired, 0)
 			rescued++
 		}
 

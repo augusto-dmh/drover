@@ -4,8 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-
-	"github.com/augusto-dmh/drover/internal/driver"
 )
 
 // Worker executes jobs whose args decode to T. Implementations must be
@@ -20,20 +18,17 @@ type Worker[T JobArgs] interface {
 // versions.
 type WorkerDefaults[T JobArgs] struct{}
 
-// workFunc adapts a typed Worker to the untyped row the loop fetches.
-type workFunc func(ctx context.Context, row *driver.JobRow) error
-
 // Workers maps job kinds to registered workers.
 type Workers struct {
-	handlers map[string]workFunc
+	handlers map[string]Handler
 }
 
 // NewWorkers returns an empty registry.
 func NewWorkers() *Workers {
-	return &Workers{handlers: make(map[string]workFunc)}
+	return &Workers{handlers: make(map[string]Handler)}
 }
 
-func (w *Workers) handler(kind string) (workFunc, bool) {
+func (w *Workers) handler(kind string) (Handler, bool) {
 	fn, ok := w.handlers[kind]
 	return fn, ok
 }
@@ -47,15 +42,15 @@ func Register[T JobArgs](ws *Workers, worker Worker[T]) {
 	if _, dup := ws.handlers[kind]; dup {
 		panic(fmt.Sprintf("drover: worker already registered for kind %q", kind))
 	}
-	ws.handlers[kind] = func(ctx context.Context, row *driver.JobRow) error {
+	ws.handlers[kind] = func(ctx context.Context, job *JobRow) error {
 		var args T
-		if err := json.Unmarshal(row.Args, &args); err != nil {
-			return fmt.Errorf("decode args for job %d (kind %q): %w", row.ID, row.Kind, err)
+		if err := json.Unmarshal(job.Args, &args); err != nil {
+			return fmt.Errorf("decode args for job %d (kind %q): %w", job.ID, job.Kind, err)
 		}
 		return worker.Work(ctx, &Job[T]{
-			ID:        row.ID,
-			Attempt:   row.Attempt,
-			CreatedAt: row.CreatedAt,
+			ID:        job.ID,
+			Attempt:   job.Attempt,
+			CreatedAt: job.CreatedAt,
 			Args:      args,
 		})
 	}

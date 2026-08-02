@@ -117,6 +117,12 @@ type Client struct {
 	concurrency       int
 	inflight          *inflightSet
 
+	// chain is the composed middleware stack with dispatch at its
+	// centre. It is built once at construction and never rebuilt: every
+	// pool worker calls it concurrently, so anything mutable in here
+	// would be a data race on every job.
+	chain Handler
+
 	// mu guards runner, which is nil until Start and holds the running
 	// pool thereafter. It is the whole of the client's lifecycle state:
 	// everything else above is configuration and is never written after
@@ -187,6 +193,7 @@ func newClient(drv driver.Driver, cfg Config) *Client {
 	if c.concurrency <= 0 {
 		c.concurrency = defaultConcurrency
 	}
+	c.chain = wrap(c.dispatch, nil)
 	return c
 }
 
