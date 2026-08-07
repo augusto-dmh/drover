@@ -118,8 +118,24 @@
 // Start returns ErrNotStarted; calling it again returns the first call's
 // verdict without blocking.
 //
-// # Current limitations
+// # Observability
 //
-// Metrics are not implemented yet; they arrive in a later cycle of
-// docs/rfc/0001 in the repository.
+// Every client records Prometheus metrics on Config.MetricsRegistry,
+// defaulting to a private registry per client. Per-execution counters
+// and a duration histogram are recorded by a middleware installed
+// inside Logging; queue depth and oldest-job age gauges are refreshed
+// from the store on Config.StatsInterval (default fifteen seconds).
+//
+// Config.OpsAddr binds a dedicated listener for GET /metrics, /healthz,
+// and /readyz. An empty address records metrics without serving them.
+// /healthz always returns 200; /readyz returns 503 when the client is
+// not started or the last gauge refresh is older than twice
+// StatsInterval — typically because the database is unreachable.
+//
+// drover_jobs_failed_total counts failed executions (attempts), not
+// jobs that reached dead; use drover_queue_depth{state="dead"} for
+// permanent failures. drover_queue_depth deliberately excludes
+// completed and cancelled states. See the README observability section
+// for every metric family, a compiling configuration snippet, and the
+// recommended alerting expression over drover_oldest_job_age_seconds.
 package drover

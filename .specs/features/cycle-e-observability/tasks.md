@@ -447,17 +447,17 @@ goroutine.
 **Requirement**: OBS-13
 
 **Done when**:
-- [ ] Every metric family listed with type, labels, and meaning
-- [ ] `drover_jobs_failed_total` explicitly described as counting attempts, not deaths, with
+- [x] Every metric family listed with type, labels, and meaning
+- [x] `drover_jobs_failed_total` explicitly described as counting attempts, not deaths, with
       `drover_queue_depth{state="dead"}` named as the permanent-failure signal
-- [ ] `completed` and `cancelled` documented as deliberately absent from the depth gauge
-- [ ] A concrete alerting expression over `drover_oldest_job_age_seconds`, with a sentence
+- [x] `completed` and `cancelled` documented as deliberately absent from the depth gauge
+- [x] A concrete alerting expression over `drover_oldest_job_age_seconds`, with a sentence
       on why it is the recommended primary alert
-- [ ] The configuration snippet compiles against the package as shipped — verify by
+- [x] The configuration snippet compiles against the package as shipped — verify by
       building it, not by reading it (this exact class of error escaped a prior cycle)
-- [ ] `doc.go:123`'s "Metrics are not implemented yet" removed
-- [ ] The roadmap line at `README.md:80` reflects observability as shipped
-- [ ] Gate passes: `go build ./... && go vet ./...`
+- [x] `doc.go:123`'s "Metrics are not implemented yet" removed
+- [x] The roadmap line at `README.md:80` reflects observability as shipped
+- [x] Gate passes: `go build ./... && go vet ./...`
 
 **Tests**: none
 **Gate**: build
