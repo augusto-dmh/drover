@@ -473,14 +473,14 @@ goroutine.
 **Requirement**: —
 
 **Done when**:
-- [ ] One row per decision D-1…D-11 from `context.md`, in the established one-line style
+- [x] One row per decision D-1…D-11 from `context.md`, in the established one-line style
       with its source
-- [ ] `## Handoff` rewritten for this cycle: what shipped, what review should look at, known
+- [x] `## Handoff` rewritten for this cycle: what shipped, what review should look at, known
       weak sensors, and the next cycle
-- [ ] The unowned terminal-row retention gap from the design's risk table is carried forward
+- [x] The unowned terminal-row retention gap from the design's risk table is carried forward
       explicitly — no roadmap row owns it
-- [ ] `## Roadmap progress` is **not** touched here; it needs the PR number and merge date
-- [ ] Gate passes: `go build ./... && go vet ./...`
+- [x] `## Roadmap progress` is **not** touched here; it needs the PR number and merge date
+- [x] Gate passes: `go build ./... && go vet ./...`
 
 **Tests**: none
 **Gate**: build
