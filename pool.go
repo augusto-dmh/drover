@@ -65,11 +65,13 @@ type runner struct {
 	stopHeartbeat chan struct{}
 
 	goroutines sync.WaitGroup // fetch loop and workers
-	background sync.WaitGroup // heartbeat and rescuer
+	background sync.WaitGroup // heartbeat, rescuer, and stats refresher
 
 	shutdown sync.Once
 	done     chan struct{} // closed once the shutdown has finished
 	stopErr  error         // written before done is closed
+
+	refresher *statsRefresher
 }
 
 func newRunner(ctx context.Context, c *Client) *runner {
@@ -95,6 +97,9 @@ func newRunner(ctx context.Context, c *Client) *runner {
 		cancelJobs:       cancelJobs,
 		stopHeartbeat:    make(chan struct{}),
 		done:             make(chan struct{}),
+		refresher: newStatsRefresher(
+			c.drv, c.metrics, c.queues, c.statsInterval, c.logger,
+		),
 	}
 	for i := 0; i < r.concurrency; i++ {
 		r.slots <- struct{}{}
@@ -102,10 +107,11 @@ func newRunner(ctx context.Context, c *Client) *runner {
 	return r
 }
 
-// start launches the pool: the heartbeat and rescuer that support it,
-// the fetch loop that feeds it, and one goroutine per worker.
+// start launches the pool: the heartbeat, rescuer, and stats refresher
+// that support it, the fetch loop that feeds it, and one goroutine per
+// worker.
 func (r *runner) start(ctx context.Context) {
-	r.background.Add(2)
+	r.background.Add(3)
 	go func() {
 		defer r.background.Done()
 		r.client.heartbeat(r.stopHeartbeat)
@@ -113,6 +119,10 @@ func (r *runner) start(ctx context.Context) {
 	go func() {
 		defer r.background.Done()
 		r.client.rescueLoop(r.fetchCtx)
+	}()
+	go func() {
+		defer r.background.Done()
+		r.refresher.run(r.fetchCtx)
 	}()
 
 	r.goroutines.Add(1)

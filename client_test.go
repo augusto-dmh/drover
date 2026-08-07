@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/goleak"
 
 	"github.com/augusto-dmh/drover/internal/memdriver"
@@ -145,6 +146,9 @@ func TestConfigZeroValuesGetDefaults(t *testing.T) {
 	}
 	if c.concurrency != 10 {
 		t.Errorf("Concurrency default = %d, want 10", c.concurrency)
+	}
+	if c.statsInterval != 15*time.Second {
+		t.Errorf("StatsInterval default = %v, want 15s", c.statsInterval)
 	}
 }
 
@@ -366,5 +370,128 @@ func TestScheduledJobRunsOnlyOnceItIsDue(t *testing.T) {
 	}
 	if at.Before(due) {
 		t.Errorf("job ran at %v, before its scheduled time %v", at, due)
+	}
+}
+
+func TestStatsIntervalZeroTakesTheDefaultSilently(t *testing.T) {
+	t.Parallel()
+
+	logs := &syncWriter{}
+	c := newClient(memdriver.New(), Config{
+		Logger:        newTestLogger(logs),
+		StatsInterval: 0,
+	})
+	if c.statsInterval != defaultStatsInterval {
+		t.Errorf("statsInterval = %v, want %v", c.statsInterval, defaultStatsInterval)
+	}
+	if strings.Contains(logs.String(), "stats interval") {
+		t.Errorf("zero StatsInterval logged a warning; unset must default silently\nlogs:\n%s", logs)
+	}
+}
+
+func TestStatsIntervalNonPositiveWarnsAndDefaults(t *testing.T) {
+	t.Parallel()
+
+	logs := &syncWriter{}
+	c := newClient(memdriver.New(), Config{
+		Logger:        newTestLogger(logs),
+		StatsInterval: -time.Second,
+	})
+	if c.statsInterval != defaultStatsInterval {
+		t.Errorf("statsInterval = %v, want %v", c.statsInterval, defaultStatsInterval)
+	}
+	if !strings.Contains(logs.String(), `level=WARN msg="drover: stats interval must be positive; using the default instead"`) {
+		t.Errorf("logs missing the stats-interval warning\nlogs:\n%s", logs)
+	}
+}
+
+func TestStatsIntervalExplicitPositiveIsKept(t *testing.T) {
+	t.Parallel()
+
+	c := newClient(memdriver.New(), Config{StatsInterval: 3 * time.Second})
+	if c.statsInterval != 3*time.Second {
+		t.Errorf("statsInterval = %v, want 3s", c.statsInterval)
+	}
+}
+
+// A client that is never started must not touch the store for gauges:
+// constructing one with the ops surface configured is not a signal to
+// begin polling.
+func TestNeverStartedClientIssuesNoStatsCall(t *testing.T) {
+	t.Parallel()
+
+	drv := &scriptedStatsDriver{Driver: memdriver.New()}
+	_ = newClient(drv, Config{
+		MetricsRegistry: prometheus.NewRegistry(),
+		StatsInterval:   time.Millisecond,
+	})
+	if n := drv.calls.Load(); n != 0 {
+		t.Errorf("Stats calls = %d on a never-started client, want 0", n)
+	}
+}
+
+// Scrapes read gauges; they must not pull a fresh Stats reading. The
+// call count across many gathers inside one interval is the sensor —
+// not an inspection of whether Gather calls the driver.
+func TestGatherWithinOneIntervalIssuesNoStatsCall(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	drv := &scriptedStatsDriver{Driver: memdriver.New()}
+	reg := prometheus.NewRegistry()
+	c := newClient(drv, Config{
+		Workers:         NewWorkers(),
+		Logger:          newTestLogger(&syncWriter{}),
+		PollInterval:    time.Hour,
+		MetricsRegistry: reg,
+		StatsInterval:   time.Hour,
+		Concurrency:     1,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	waitFor(t, func() bool { return drv.calls.Load() >= 1 }, "the immediate first refresh")
+	settled := drv.calls.Load()
+
+	for i := 0; i < 50; i++ {
+		if _, err := reg.Gather(); err != nil {
+			t.Fatalf("Gather #%d: %v", i, err)
+		}
+	}
+
+	if after := drv.calls.Load(); after != settled {
+		t.Errorf("Stats calls rose from %d to %d across gathers inside one interval — scrape must not query the store",
+			settled, after)
+	}
+
+	if err := c.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+func TestStopJoinsTheStatsRefresher(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	drv := &scriptedStatsDriver{Driver: memdriver.New()}
+	c := newClient(drv, Config{
+		Workers:       NewWorkers(),
+		Logger:        newTestLogger(&syncWriter{}),
+		PollInterval:  time.Hour,
+		StatsInterval: 5 * time.Millisecond,
+		Concurrency:   1,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	waitFor(t, func() bool { return drv.calls.Load() >= 1 }, "the refresher to start")
+
+	if err := c.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop: %v", err)
 	}
 }

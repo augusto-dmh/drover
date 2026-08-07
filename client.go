@@ -57,8 +57,8 @@ type JobRow struct {
 // for Logger, one second for PollInterval, an empty registry for
 // Workers, ExponentialRetryPolicy for RetryPolicy, one minute for
 // LeaseDuration, a third of the lease for HeartbeatInterval, the lease
-// duration itself for RescueInterval, and a registry of the client's own
-// for MetricsRegistry.
+// duration itself for RescueInterval, fifteen seconds for StatsInterval,
+// and a registry of the client's own for MetricsRegistry.
 type Config struct {
 	Workers      *Workers
 	Logger       *slog.Logger
@@ -159,6 +159,13 @@ type Config struct {
 	// you already serve; the client's own ops server is the alternative,
 	// not a requirement.
 	MetricsRegistry *prometheus.Registry
+
+	// StatsInterval is how often this client refreshes its queue depth
+	// and oldest-job-age gauges from the store. Unset, it defaults to
+	// fifteen seconds. A non-positive value is corrected to the default
+	// and reported: the gauges would otherwise never move, and an
+	// operator's alerts would go blind without a log line to explain why.
+	StatsInterval time.Duration
 }
 
 // Client enqueues jobs and runs the worker loop.
@@ -172,6 +179,7 @@ type Client struct {
 	heartbeatInterval time.Duration
 	rescueInterval    time.Duration
 	concurrency       int
+	statsInterval     time.Duration
 	queues            []weightedQueue
 	inflight          *inflightSet
 	metrics           *metricSet
@@ -251,6 +259,19 @@ func newClient(drv driver.Driver, cfg Config) *Client {
 	}
 	if c.concurrency <= 0 {
 		c.concurrency = defaultConcurrency
+	}
+	// Zero means unset and takes the default silently. A negative value
+	// is an explicit choice the caller got wrong, so it is corrected and
+	// reported the same way a heartbeat at or beyond the lease is.
+	switch {
+	case cfg.StatsInterval < 0:
+		c.logger.Warn("drover: stats interval must be positive; using the default instead",
+			"stats_interval", cfg.StatsInterval)
+		c.statsInterval = defaultStatsInterval
+	case cfg.StatsInterval == 0:
+		c.statsInterval = defaultStatsInterval
+	default:
+		c.statsInterval = cfg.StatsInterval
 	}
 	// After the logger is settled, so a corrected weight is reported
 	// through the logger the caller configured.
