@@ -81,7 +81,7 @@ v0.1.0 = cycles A–E of [RFC-0001](docs/rfc/0001-drover-roadmap.md): walking sk
 
 ## Documentation
 
-- [Architecture Decision Records](docs/adr/) — what was decided and why
+- [Architecture Decision Records](docs/adr/) — what was decided and why, including [observability (ADR-0005)](docs/adr/0005-prometheus-observability-via-ops-port-and-background-gauge-refresh.md)
 - [RFC-0001 roadmap](docs/rfc/0001-drover-roadmap.md) — what ships when
 - [Research](docs/research/) — the evidence behind the decisions (existing-system survey, storage mechanics, delivery semantics, conventions, scope)
 

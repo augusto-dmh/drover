@@ -425,13 +425,13 @@ goroutine.
 **Requirement**: OBS-13
 
 **Done when**:
-- [ ] Covers: Prometheus as the backend and what that commits the public API to; the
+- [x] Covers: Prometheus as the backend and what that commits the public API to; the
       refresher-versus-collect-on-scrape choice and why database load must not track scrape
       rate; the ops-port split; readiness derived from refresh freshness; and what is
       deliberately excluded (tracing, dashboards, push gateway)
-- [ ] Argues on technical merit only — the repository is public
-- [ ] Linked from the README's Documentation section
-- [ ] Gate passes: `go build ./... && go vet ./...`
+- [x] Argues on technical merit only — the repository is public
+- [x] Linked from the README's Documentation section
+- [x] Gate passes: `go build ./... && go vet ./...`
 
 **Tests**: none
 **Gate**: build
