@@ -67,7 +67,7 @@ func newStatsRefresher(
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &statsRefresher{
+	r := &statsRefresher{
 		drv:       drv,
 		metrics:   m,
 		queues:    queues,
@@ -75,6 +75,25 @@ func newStatsRefresher(
 		logger:    logger,
 		depthKeys: make(map[depthKey]struct{}),
 		ageKeys:   make(map[string]struct{}),
+	}
+	// Seed configured-queue series before the first Stats call returns so
+	// a scrape that arrives while that call is still in flight reads zero
+	// rather than omitting the series or waiting on the database.
+	r.seedConfiguredZeros()
+	return r
+}
+
+// seedConfiguredZeros publishes depth and age series at zero for every
+// configured queue. It does not advance lastSuccess: readiness still
+// waits on a real Stats reading.
+func (r *statsRefresher) seedConfiguredZeros() {
+	for _, q := range r.queues {
+		for _, state := range publishedDepthStates {
+			r.metrics.setDepth(q.name, state, 0)
+			r.depthKeys[depthKey{queue: q.name, state: state}] = struct{}{}
+		}
+		r.metrics.setOldestAge(q.name, 0)
+		r.ageKeys[q.name] = struct{}{}
 	}
 }
 

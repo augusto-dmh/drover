@@ -98,6 +98,108 @@ func TestRefreshSeedsConfiguredQueuesToZero(t *testing.T) {
 	}
 }
 
+// blockingStatsDriver holds the first Stats call until release is closed,
+// so a Gather can run while the first refresh is still in flight.
+type blockingStatsDriver struct {
+	driver.Driver
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (d *blockingStatsDriver) Stats(ctx context.Context) (*driver.Stats, error) {
+	d.once.Do(func() { close(d.entered) })
+	select {
+	case <-d.release:
+		return &driver.Stats{}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// A scrape that arrives while the first Stats call is still blocked must
+// already see configured-queue depth and age series at zero. Seeding
+// those children only after Stats returns would omit them; waiting on
+// Stats would couple scrape latency to the database.
+func TestGatherBeforeFirstRefreshServesConfiguredQueueZeros(t *testing.T) {
+	t.Parallel()
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	drv := &blockingStatsDriver{
+		Driver:  memdriver.New(),
+		entered: entered,
+		release: release,
+	}
+	m, reg, _ := newTestMetricSet(t, 1)
+	r := newStatsRefresher(drv, m, []weightedQueue{
+		{name: "critical", weight: 1},
+		{name: "bulk", weight: 1},
+	}, time.Hour, newTestLogger(&syncWriter{}))
+
+	refreshDone := make(chan error, 1)
+	go func() {
+		refreshDone <- r.refresh(context.Background())
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stats was never called")
+	}
+
+	gatherDone := make(chan error, 1)
+	go func() {
+		_, err := reg.Gather()
+		gatherDone <- err
+	}()
+
+	var gatherErr error
+	select {
+	case gatherErr = <-gatherDone:
+	case <-time.After(2 * time.Second):
+		close(release)
+		t.Fatal("Gather blocked while the first refresh was in flight")
+	}
+	if gatherErr != nil {
+		close(release)
+		t.Fatalf("Gather: %v", gatherErr)
+	}
+
+	for _, queue := range []string{"critical", "bulk"} {
+		for _, state := range publishedDepthStates {
+			s, ok := seriesFor(t, reg, "drover_queue_depth", map[string]string{
+				"queue": queue, "state": state,
+			})
+			if !ok {
+				t.Errorf("depth{%s,%s} missing before first refresh completed", queue, state)
+				continue
+			}
+			if s.value != 0 {
+				t.Errorf("depth{%s,%s} = %v, want 0", queue, state, s.value)
+			}
+		}
+		s, ok := seriesFor(t, reg, "drover_oldest_job_age_seconds", map[string]string{"queue": queue})
+		if !ok {
+			t.Errorf("oldest_job_age{%s} missing before first refresh completed", queue)
+			continue
+		}
+		if s.value != 0 {
+			t.Errorf("oldest_job_age{%s} = %v, want 0", queue, s.value)
+		}
+	}
+
+	close(release)
+	select {
+	case err := <-refreshDone:
+		if err != nil {
+			t.Fatalf("refresh after release: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("refresh did not return after Stats was released")
+	}
+}
+
 func TestRefreshPublishesDatabaseOnlyQueues(t *testing.T) {
 	t.Parallel()
 
