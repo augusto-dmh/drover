@@ -599,7 +599,7 @@ func TestClaimsNeverHandedToAWorkerGoBackToTheQueue(t *testing.T) {
 		t.Fatalf("claimed %d rows, want 2", len(claimed))
 	}
 
-	r := newRunner(context.Background(), c)
+	r := newRunner(context.Background(), c, nil)
 	defer r.cancelJobs()
 	defer r.cancelBackground()
 
@@ -644,7 +644,7 @@ func TestTheFetchLoopHandsBackRowsItNeverDispatched(t *testing.T) {
 	c := newPoolClient(mem, NewWorkers(), 2, nil)
 	ids := insertN(t, c, 2)
 
-	r := newRunner(context.Background(), c)
+	r := newRunner(context.Background(), c, nil)
 	defer r.cancelJobs()
 	defer r.cancelBackground()
 
@@ -759,7 +759,7 @@ func TestAHandBackThatLostItsRaceIsNotReportedAsAFailure(t *testing.T) {
 				t.Fatalf("FetchAvailable: %v", err)
 			}
 
-			r := newRunner(context.Background(), c)
+			r := newRunner(context.Background(), c, nil)
 			defer r.cancelJobs()
 			defer r.cancelBackground()
 			<-r.slots
@@ -805,7 +805,7 @@ func TestOneFailedHandBackDoesNotStopTheRest(t *testing.T) {
 		t.Fatalf("FetchAvailable: %v", err)
 	}
 
-	r := newRunner(context.Background(), c)
+	r := newRunner(context.Background(), c, nil)
 	defer r.cancelJobs()
 	defer r.cancelBackground()
 	for _, row := range claimed {
@@ -1105,7 +1105,7 @@ func TestEscalationReportsNothingWhenNothingWasStranded(t *testing.T) {
 	t.Parallel()
 
 	c := newPoolClient(memdriver.New(), NewWorkers(), 2, nil)
-	r := newRunner(context.Background(), c)
+	r := newRunner(context.Background(), c, nil)
 	defer r.cancelJobs()
 	defer r.cancelBackground()
 

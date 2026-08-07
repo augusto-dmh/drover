@@ -3,7 +3,10 @@ package drover
 import (
 	"context"
 	"errors"
+	"io"
 	"log/slog"
+	"net"
+	"net/http"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -490,6 +493,291 @@ func TestStopJoinsTheStatsRefresher(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 	waitFor(t, func() bool { return drv.calls.Load() >= 1 }, "the refresher to start")
+
+	if err := c.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+func opsBaseURL(t *testing.T, c *Client) string {
+	t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.runner == nil || c.runner.ops == nil {
+		t.Fatal("ops server is not running")
+	}
+	return "http://" + c.runner.ops.ln.Addr().String()
+}
+
+// An empty OpsAddr must start no listener and no ops goroutine: the
+// runner holds no ops server at all.
+func TestEmptyOpsAddrStartsNoOpsServer(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	c := newClient(memdriver.New(), Config{
+		Workers:      NewWorkers(),
+		Logger:       newTestLogger(&syncWriter{}),
+		PollInterval: time.Hour,
+		Concurrency:  1,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	c.mu.Lock()
+	opsNil := c.runner.ops == nil
+	c.mu.Unlock()
+	if !opsNil {
+		t.Fatal("ops server was started with an empty OpsAddr")
+	}
+	if err := c.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+// A port conflict fails Start naming the address and leaves the client
+// startable — nothing partially started.
+func TestUnbindableOpsAddrFailsStartCleanly(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	held, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer held.Close()
+	addr := held.Addr().String()
+
+	c := newClient(memdriver.New(), Config{
+		Workers:      NewWorkers(),
+		Logger:       newTestLogger(&syncWriter{}),
+		PollInterval: time.Hour,
+		Concurrency:  1,
+		OpsAddr:      addr,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	err = c.Start(ctx)
+	if err == nil {
+		t.Fatal("Start succeeded on a taken address, want bind error")
+	}
+	if !strings.Contains(err.Error(), addr) {
+		t.Fatalf("Start error = %q, want it to name %q", err, addr)
+	}
+	c.mu.Lock()
+	started := c.runner != nil
+	c.mu.Unlock()
+	if started {
+		t.Fatal("client was left partially started after a bind failure")
+	}
+
+	// Startable again on a free address.
+	c.opsAddr = "127.0.0.1:0"
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start after bind failure: %v", err)
+	}
+	if err := c.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+// After Stop the ops address must be bindable again — the listener is
+// gone, not merely closed from the caller's perspective.
+func TestOpsAddrRebindableAfterStop(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	c := newClient(memdriver.New(), Config{
+		Workers:       NewWorkers(),
+		Logger:        newTestLogger(&syncWriter{}),
+		PollInterval:  time.Hour,
+		StatsInterval: 20 * time.Millisecond,
+		Concurrency:   1,
+		OpsAddr:       "127.0.0.1:0",
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	addr := c.runner.ops.ln.Addr().String()
+	if err := c.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("rebind %s after Stop: %v", addr, err)
+	}
+	ln.Close()
+}
+
+// /readyz must flip to 503 the instant Stop begins, not one staleness
+// bound after the refresher is cancelled.
+func TestReadyz503FromInstantStop(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	ws := NewWorkers()
+	entered := make(chan int64, 1)
+	release := make(chan struct{})
+	Register(ws, blockingWorker(entered, release))
+
+	c := newClient(memdriver.New(), Config{
+		Workers:       ws,
+		Logger:        newTestLogger(&syncWriter{}),
+		PollInterval:  time.Millisecond,
+		StatsInterval: time.Hour, // staleness bound is huge; draining must still win
+		Concurrency:   1,
+		OpsAddr:       "127.0.0.1:0",
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	base := opsBaseURL(t, c)
+
+	waitFor(t, func() bool {
+		resp, err := http.Get(base + "/readyz")
+		if err != nil {
+			return false
+		}
+		resp.Body.Close()
+		return resp.StatusCode == http.StatusOK
+	}, "readyz to become ready after first refresh")
+
+	if _, err := c.Insert(context.Background(), greetArgs{Name: "ada"}, nil); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler never entered")
+	}
+
+	stopDone := make(chan error, 1)
+	go func() {
+		stopDone <- c.Stop(context.Background())
+	}()
+
+	waitFor(t, func() bool {
+		resp, err := http.Get(base + "/readyz")
+		if err != nil {
+			return false
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			return false
+		}
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return false
+		}
+		return strings.Contains(string(body), "draining")
+	}, "readyz to report draining while Stop waits")
+
+	close(release)
+	select {
+	case err := <-stopDone:
+		if err != nil {
+			t.Fatalf("Stop: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop did not return")
+	}
+}
+
+// Ops must answer throughout the drain: /metrics stays up while workers
+// finish, and the server is only shut down after they have.
+func TestOpsAnswersThroughoutDrain(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	ws := NewWorkers()
+	entered := make(chan int64, 1)
+	release := make(chan struct{})
+	Register(ws, blockingWorker(entered, release))
+
+	c := newClient(memdriver.New(), Config{
+		Workers:       ws,
+		Logger:        newTestLogger(&syncWriter{}),
+		PollInterval:  time.Millisecond,
+		StatsInterval: 20 * time.Millisecond,
+		Concurrency:   1,
+		OpsAddr:       "127.0.0.1:0",
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	base := opsBaseURL(t, c)
+
+	if _, err := c.Insert(context.Background(), greetArgs{Name: "ada"}, nil); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler never entered")
+	}
+
+	stopDone := make(chan error, 1)
+	go func() {
+		stopDone <- c.Stop(context.Background())
+	}()
+
+	waitFor(t, func() bool {
+		resp, err := http.Get(base + "/metrics")
+		if err != nil {
+			return false
+		}
+		resp.Body.Close()
+		return resp.StatusCode == http.StatusOK
+	}, "metrics to answer during drain")
+	waitFor(t, func() bool {
+		resp, err := http.Get(base + "/readyz")
+		if err != nil {
+			return false
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode == http.StatusServiceUnavailable
+	}, "readyz to answer 503 during drain")
+
+	close(release)
+	select {
+	case err := <-stopDone:
+		if err != nil {
+			t.Fatalf("Stop: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop did not return")
+	}
+}
+
+func TestStopJoinsOpsServer(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	c := newClient(memdriver.New(), Config{
+		Workers:       NewWorkers(),
+		Logger:        newTestLogger(&syncWriter{}),
+		PollInterval:  time.Hour,
+		StatsInterval: 20 * time.Millisecond,
+		Concurrency:   1,
+		OpsAddr:       "127.0.0.1:0",
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	base := opsBaseURL(t, c)
+	waitFor(t, func() bool {
+		resp, err := http.Get(base + "/healthz")
+		if err != nil {
+			return false
+		}
+		resp.Body.Close()
+		return resp.StatusCode == http.StatusOK
+	}, "ops healthz to answer")
 
 	if err := c.Stop(context.Background()); err != nil {
 		t.Fatalf("Stop: %v", err)

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"slices"
 	"time"
 
@@ -31,12 +32,27 @@ import (
 // backstop for the paths no shutdown code survives; a clean shutdown
 // loses nothing.
 func (c *Client) Start(ctx context.Context) error {
+	// Bind before any goroutine and before taking the lock. A port
+	// conflict must fail Start and leave the client startable again —
+	// not surface later as a log line from a half-started pool.
+	var ln net.Listener
+	if c.opsAddr != "" {
+		var err error
+		ln, err = net.Listen("tcp", c.opsAddr)
+		if err != nil {
+			return fmt.Errorf("drover: listen on ops address %q: %w", c.opsAddr, err)
+		}
+	}
+
 	c.mu.Lock()
 	if c.runner != nil {
 		c.mu.Unlock()
+		if ln != nil {
+			_ = ln.Close()
+		}
 		return ErrAlreadyStarted
 	}
-	r := newRunner(ctx, c)
+	r := newRunner(ctx, c, ln)
 	c.runner = r
 	// Launched under the lock, not after it. Publishing the runner and
 	// then starting it in two steps leaves a window in which Stop sees a

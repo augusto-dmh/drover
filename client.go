@@ -166,6 +166,14 @@ type Config struct {
 	// and reported: the gauges would otherwise never move, and an
 	// operator's alerts would go blind without a log line to explain why.
 	StatsInterval time.Duration
+
+	// OpsAddr is the address the client binds for /metrics, /healthz, and
+	// /readyz. Empty means no listener and no ops goroutine — the client
+	// still records metrics on its registry; it just does not serve them.
+	//
+	// Bind failure fails Start and starts nothing: a worker that is
+	// running but unreachable is the state this surface exists to remove.
+	OpsAddr string
 }
 
 // Client enqueues jobs and runs the worker loop.
@@ -180,9 +188,11 @@ type Client struct {
 	rescueInterval    time.Duration
 	concurrency       int
 	statsInterval     time.Duration
+	opsAddr           string
 	queues            []weightedQueue
 	inflight          *inflightSet
 	metrics           *metricSet
+	registry          *prometheus.Registry
 
 	// chain is the composed middleware stack with dispatch at its
 	// centre. It is built once at construction and never rebuilt: every
@@ -282,6 +292,8 @@ func newClient(drv driver.Driver, cfg Config) *Client {
 	if registry == nil {
 		registry = prometheus.NewRegistry()
 	}
+	c.registry = registry
+	c.opsAddr = cfg.OpsAddr
 	c.metrics = newMetricSet(registry, c.concurrency, c.logger)
 	// Logging goes outermost, ahead of whatever the caller configured, so
 	// that per-job logging survives a caller adding middleware of their

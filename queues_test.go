@@ -412,7 +412,7 @@ func TestSurplusIsClampedToWhatIsLeftOfTheRound(t *testing.T) {
 			Logger: newTestLogger(&syncWriter{}),
 			Queues: map[string]int{"thin": 1, "fat": 1},
 		})
-		r := newRunner(context.Background(), c)
+		r := newRunner(context.Background(), c, nil)
 
 		got := r.claimRound(capacity)
 		if len(got) > capacity {
@@ -497,7 +497,7 @@ func TestAClaimRoundNeverExceedsTheCapacityItWasGiven(t *testing.T) {
 			Logger: newTestLogger(&syncWriter{}),
 			Queues: map[string]int{"thin": 1, "fat": 1},
 		})
-		r := newRunner(context.Background(), c)
+		r := newRunner(context.Background(), c, nil)
 
 		got := r.claimRound(capacity)
 		if len(got) > capacity {
@@ -628,7 +628,7 @@ func TestEachQueueIsAskedOnlyForTheRemainingCapacity(t *testing.T) {
 			Logger: newTestLogger(&syncWriter{}),
 			Queues: map[string]int{"thin": 1, "fat": 1},
 		})
-		r := newRunner(context.Background(), c)
+		r := newRunner(context.Background(), c, nil)
 		r.claimRound(capacity)
 
 		drv.mu.Lock()

@@ -379,16 +379,16 @@ goroutine.
 **Requirement**: OBS-01, OBS-02, OBS-11
 
 **Done when**:
-- [ ] An empty `OpsAddr` binds nothing and starts no goroutine (OBS-01.2)
-- [ ] An unbindable address makes `Start` return an error naming it, and leaves the client
+- [x] An empty `OpsAddr` binds nothing and starts no goroutine (OBS-01.2)
+- [x] An unbindable address makes `Start` return an error naming it, and leaves the client
       startable again afterwards — nothing partially started (OBS-01.4, D-6)
-- [ ] The address is bindable again after `Stop` (OBS-01.3)
-- [ ] `/readyz` reports `503` from the instant `Stop` is called, not one staleness bound
+- [x] The address is bindable again after `Stop` (OBS-01.3)
+- [x] `/readyz` reports `503` from the instant `Stop` is called, not one staleness bound
       later (OBS-11.4)
-- [ ] The ops server is shut down after the workers drain, so `/readyz` and `/metrics`
+- [x] The ops server is shut down after the workers drain, so `/readyz` and `/metrics`
       answer throughout the drain (D-10)
-- [ ] A goleak lifecycle test with the ops server enabled passes
-- [ ] Gate passes: `go test -race ./...`
+- [x] A goleak lifecycle test with the ops server enabled passes
+- [x] Gate passes: `go test -race ./...`
 
 **Tests**: unit
 **Gate**: quick
