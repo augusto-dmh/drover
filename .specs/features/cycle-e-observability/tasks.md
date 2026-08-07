@@ -282,17 +282,17 @@ freshness timestamp.
 **Requirement**: OBS-06, OBS-07, OBS-09, OBS-11
 
 **Done when**:
-- [ ] `run` refreshes once immediately before its first tick (D-7 depends on this)
-- [ ] Configured queues are seeded to zero for every published state and for age, so an
+- [x] `run` refreshes once immediately before its first tick (D-7 depends on this)
+- [x] Configured queues are seeded to zero for every published state and for age, so an
       idle configured queue reads zero rather than missing (EDGE-02)
-- [ ] A queue present only in the database is published under its own label (EDGE-03)
-- [ ] A queue that drains away has its series deleted, and a test proves no `Reset()`-style
+- [x] A queue present only in the database is published under its own label (EDGE-03)
+- [x] A queue that drains away has its series deleted, and a test proves no `Reset()`-style
       window exists where a surviving series is momentarily absent
-- [ ] A failing refresh logs a warning, leaves previous gauge values untouched, and does
+- [x] A failing refresh logs a warning, leaves previous gauge values untouched, and does
       not advance the freshness timestamp (OBS-09)
-- [ ] `fresh` is a pure function of recorded state and is tested directly at, inside, and
+- [x] `fresh` is a pure function of recorded state and is tested directly at, inside, and
       beyond the staleness bound
-- [ ] Gate passes: `go test -race ./...`
+- [x] Gate passes: `go test -race ./...`
 
 **Tests**: unit
 **Gate**: quick
@@ -309,15 +309,15 @@ freshness timestamp.
 **Requirement**: OBS-08, OBS-09
 
 **Done when**:
-- [ ] `Config.StatsInterval`: zero takes the default silently; explicitly non-positive warns
+- [x] `Config.StatsInterval`: zero takes the default silently; explicitly non-positive warns
       and takes the default (EDGE-04, AD-037)
-- [ ] The refresher starts with the runner and is joined by `Stop`; a goleak lifecycle test
+- [x] The refresher starts with the runner and is joined by `Stop`; a goleak lifecycle test
       proves no goroutine outlives `Stop` (EDGE-05)
-- [ ] A client that is never started issues no `Stats` call (EDGE-09)
-- [ ] A test drives many gathers within one interval and asserts the driver's `Stats` call
+- [x] A client that is never started issues no `Stats` call (EDGE-09)
+- [x] A test drives many gathers within one interval and asserts the driver's `Stats` call
       count did not rise — this is OBS-08, the cycle's headline property, and it must be
       sensed by counting calls, not by inspecting the code
-- [ ] Gate passes: `go test -race ./...`
+- [x] Gate passes: `go test -race ./...`
 
 **Tests**: unit
 **Gate**: quick
@@ -334,11 +334,11 @@ freshness timestamp.
 **Requirement**: OBS-06, OBS-07
 
 **Done when**:
-- [ ] Jobs of known states and known wait ages are inserted, one refresh is awaited, and the
+- [x] Jobs of known states and known wait ages are inserted, one refresh is awaited, and the
       gathered gauge values match
-- [ ] A queue with only future-scheduled jobs reports age `0`, not the delay (ASM-08)
-- [ ] A dead job is reflected in `drover_queue_depth{state="dead"}`
-- [ ] Gate passes: `go test -race ./... && go test -race -tags=integration ./...`, plus lint (phase close)
+- [x] A queue with only future-scheduled jobs reports age `0`, not the delay (ASM-08)
+- [x] A dead job is reflected in `drover_queue_depth{state="dead"}`
+- [x] Gate passes: `go test -race ./... && go test -race -tags=integration ./...`, plus lint (phase close)
 
 **Tests**: integration
 **Gate**: full
