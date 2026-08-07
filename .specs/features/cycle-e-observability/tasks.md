@@ -405,10 +405,10 @@ goroutine.
 **Requirement**: OBS-10, OBS-11
 
 **Done when**:
-- [ ] Both endpoints return `200` against a healthy database
-- [ ] After the database becomes unreachable, `/readyz` returns `503` while `/healthz`
+- [x] Both endpoints return `200` against a healthy database
+- [x] After the database becomes unreachable, `/readyz` returns `503` while `/healthz`
       still returns `200` — the property that justifies having two endpoints at all
-- [ ] Gate passes: `go test -race ./... && go test -race -tags=integration ./...`, plus lint (phase close)
+- [x] Gate passes: `go test -race ./... && go test -race -tags=integration ./...`, plus lint (phase close)
 
 **Tests**: integration
 **Gate**: full

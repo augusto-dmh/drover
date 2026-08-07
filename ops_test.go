@@ -38,11 +38,15 @@ func startTestOps(t *testing.T, reg *prometheus.Registry, ready func() error) (b
 
 func get(t *testing.T, url string) (int, string) {
 	t.Helper()
-	resp, err := http.Get(url)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatalf("NewRequest %s: %v", url, err)
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("GET %s: %v", url, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("read body: %v", err)
@@ -164,7 +168,7 @@ func TestOpsShutdownJoinsServe(t *testing.T) {
 		if err != nil {
 			return false
 		}
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		return resp.StatusCode == http.StatusOK
 	}, "ops server to accept")
 

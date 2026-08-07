@@ -545,7 +545,7 @@ func TestUnbindableOpsAddrFailsStartCleanly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
-	defer held.Close()
+	defer func() { _ = held.Close() }()
 	addr := held.Addr().String()
 
 	c := newClient(memdriver.New(), Config{
@@ -608,7 +608,7 @@ func TestOpsAddrRebindableAfterStop(t *testing.T) {
 	if err != nil {
 		t.Fatalf("rebind %s after Stop: %v", addr, err)
 	}
-	ln.Close()
+	_ = ln.Close()
 }
 
 // /readyz must flip to 503 the instant Stop begins, not one staleness
@@ -641,7 +641,7 @@ func TestReadyz503FromInstantStop(t *testing.T) {
 		if err != nil {
 			return false
 		}
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		return resp.StatusCode == http.StatusOK
 	}, "readyz to become ready after first refresh")
 
@@ -664,7 +664,7 @@ func TestReadyz503FromInstantStop(t *testing.T) {
 		if err != nil {
 			return false
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode != http.StatusServiceUnavailable {
 			return false
 		}
@@ -730,7 +730,7 @@ func TestOpsAnswersThroughoutDrain(t *testing.T) {
 		if err != nil {
 			return false
 		}
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		return resp.StatusCode == http.StatusOK
 	}, "metrics to answer during drain")
 	waitFor(t, func() bool {
@@ -738,7 +738,7 @@ func TestOpsAnswersThroughoutDrain(t *testing.T) {
 		if err != nil {
 			return false
 		}
-		defer resp.Body.Close()
+		_ = resp.Body.Close()
 		return resp.StatusCode == http.StatusServiceUnavailable
 	}, "readyz to answer 503 during drain")
 
@@ -775,7 +775,7 @@ func TestStopJoinsOpsServer(t *testing.T) {
 		if err != nil {
 			return false
 		}
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		return resp.StatusCode == http.StatusOK
 	}, "ops healthz to answer")
 
