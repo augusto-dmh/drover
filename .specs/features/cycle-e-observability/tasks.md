@@ -355,15 +355,15 @@ goroutine.
 **Requirement**: OBS-01, OBS-10, OBS-11
 
 **Done when**:
-- [ ] `/metrics` serves the supplied registry in Prometheus text format
-- [ ] `/healthz` returns `200` without consulting anything (OBS-10.1)
-- [ ] `/readyz` returns `200` when the readiness function returns nil and `503` with the
+- [x] `/metrics` serves the supplied registry in Prometheus text format
+- [x] `/healthz` returns `200` without consulting anything (OBS-10.1)
+- [x] `/readyz` returns `200` when the readiness function returns nil and `503` with the
       reason in the body when it does not
-- [ ] An unknown path returns `404` (EDGE-06)
-- [ ] `shutdown` returns only after the serving goroutine has returned — a goleak test
+- [x] An unknown path returns `404` (EDGE-06)
+- [x] `shutdown` returns only after the serving goroutine has returned — a goleak test
       proves it, since `http.Server.Shutdown` alone does not join `Serve`
-- [ ] Tests bind `127.0.0.1:0`, never a fixed port
-- [ ] Gate passes: `go test -race ./...`
+- [x] Tests bind `127.0.0.1:0`, never a fixed port
+- [x] Gate passes: `go test -race ./...`
 
 **Tests**: unit
 **Gate**: quick
