@@ -145,6 +145,18 @@ func (m *metricSet) setOldestAge(queue string, seconds float64) {
 	gauge.Set(seconds)
 }
 
+// deleteDepth drops one depth series so a queue that no longer holds
+// jobs in that state stops publishing it.
+func (m *metricSet) deleteDepth(queue, state string) {
+	m.depth.DeleteLabelValues(queue, state)
+}
+
+// deleteOldestAge drops one age series so a queue that has drained
+// away stops publishing a wait age.
+func (m *metricSet) deleteOldestAge(queue string) {
+	m.oldestAge.DeleteLabelValues(queue)
+}
+
 // skipSeries reports a queue name prometheus will not accept as a label
 // value, having dropped that one series.
 //
