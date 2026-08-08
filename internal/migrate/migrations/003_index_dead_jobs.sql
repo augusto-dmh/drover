@@ -8,9 +8,10 @@
 --
 -- Built with a plain CREATE INDEX rather than CONCURRENTLY because each
 -- migration runs inside one transaction and CONCURRENTLY cannot. The
--- SHARE lock it takes blocks writes for the length of the build, which
--- here is a build over only the rows that have died — by construction the
--- rare path, and the same reason the index is close to free to maintain
+-- SHARE lock it takes blocks writes for the length of the build. The
+-- build still heap-scans the table to evaluate the predicate; the
+-- finished index retains only dead rows — by construction the rare
+-- path, and the same reason the index is close to free to maintain
 -- afterwards.
 --
 -- Keyed (queue, id) rather than (queue) alone so the count is answered
