@@ -54,8 +54,17 @@ Durable, cross-cycle. Architecture-level decisions live in `docs/adr/`; entries 
 | AD-046 | Metric names use the `drover_` namespace with explicit histogram buckets from 5ms to 10 minutes; job metrics carry a `queue` label only; depth additionally carries `state`; pool gauges are unlabelled | cycle-e D-9 |
 | AD-047 | The ops server shuts down last, after workers drain and after the heartbeat and refresher stop, so `/metrics` and `/readyz` remain answerable throughout the drain | cycle-e D-10 |
 | AD-048 | `drover_queue_depth` counts only `available`, `scheduled`, `retryable`, `running`, and `dead`; `completed` and `cancelled` are deliberately absent, and migration 003 indexes `dead` so the refresher's cost stays proportional to backlog plus retained dead rows, not completed-job history | cycle-e D-11 |
+| AD-049 | CLI uses stdlib `flag` + a small subcommand dispatcher in `cmd/drover/` — not cobra | cycle-f `context.md` D-1 |
+| AD-050 | Operator introspection is an exported `Inspector` constructed from `*pgxpool.Pool`, not methods on `Client` | cycle-f D-2 |
+| AD-051 | List/Get/OperatorCancel/RedriveDead extend the unexported `driver.Driver` (both adapters), reusing `Stats` and `Insert` | cycle-f D-3 |
+| AD-052 | Operator cancel/redrive use state-conditioned UPDATEs without the lease attempt fence; `running` jobs cannot be cancelled this way | cycle-f D-4 |
+| AD-053 | Redrive moves `dead` → `available` with `attempt=0`, cleared lease, `scheduled_at=now()`, retaining `errors` | cycle-f D-5 |
+| AD-054 | CLI output is human text by default with a global `--json` flag | cycle-f D-6 |
+| AD-055 | Database URL from `--database` or `DATABASE_URL`; no YAML config this cycle | cycle-f D-7 |
+| AD-056 | CLI enqueue takes `--kind`, optional `--queue`, and `--args` as a JSON object string | cycle-f D-8 |
+| AD-057 | GoReleaser ships multi-OS/arch archives + checksums with version ldflags; no Homebrew tap or Docker image this cycle | cycle-f D-9 |
 
-**Amended by this cycle:** AD-018 is generalised, not superseded — the heartbeat now stops after the last *pool worker* drains rather than after the fetch loop returns. Same principle, wider scope.
+**Amended by cycle C:** AD-018 is generalised, not superseded — the heartbeat now stops after the last *pool worker* drains rather than after the fetch loop returns. Same principle, wider scope.
 
 **Corrected by cycle D:** a `pool.go` comment from cycle C guessed that "a second queue is a second runner rather than a rewrite of this one". That was a forward guess, not a recorded decision, and AD-036 supersedes it: a second queue is another entry in the weighted set served by the same pool.
 
@@ -72,8 +81,9 @@ Durable, cross-cycle. Architecture-level decisions live in `docs/adr/`; entries 
 
 ## Handoff
 
-- **Last shipped**: the observability cycle (#9) — Prometheus metrics on a dedicated ops port (`/metrics`, `/healthz`, `/readyz`), per-execution counters and duration histogram from the middleware chain, queue depth and oldest-job-age gauges refreshed on an interval, and ADR-0005 recording the stack decision. `main` is green: build, vet, unit `-race`, integration, lint. Cycles A–E close the v0.1.0 cut line.
-- **What review should look at**: the load property — no code path from the ops server to the database; scrape rate cannot multiply query load. Readiness derived from refresh freshness, not a per-probe ping. Bind failure fails `Start` cleanly. Ops server joins shutdown last so metrics stay scrapeable during drain. `drover_jobs_failed_total` counts attempts, not deaths — the README and ADR say so explicitly. Migration 003 partial index on `dead` keeps depth queries from scanning completed history.
-- **Known weak sensors** (carried forward from cycle D, still unfalsified): neither database-clock property — lease deadlines, nor a delayed job's dueness — can be falsified while the test container and the client share a host clock. One skewed-clock container fixture would close both.
-- **Follow-up work carried forward** (recorded, not scheduled): terminal-state rows (`completed`, `cancelled`) accumulate forever with no retention or pruning story — no roadmap row owns it yet, and excluding those states from the depth gauge is load-bearing until one does. Batch the shutdown hand-back into one `unnest`-based statement (Cycle G fetch/perf). Revisit lifecycle tests for `testing/synctest` where handler lifetime allows a bubble. Reconsider the constructor contract before 1.0 — config validation panics while `NewClient` returns errors, and `Register` panics too. Deferred observability ideas: configurable histogram buckets, rescued-jobs and requeued-on-shutdown counters, a `drover_stats_refreshed_at` metric, queue-label allowlist for cardinality.
-- **Next**: Cycle F — CLI introspection: `drover` binary with `stats`, `jobs list`, `retry`, `cancel`, `enqueue`, backed by an exported `Inspector` API. Then benchmarks with published methodology (G), periodic jobs via advisory-lock leader election (H), and an optional server-rendered status page (I). Cycles A–E close the v0.1.0 cut line.
+- **In flight**: Cycle F — CLI + introspection (`cycle-f-cli-introspection`). Spec/design/tasks approved under ship-cycle auto-decision (AD-049–AD-057). Execute next: storage → Inspector → `cmd/drover` → GoReleaser/docs → Verifier.
+- **Last shipped**: the observability cycle (#9). Cycles A–E close the v0.1.0 cut line.
+- **What review should look at (when F opens)**: Inspector vs Client separation; operator writes must not reuse lease-fenced `Mark*`; redrive resets attempt but keeps errors; cancel refuses `running`; CLI is stdlib `flag`; unit suite covers Inspector via memdriver.
+- **Known weak sensors** (carried forward): neither database-clock property — lease deadlines, nor a delayed job's dueness — can be falsified while the test container and the client share a host clock.
+- **Follow-up work carried forward** (recorded, not scheduled): terminal-state retention/pruning; batch shutdown hand-back (Cycle G); `testing/synctest` where viable; constructor panic-vs-error consistency before 1.0; deferred observability niceties from cycle E handoff.
+- **Next after F**: Cycle G — benchmarks + fetch hardening; then H (periodic jobs), I (optional status page).
