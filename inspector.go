@@ -174,15 +174,16 @@ func (in *Inspector) RetryJob(ctx context.Context, id int64) (*JobRow, error) {
 }
 
 // mapDriverErr translates driver sentinels to root-package ones so
-// callers can errors.Is without importing internal/driver, while
-// keeping the driver's detail message.
+// callers can errors.Is without importing internal/driver. The driver
+// detail is kept as text (%s) so the public unwrap chain stays on the
+// root sentinels only.
 func mapDriverErr(err error) error {
 	switch {
 	case errors.Is(err, driver.ErrNotFound):
-		return fmt.Errorf("%w: %w", err, ErrNotFound)
+		return fmt.Errorf("%w: %s", ErrNotFound, err.Error())
 	case errors.Is(err, driver.ErrInvalidTransition):
-		return fmt.Errorf("%w: %w", err, ErrInvalidTransition)
+		return fmt.Errorf("%w: %s", ErrInvalidTransition, err.Error())
 	default:
-		return err
+		return fmt.Errorf("drover: %w", err)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"strings"
 	"testing"
@@ -243,6 +244,48 @@ func TestInspectorGetJob(t *testing.T) {
 	if !errors.Is(err, ErrNotFound) {
 		t.Errorf("GetJob unknown: %v, want ErrNotFound", err)
 	}
+	if errors.Is(err, driver.ErrNotFound) {
+		t.Errorf("GetJob unknown unwraps driver.ErrNotFound; public surface must stay on root sentinels")
+	}
+	if !strings.Contains(err.Error(), ErrNotFound.Error()) {
+		t.Errorf("error %q missing root sentinel text", err)
+	}
+}
+
+func TestMapDriverErrPublicSentinels(t *testing.T) {
+	t.Parallel()
+
+	t.Run("not found", func(t *testing.T) {
+		t.Parallel()
+		err := mapDriverErr(fmt.Errorf("job 1: %w", driver.ErrNotFound))
+		if !errors.Is(err, ErrNotFound) {
+			t.Fatalf("Is ErrNotFound: %v", err)
+		}
+		if errors.Is(err, driver.ErrNotFound) {
+			t.Fatal("driver sentinel must not remain in the unwrap chain")
+		}
+	})
+	t.Run("invalid transition", func(t *testing.T) {
+		t.Parallel()
+		err := mapDriverErr(fmt.Errorf("job 1 is running: %w", driver.ErrInvalidTransition))
+		if !errors.Is(err, ErrInvalidTransition) {
+			t.Fatalf("Is ErrInvalidTransition: %v", err)
+		}
+		if errors.Is(err, driver.ErrInvalidTransition) {
+			t.Fatal("driver sentinel must not remain in the unwrap chain")
+		}
+	})
+	t.Run("other", func(t *testing.T) {
+		t.Parallel()
+		inner := errors.New("connection reset")
+		err := mapDriverErr(inner)
+		if !errors.Is(err, inner) {
+			t.Fatalf("Is inner: %v", err)
+		}
+		if !strings.HasPrefix(err.Error(), "drover:") {
+			t.Fatalf("error = %q, want drover: prefix", err)
+		}
+	})
 }
 
 func TestInspectorEnqueue(t *testing.T) {
