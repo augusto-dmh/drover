@@ -156,7 +156,7 @@ states, refusals, error wrapping with `errors.Is`.
 
 ## Phase 3: CLI
 
-### T8: `cmd/drover` skeleton — DSN, dispatch, version, format
+### T8: `cmd/drover` skeleton — DSN, dispatch, version, format ✅
 
 **What**: Create `cmd/drover` with global flags (`--database`, `--json`), version var +
 `version`/`--version`, usage, human/JSON helpers, pool open from DSN.
@@ -229,6 +229,6 @@ at this feature.
 | CLI-08 | T9 | Pending |
 | CLI-09 | T10 | Pending |
 | CLI-10 | T10 | Pending |
-| CLI-11 | T8, T12 | Pending |
+| CLI-11 | T8, T12 | Pending (version done; GoReleaser in T12) |
 
 **Coverage:** 11 total, 11 mapped, 0 unmapped.
