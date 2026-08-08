@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"flag"
-	"fmt"
 	"io"
 
 	"github.com/augusto-dmh/drover"
@@ -19,7 +18,7 @@ func runJobsList(ctx context.Context, in inspector, args []string, jsonOut bool,
 		return 2
 	}
 	if fs.NArg() != 0 {
-		fmt.Fprintf(stderr, "drover: unexpected arguments %v\n", fs.Args())
+		cliPrintf(stderr, "drover: unexpected arguments %v\n", fs.Args())
 		return 2
 	}
 
@@ -33,7 +32,7 @@ func runJobsList(ctx context.Context, in inspector, args []string, jsonOut bool,
 
 	jobs, err := in.ListJobs(ctx, opts)
 	if err != nil {
-		fmt.Fprintf(stderr, "drover: %v\n", err)
+		cliPrintf(stderr, "drover: %v\n", err)
 		return 1
 	}
 	if jsonOut {
@@ -41,7 +40,7 @@ func runJobsList(ctx context.Context, in inspector, args []string, jsonOut bool,
 			jobs = []*drover.JobRow{}
 		}
 		if err := writeJSON(stdout, jobs); err != nil {
-			fmt.Fprintf(stderr, "drover: %v\n", err)
+			cliPrintf(stderr, "drover: %v\n", err)
 			return 1
 		}
 		return 0

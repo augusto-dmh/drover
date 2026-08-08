@@ -3,7 +3,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"os"
 	"strings"
@@ -26,7 +25,7 @@ func run(args []string, stdout, stderr io.Writer, getenv func(string) string, op
 	}
 	cfg, rest, err := peelGlobals(args)
 	if err != nil {
-		fmt.Fprintf(stderr, "drover: %v\n", err)
+		cliPrintf(stderr, "drover: %v\n", err)
 		return 2
 	}
 	if cfg.help {
@@ -34,7 +33,7 @@ func run(args []string, stdout, stderr io.Writer, getenv func(string) string, op
 		return 0
 	}
 	if cfg.version {
-		fmt.Fprintln(stdout, version)
+		cliPrintln(stdout, version)
 		return 0
 	}
 	if len(rest) == 0 {
@@ -43,37 +42,37 @@ func run(args []string, stdout, stderr io.Writer, getenv func(string) string, op
 	}
 
 	ctx := context.Background()
-	switch {
-	case rest[0] == "version":
-		fmt.Fprintln(stdout, version)
+	switch rest[0] {
+	case "version":
+		cliPrintln(stdout, version)
 		return 0
-	case rest[0] == "stats":
+	case "stats":
 		return withInspector(ctx, cfg, getenv, open, stderr, func(in inspector) int {
 			return runStats(ctx, in, cfg.json, stdout, stderr)
 		})
-	case rest[0] == "jobs":
+	case "jobs":
 		if len(rest) < 2 || rest[1] != "list" {
-			fmt.Fprintf(stderr, "drover: unknown command %q\n\n", strings.Join(rest, " "))
+			cliPrintf(stderr, "drover: unknown command %q\n\n", strings.Join(rest, " "))
 			printUsage(stderr)
 			return 2
 		}
 		return withInspector(ctx, cfg, getenv, open, stderr, func(in inspector) int {
 			return runJobsList(ctx, in, rest[2:], cfg.json, stdout, stderr)
 		})
-	case rest[0] == "retry":
+	case "retry":
 		return withInspector(ctx, cfg, getenv, open, stderr, func(in inspector) int {
 			return runRetry(ctx, in, rest[1:], cfg.json, stdout, stderr)
 		})
-	case rest[0] == "cancel":
+	case "cancel":
 		return withInspector(ctx, cfg, getenv, open, stderr, func(in inspector) int {
 			return runCancel(ctx, in, rest[1:], cfg.json, stdout, stderr)
 		})
-	case rest[0] == "enqueue":
+	case "enqueue":
 		return withInspector(ctx, cfg, getenv, open, stderr, func(in inspector) int {
 			return runEnqueue(ctx, in, rest[1:], cfg.json, stdout, stderr)
 		})
 	default:
-		fmt.Fprintf(stderr, "drover: unknown command %q\n\n", rest[0])
+		cliPrintf(stderr, "drover: unknown command %q\n\n", rest[0])
 		printUsage(stderr)
 		return 2
 	}
@@ -89,12 +88,12 @@ func withInspector(
 ) int {
 	dsn, err := resolveDSN(cfg.database, getenv)
 	if err != nil {
-		fmt.Fprintf(stderr, "drover: %v\n", err)
+		cliPrintf(stderr, "drover: %v\n", err)
 		return 2
 	}
 	in, cleanup, err := open(ctx, dsn)
 	if err != nil {
-		fmt.Fprintf(stderr, "drover: %v\n", err)
+		cliPrintf(stderr, "drover: %v\n", err)
 		return 1
 	}
 	if cleanup != nil {
@@ -112,7 +111,7 @@ func defaultOpenInspector(ctx context.Context, dsn string) (inspector, func(), e
 }
 
 func printUsage(w io.Writer) {
-	fmt.Fprintf(w, `Usage: drover [global flags] <command> [command flags]
+	cliPrintf(w, `Usage: drover [global flags] <command> [command flags]
 
 Commands:
   stats              Print per-queue depth and oldest-claimable age

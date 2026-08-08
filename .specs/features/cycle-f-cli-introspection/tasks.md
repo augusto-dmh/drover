@@ -182,7 +182,7 @@ and filters (prefer injecting Inspector over live Postgres in unit tests).
 **Gate**: quick
 **Commit**: `feat(cli): add retry, cancel, and enqueue commands`
 
-### T11: Phase 3 full gate + lint
+### T11: Phase 3 full gate + lint ✅
 
 **What**: Full unit + integration + lint; fix fallout.
 **Requires**: T10

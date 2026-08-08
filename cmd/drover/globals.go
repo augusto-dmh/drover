@@ -32,11 +32,12 @@ func peelGlobals(args []string) (globalConfig, []string, error) {
 		case a == "-h", a == "--help":
 			cfg.help = true
 		case a == "--database":
-			if i+1 >= len(args) {
+			restArgs := args[i+1:]
+			if len(restArgs) == 0 {
 				return cfg, nil, fmt.Errorf("--database requires a value")
 			}
+			cfg.database = restArgs[0]
 			i++
-			cfg.database = args[i]
 		case strings.HasPrefix(a, "--database="):
 			cfg.database = strings.TrimPrefix(a, "--database=")
 			if cfg.database == "" {
