@@ -193,7 +193,7 @@ and filters (prefer injecting Inspector over live Postgres in unit tests).
 
 ## Phase 4: Release + docs
 
-### T12: GoReleaser config
+### T12: GoReleaser config ✅
 
 **What**: Add `.goreleaser.yaml` per design; document tag-based release in README CLI
 section; run `goreleaser check` if feasible.
@@ -202,7 +202,7 @@ section; run `goreleaser check` if feasible.
 **Gate**: build
 **Commit**: `build: add GoReleaser config for the drover binary`
 
-### T13: README CLI section + planning handoff prep
+### T13: README CLI section + planning handoff prep ✅
 
 **What**: README operator docs for the five commands and `DATABASE_URL`; update
 `.specs/STATE.md` Decisions (AD-049+) and Handoff for Cycle F in-progress / ready-for-PR
@@ -229,6 +229,6 @@ at this feature.
 | CLI-08 | T9 | Done |
 | CLI-09 | T10 | Done |
 | CLI-10 | T10 | Done |
-| CLI-11 | T8, T12 | Pending (version done; GoReleaser in T12) |
+| CLI-11 | T8, T12 | Done |
 
 **Coverage:** 11 total, 11 mapped, 0 unmapped.

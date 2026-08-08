@@ -124,9 +124,40 @@ max by (queue) (max_over_time(drover_oldest_job_age_seconds[5m])) > 300
 
 Secondary signals: `drover_queue_depth{state="dead"}` for permanent failure accumulation; `drover_jobs_executing / drover_pool_concurrency` near 1.0 for saturation.
 
+## CLI
+
+The `drover` binary is the operator surface for a live queue. Point it at Postgres with `--database` or `$DATABASE_URL` (the flag wins). The schema must already exist — the CLI does not run migrations. Add `--json` for machine-readable output on any command.
+
+```
+drover [--database URL] [--json] <command>
+```
+
+| Command | What it does |
+| --- | --- |
+| `stats` | Per-queue depth and oldest-claimable age |
+| `jobs list` | List jobs; optional `--queue`, `--state`, `--limit` (default 100) |
+| `retry <id>` | Redrive a `dead` job to `available` (attempt reset; prior errors kept) |
+| `cancel <id>` | Cancel a waiting or dead job (`running` / terminal states are refused) |
+| `enqueue` | Insert a job: `--kind` required; optional `--queue`, `--args` (JSON, default `{}`) |
+| `version` / `--version` | Print the embedded version (`dev` for local builds) |
+
+Library callers that need the same reads and operator writes without spawning the binary use `drover.NewInspector(pool)` — `Stats`, `ListJobs`, `GetJob`, `Enqueue`, `CancelJob`, and `RetryJob` on an `Inspector`. It is not a `Client`: there is no worker pool and no `Start`/`Stop`.
+
+### Releasing the binary
+
+`.goreleaser.yaml` builds `cmd/drover` for linux, darwin, and windows on amd64 and arm64 with `CGO_ENABLED=0`, injects the tag via `-X main.version={{.Version}}`, and publishes archives plus `checksums.txt` (no Homebrew tap or Docker image). Cut a release from a version tag:
+
+```
+git tag v0.1.0
+git push origin v0.1.0
+goreleaser release --clean
+```
+
+Validate the config locally with `goreleaser check`. Snapshot builds without publishing: `goreleaser release --snapshot --clean`.
+
 ## Roadmap
 
-v0.1.0 = cycles A–E of [RFC-0001](docs/rfc/0001-drover-roadmap.md): walking skeleton → retries/DLQ/rescue → worker pools + graceful shutdown → middleware + scheduled jobs → **Prometheus observability (shipped)**. Then: CLI introspection, benchmarks with published methodology, periodic jobs via advisory-lock leader election, and an optional server-rendered status page.
+v0.1.0 = cycles A–F of [RFC-0001](docs/rfc/0001-drover-roadmap.md): walking skeleton → retries/DLQ/rescue → worker pools + graceful shutdown → middleware + scheduled jobs → Prometheus observability → **CLI + introspection**. Then: benchmarks with published methodology, periodic jobs via advisory-lock leader election, and an optional server-rendered status page.
 
 ## Documentation
 

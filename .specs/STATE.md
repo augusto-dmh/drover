@@ -81,9 +81,9 @@ Durable, cross-cycle. Architecture-level decisions live in `docs/adr/`; entries 
 
 ## Handoff
 
-- **In flight**: Cycle F — CLI + introspection (`cycle-f-cli-introspection`). Spec/design/tasks approved under ship-cycle auto-decision (AD-049–AD-057). Execute next: storage → Inspector → `cmd/drover` → GoReleaser/docs → Verifier.
-- **Last shipped**: the observability cycle (#9). Cycles A–E close the v0.1.0 cut line.
-- **What review should look at (when F opens)**: Inspector vs Client separation; operator writes must not reuse lease-fenced `Mark*`; redrive resets attempt but keeps errors; cancel refuses `running`; CLI is stdlib `flag`; unit suite covers Inspector via memdriver.
+- **In flight**: Cycle F — CLI + introspection (`cycle-f-cli-introspection`) on `feat/cli-introspection`. Implementation complete (storage, Inspector, `cmd/drover`, GoReleaser, README). Ready for Verifier + PR.
+- **Last shipped**: the observability cycle (#9). Cycles A–E are merged; F is the next PR.
+- **What review should look at**: Inspector vs Client separation; operator writes must not reuse lease-fenced `Mark*`; redrive resets attempt but keeps errors; cancel refuses `running`; CLI is stdlib `flag`; unit suite covers Inspector via memdriver; GoReleaser is archives + checksums only (AD-057).
 - **Known weak sensors** (carried forward): neither database-clock property — lease deadlines, nor a delayed job's dueness — can be falsified while the test container and the client share a host clock.
 - **Follow-up work carried forward** (recorded, not scheduled): terminal-state retention/pruning; batch shutdown hand-back (Cycle G); `testing/synctest` where viable; constructor panic-vs-error consistency before 1.0; deferred observability niceties from cycle E handoff.
 - **Next after F**: Cycle G — benchmarks + fetch hardening; then H (periodic jobs), I (optional status page).
