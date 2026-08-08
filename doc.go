@@ -128,9 +128,11 @@
 //
 // Config.OpsAddr binds a dedicated listener for GET /metrics, /healthz,
 // and /readyz. An empty address records metrics without serving them.
-// /healthz always returns 200; /readyz returns 503 when the client is
-// not started or the last gauge refresh is older than twice
-// StatsInterval — typically because the database is unreachable.
+// Until Start binds the address there is no listener, so probes see
+// connection refused rather than an HTTP status. /healthz always
+// returns 200; /readyz returns 503 while the client is draining or when
+// the last gauge refresh is older than twice StatsInterval — typically
+// because the database is unreachable.
 //
 // drover_jobs_failed_total counts failed executions (attempts), not
 // jobs that reached dead; use drover_queue_depth{state="dead"} for

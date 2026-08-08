@@ -161,10 +161,11 @@ type Config struct {
 	MetricsRegistry *prometheus.Registry
 
 	// StatsInterval is how often this client refreshes its queue depth
-	// and oldest-job-age gauges from the store. Unset, it defaults to
-	// fifteen seconds. A non-positive value is corrected to the default
-	// and reported: the gauges would otherwise never move, and an
-	// operator's alerts would go blind without a log line to explain why.
+	// and oldest-job-age gauges from the store. Zero (unset) takes the
+	// default of fifteen seconds silently. A negative value is corrected
+	// to the default and reported: the gauges would otherwise never move,
+	// and an operator's alerts would go blind without a log line to
+	// explain why.
 	StatsInterval time.Duration
 
 	// OpsAddr is the address the client binds for /metrics, /healthz, and
