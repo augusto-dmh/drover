@@ -226,22 +226,76 @@ func (d *Driver) Stats(ctx context.Context) (*driver.Stats, error) {
 	return stats, nil
 }
 
-// Operator list/get/cancel/redrive stubs satisfy driver.Driver until the
-// Postgres implementations land in the next commit.
-func (d *Driver) ListJobs(context.Context, driver.ListJobsParams) ([]*driver.JobRow, error) {
-	panic("pgdriver: ListJobs not implemented")
+// ListJobs returns jobs matching optional queue and state filters,
+// newest id first, capped at p.Limit.
+func (d *Driver) ListJobs(ctx context.Context, p driver.ListJobsParams) ([]*driver.JobRow, error) {
+	if p.Limit < 0 || p.Limit > math.MaxInt32 {
+		return nil, fmt.Errorf("list limit %d out of range", p.Limit)
+	}
+	jobs, err := d.queries.ListJobs(ctx, dbsqlc.ListJobsParams{
+		Queue:   p.Queue,
+		State:   p.State,
+		MaxJobs: int32(p.Limit),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list jobs: %w", err)
+	}
+	rows := make([]*driver.JobRow, len(jobs))
+	for i, job := range jobs {
+		rows[i] = rowFromDB(job)
+	}
+	return rows, nil
 }
 
-func (d *Driver) GetJob(context.Context, int64) (*driver.JobRow, error) {
-	panic("pgdriver: GetJob not implemented")
+// GetJob returns the current row for id, or ErrNotFound.
+func (d *Driver) GetJob(ctx context.Context, id int64) (*driver.JobRow, error) {
+	job, err := d.queries.GetJob(ctx, id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("job %d: %w", id, driver.ErrNotFound)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get job %d: %w", id, err)
+	}
+	return rowFromDB(job), nil
 }
 
-func (d *Driver) OperatorCancel(context.Context, int64) (*driver.JobRow, error) {
-	panic("pgdriver: OperatorCancel not implemented")
+// OperatorCancel moves a waiting or dead job to cancelled. A zero-row
+// update is re-read so missing ids and wrong states stay distinguishable.
+func (d *Driver) OperatorCancel(ctx context.Context, id int64) (*driver.JobRow, error) {
+	job, err := d.queries.OperatorCancel(ctx, id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, d.operatorRefusal(ctx, id, "cancellable")
+	}
+	if err != nil {
+		return nil, fmt.Errorf("cancel job %d: %w", id, err)
+	}
+	return rowFromDB(job), nil
 }
 
-func (d *Driver) RedriveDead(context.Context, int64) (*driver.JobRow, error) {
-	panic("pgdriver: RedriveDead not implemented")
+// RedriveDead returns a dead job to available with attempt reset. A
+// zero-row update is re-read so missing ids and wrong states stay
+// distinguishable.
+func (d *Driver) RedriveDead(ctx context.Context, id int64) (*driver.JobRow, error) {
+	job, err := d.queries.RedriveDead(ctx, id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, d.operatorRefusal(ctx, id, "dead")
+	}
+	if err != nil {
+		return nil, fmt.Errorf("redrive job %d: %w", id, err)
+	}
+	return rowFromDB(job), nil
+}
+
+// operatorRefusal explains why an operator UPDATE matched no row.
+func (d *Driver) operatorRefusal(ctx context.Context, id int64, want string) error {
+	job, err := d.queries.GetJob(ctx, id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("job %d: %w", id, driver.ErrNotFound)
+	}
+	if err != nil {
+		return fmt.Errorf("inspect job %d: %w", id, err)
+	}
+	return fmt.Errorf("job %d is %s, want %s: %w", id, job.State, want, driver.ErrInvalidTransition)
 }
 
 // explain turns the row count of a guarded transition UPDATE into an

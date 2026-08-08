@@ -106,7 +106,7 @@ ordering, limit, cancel allowed states, redrive from dead only, not-found.
 **Gate**: quick
 **Commit**: `feat(memdriver): implement operator list, cancel, and redrive`
 
-### T3: pgdriver implementations + integration tests
+### T3: pgdriver implementations + integration tests ✅
 
 **What**: Wire sqlc queries in `pgdriver`; integration tests mirroring memdriver cases.
 **Done when**: integration gate green for the new methods.
