@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"testing"
 	"time"
 
@@ -30,6 +31,15 @@ func TestInspectorStatsMatchesPublishedStates(t *testing.T) {
 	ctx := context.Background()
 	mem := memdriver.New()
 	in := newInspector(mem)
+
+	const waited = 30 * time.Second
+	past := time.Now().Add(-waited)
+	if _, err := in.Enqueue(ctx, "aged", json.RawMessage(`{}`), &InsertOpts{
+		Queue:       "aged",
+		ScheduledAt: past,
+	}); err != nil {
+		t.Fatalf("Enqueue aged: %v", err)
+	}
 
 	mustEnqueue(t, in, "a", "default", `{}`)
 	mustEnqueue(t, in, "b", "default", `{}`)
@@ -81,6 +91,21 @@ func TestInspectorStatsMatchesPublishedStates(t *testing.T) {
 	}
 	if _, ok := counts["cancelled"]; ok {
 		t.Error("cancelled appeared in depths")
+	}
+
+	var age *QueueAge
+	for i := range stats.Oldest {
+		if stats.Oldest[i].Queue == "aged" {
+			age = &stats.Oldest[i]
+			break
+		}
+	}
+	if age == nil {
+		t.Fatal("Oldest missing queue aged — Inspector must map driver ages")
+	}
+	wantAge := waited.Seconds()
+	if math.Abs(age.AgeSeconds-wantAge) > 2 {
+		t.Errorf("Oldest AgeSeconds = %v, want about %v", age.AgeSeconds, wantAge)
 	}
 }
 
