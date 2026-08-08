@@ -97,7 +97,7 @@ interface (pgdriver may already call the query internally).
 **Gate**: build
 **Commit**: `feat(driver): add list, get, cancel, and redrive operator methods`
 
-### T2: memdriver implementations + unit tests
+### T2: memdriver implementations + unit tests ✅
 
 **What**: Implement the four methods on `memdriver`; table-driven tests for filters,
 ordering, limit, cancel allowed states, redrive from dead only, not-found.

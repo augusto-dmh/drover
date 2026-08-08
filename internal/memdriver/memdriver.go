@@ -219,22 +219,99 @@ func (d *Driver) Stats(context.Context) (*driver.Stats, error) {
 	return stats, nil
 }
 
-// Operator list/get/cancel/redrive stubs satisfy driver.Driver until the
-// in-memory implementations land in the next commit.
-func (d *Driver) ListJobs(context.Context, driver.ListJobsParams) ([]*driver.JobRow, error) {
-	panic("memdriver: ListJobs not implemented")
+// ListJobs returns jobs matching optional queue and state filters,
+// newest id first, capped at p.Limit.
+func (d *Driver) ListJobs(_ context.Context, p driver.ListJobsParams) ([]*driver.JobRow, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	var matched []*driver.JobRow
+	for _, row := range d.jobs {
+		if p.Queue != "" && row.Queue != p.Queue {
+			continue
+		}
+		if p.State != "" && row.State != p.State {
+			continue
+		}
+		matched = append(matched, row)
+	}
+	slices.SortFunc(matched, func(a, b *driver.JobRow) int {
+		return cmp.Compare(b.ID, a.ID)
+	})
+	if p.Limit > 0 && p.Limit < len(matched) {
+		matched = matched[:p.Limit]
+	}
+	out := make([]*driver.JobRow, len(matched))
+	for i, row := range matched {
+		out[i] = copyRow(row)
+	}
+	return out, nil
 }
 
-func (d *Driver) GetJob(context.Context, int64) (*driver.JobRow, error) {
-	panic("memdriver: GetJob not implemented")
+// GetJob returns a copy of the stored row for id, or ErrNotFound.
+func (d *Driver) GetJob(_ context.Context, id int64) (*driver.JobRow, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	row, ok := d.jobs[id]
+	if !ok {
+		return nil, fmt.Errorf("job %d: %w", id, driver.ErrNotFound)
+	}
+	return copyRow(row), nil
 }
 
-func (d *Driver) OperatorCancel(context.Context, int64) (*driver.JobRow, error) {
-	panic("memdriver: OperatorCancel not implemented")
+// cancellable reports whether an operator may cancel a job in this state
+// without fighting a live lease holder.
+func cancellable(state string) bool {
+	switch state {
+	case "available", "scheduled", "retryable", "dead":
+		return true
+	default:
+		return false
+	}
 }
 
-func (d *Driver) RedriveDead(context.Context, int64) (*driver.JobRow, error) {
-	panic("memdriver: RedriveDead not implemented")
+// OperatorCancel moves a waiting or dead job to cancelled. Running and
+// terminal completed/cancelled rows are refused so the write never races
+// a worker's attempt fence.
+func (d *Driver) OperatorCancel(_ context.Context, id int64) (*driver.JobRow, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	row, ok := d.jobs[id]
+	if !ok {
+		return nil, fmt.Errorf("job %d: %w", id, driver.ErrNotFound)
+	}
+	if !cancellable(row.State) {
+		return nil, fmt.Errorf("job %d is %s: %w", id, row.State, driver.ErrInvalidTransition)
+	}
+	now := time.Now()
+	row.State = "cancelled"
+	row.FinalizedAt = &now
+	row.LeasedUntil = nil
+	return copyRow(row), nil
+}
+
+// RedriveDead returns a dead job to available with attempt reset and
+// lease cleared, keeping the errors array for triage provenance.
+func (d *Driver) RedriveDead(_ context.Context, id int64) (*driver.JobRow, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	row, ok := d.jobs[id]
+	if !ok {
+		return nil, fmt.Errorf("job %d: %w", id, driver.ErrNotFound)
+	}
+	if row.State != "dead" {
+		return nil, fmt.Errorf("job %d is %s, want dead: %w", id, row.State, driver.ErrInvalidTransition)
+	}
+	now := time.Now()
+	row.State = "available"
+	row.Attempt = 0
+	row.LeasedUntil = nil
+	row.FinalizedAt = nil
+	row.ScheduledAt = now
+	return copyRow(row), nil
 }
 
 // selectRows returns the stored rows matching keep, ordered by order and
