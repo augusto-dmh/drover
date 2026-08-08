@@ -367,3 +367,93 @@ func (q *Queries) MarkSnoozed(ctx context.Context, arg MarkSnoozedParams) (int64
 	}
 	return result.RowsAffected(), nil
 }
+
+const oldestClaimable = `-- name: OldestClaimable :many
+SELECT queue,
+       EXTRACT(EPOCH FROM (now() - min(scheduled_at)))::float8 AS age_seconds
+FROM drover_jobs
+WHERE state IN ('available', 'retryable', 'scheduled')
+  AND scheduled_at <= now()
+GROUP BY queue
+`
+
+type OldestClaimableRow struct {
+	Queue      string
+	AgeSeconds float64
+}
+
+// The predicate is the fetch predicate, deliberately: "oldest job" has to
+// mean "oldest job that should already have run", or a job scheduled for
+// next week would report a week of lateness the moment it is enqueued and
+// every delayed job would look like an outage. Anything that widens what
+// FetchAvailable claims has to widen this too, or the age stops measuring
+// what the claim round is actually behind on.
+//
+// The age is subtracted here rather than returned as a timestamp for the
+// caller to compare against its own clock: the scheduled time is decided
+// by this database's clock, so only this database can say how late it is.
+// A client running fast would otherwise publish an age no other client
+// agrees with.
+func (q *Queries) OldestClaimable(ctx context.Context) ([]OldestClaimableRow, error) {
+	rows, err := q.db.Query(ctx, oldestClaimable)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []OldestClaimableRow
+	for rows.Next() {
+		var i OldestClaimableRow
+		if err := rows.Scan(&i.Queue, &i.AgeSeconds); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const queueDepths = `-- name: QueueDepths :many
+SELECT queue, state::text AS state, count(*) AS count
+FROM drover_jobs
+WHERE state IN ('available', 'scheduled', 'retryable', 'running', 'dead')
+GROUP BY queue, state
+`
+
+type QueueDepthsRow struct {
+	Queue string
+	State string
+	Count int64
+}
+
+// Only the states an operator can act on are counted. completed and
+// cancelled are deliberately absent: those rows are never removed, so
+// counting them would make this query's cost grow with the whole history
+// of the queue rather than with its backlog — turning the thing that
+// reports load into a source of it. Every state listed here is served by
+// a partial index: the three waiting ones by the fetch index, running by
+// the lease index, dead by its own.
+//
+// The cast to text is what keeps the enum out of the driver: without it
+// the generated row would carry a generated enum type, and the state
+// would have to be translated again on its way to a metric label.
+func (q *Queries) QueueDepths(ctx context.Context) ([]QueueDepthsRow, error) {
+	rows, err := q.db.Query(ctx, queueDepths)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []QueueDepthsRow
+	for rows.Next() {
+		var i QueueDepthsRow
+		if err := rows.Scan(&i.Queue, &i.State, &i.Count); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}

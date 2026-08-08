@@ -6,7 +6,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -15,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/augusto-dmh/drover/internal/driver"
+	"github.com/augusto-dmh/drover/internal/memdriver"
 	"github.com/augusto-dmh/drover/internal/pgdriver"
 	"github.com/augusto-dmh/drover/internal/testdb"
 )
@@ -947,5 +950,223 @@ func TestScheduledJobBecomesClaimableWhenItsTimeArrives(t *testing.T) {
 	}
 	if len(claimed) != 1 || claimed[0].ID != row.ID {
 		t.Fatalf("claimed %d job(s) after the scheduled time, want job %d", len(claimed), row.ID)
+	}
+}
+
+// statsDriver is the slice of the storage contract the queue-statistics
+// scenario below needs. Naming it here lets the same scenario be driven
+// against the in-memory driver, which is the only way to check that the
+// two agree rather than that each is self-consistent.
+type statsDriver interface {
+	Insert(ctx context.Context, params driver.InsertParams) (*driver.JobRow, error)
+	FetchAvailable(ctx context.Context, queue string, leaseFor time.Duration, limit int) ([]*driver.JobRow, error)
+	MarkCompleted(ctx context.Context, lease driver.Lease) error
+	MarkCancelled(ctx context.Context, lease driver.Lease, errDetail []byte) error
+	MarkDead(ctx context.Context, lease driver.Lease, errDetail []byte) error
+	MarkRetryable(ctx context.Context, lease driver.Lease, retryAt time.Time, errDetail []byte) error
+	Stats(ctx context.Context) (*driver.Stats, error)
+}
+
+const (
+	// overdue is how long the scenario's oldest claimable job has been due.
+	overdue = 90 * time.Second
+	// backoffEnded is how long ago a retryable job's backoff ran out.
+	backoffEnded = 30 * time.Second
+)
+
+func dueOn(t *testing.T, d statsDriver, queue string, at time.Time) *driver.JobRow {
+	t.Helper()
+	row, err := d.Insert(context.Background(), driver.InsertParams{
+		Kind:        "k",
+		Queue:       queue,
+		Args:        []byte(`{"n":1}`),
+		ScheduledAt: at,
+	})
+	if err != nil {
+		t.Fatalf("Insert on queue %q: %v", queue, err)
+	}
+	return row
+}
+
+func claimFrom(t *testing.T, d statsDriver, queue string) {
+	t.Helper()
+	rows, err := d.FetchAvailable(context.Background(), queue, time.Minute, 1)
+	if err != nil {
+		t.Fatalf("FetchAvailable from queue %q: %v", queue, err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("FetchAvailable from queue %q claimed %d jobs, want 1", queue, len(rows))
+	}
+}
+
+// buildStatsScenario drives d through one fixed set of jobs using only
+// the driver's own transitions, so any implementation can be asked for a
+// reading of the same situation. Every job that has to be claimed is
+// claimed while it is the only claimable job on its queue.
+func buildStatsScenario(t *testing.T, d statsDriver) {
+	t.Helper()
+	ctx := context.Background()
+
+	// alpha is behind: one job came due overdue ago, and one is
+	// deliberately deferred and therefore not late at all.
+	dueOn(t, d, "alpha", time.Now().Add(-overdue))
+	dueOn(t, d, "alpha", time.Now().Add(time.Hour))
+
+	// beta has one job in a worker's hands and one that died in them.
+	dueOn(t, d, "beta", time.Now())
+	claimFrom(t, d, "beta")
+	died := dueOn(t, d, "beta", time.Now())
+	claimFrom(t, d, "beta")
+	if err := d.MarkDead(ctx, held(died.ID), []byte(`{"error":"boom"}`)); err != nil {
+		t.Fatalf("MarkDead: %v", err)
+	}
+
+	// gamma holds the two states that are never counted, plus one job
+	// whose backoff has run out and is waiting to be picked up again.
+	finished := dueOn(t, d, "gamma", time.Now())
+	claimFrom(t, d, "gamma")
+	if err := d.MarkCompleted(ctx, held(finished.ID)); err != nil {
+		t.Fatalf("MarkCompleted: %v", err)
+	}
+	abandoned := dueOn(t, d, "gamma", time.Now())
+	claimFrom(t, d, "gamma")
+	if err := d.MarkCancelled(ctx, held(abandoned.ID), []byte(`{"error":"nope"}`)); err != nil {
+		t.Fatalf("MarkCancelled: %v", err)
+	}
+	retried := dueOn(t, d, "gamma", time.Now())
+	claimFrom(t, d, "gamma")
+	if err := d.MarkRetryable(ctx, held(retried.ID),
+		time.Now().Add(-backoffEnded), []byte(`{"error":"boom"}`)); err != nil {
+		t.Fatalf("MarkRetryable: %v", err)
+	}
+
+	// delta holds nothing but a job scheduled for later. It is the queue
+	// that separates lateness from delay: anywhere a deferred job sits
+	// beside an overdue one the overdue one is the older of the two, so a
+	// reading that forgot to check whether a job is due yet would still
+	// look right. Here there is nothing to hide behind.
+	dueOn(t, d, "delta", time.Now().Add(time.Hour))
+}
+
+// assertAges compares a reading's ages queue by queue. The tolerance
+// covers the time the scenario itself takes to build; it is orders of
+// magnitude below the hour a job counted from the wrong side of now would
+// be out by.
+func assertAges(t *testing.T, got, want []driver.QueueAge, tolerance float64) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("Oldest = %+v, want %+v", got, want)
+	}
+	for i, w := range want {
+		if got[i].Queue != w.Queue || math.Abs(got[i].AgeSeconds-w.AgeSeconds) > tolerance {
+			t.Errorf("Oldest[%d] = %+v, want queue %q aged about %vs", i, got[i], w.Queue, w.AgeSeconds)
+		}
+	}
+}
+
+func TestStatsReportsDepthPerQueueAndAgeOfWhatIsClaimable(t *testing.T) {
+	d, _ := newDriver(t)
+
+	buildStatsScenario(t, d)
+
+	stats, err := d.Stats(context.Background())
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+
+	// gamma's completed and cancelled jobs are absent by design: those are
+	// the rows nothing ever removes, and counting them would tie the cost
+	// of this query to the whole history of the queue.
+	wantDepths := []driver.QueueDepth{
+		{Queue: "alpha", State: "available", Count: 1},
+		{Queue: "alpha", State: "scheduled", Count: 1},
+		{Queue: "beta", State: "dead", Count: 1},
+		{Queue: "beta", State: "running", Count: 1},
+		{Queue: "delta", State: "scheduled", Count: 1},
+		{Queue: "gamma", State: "retryable", Count: 1},
+	}
+	if !slices.Equal(stats.Depths, wantDepths) {
+		t.Errorf("Depths = %+v, want %+v", stats.Depths, wantDepths)
+	}
+
+	// Only alpha and gamma are late. beta has nothing claimable at all —
+	// one job is running, the other is dead — and delta's only job is not
+	// due yet, so neither is reported as waiting rather than being
+	// reported as waiting for zero.
+	assertAges(t, stats.Oldest, []driver.QueueAge{
+		{Queue: "alpha", AgeSeconds: overdue.Seconds()},
+		{Queue: "gamma", AgeSeconds: backoffEnded.Seconds()},
+	}, 5)
+}
+
+func TestStatsAgreesWithTheInMemoryDriver(t *testing.T) {
+	pg, _ := newDriver(t)
+	mem := memdriver.New()
+
+	buildStatsScenario(t, pg)
+	buildStatsScenario(t, mem)
+
+	ctx := context.Background()
+	fromPostgres, err := pg.Stats(ctx)
+	if err != nil {
+		t.Fatalf("Stats from Postgres: %v", err)
+	}
+	fromMemory, err := mem.Stats(ctx)
+	if err != nil {
+		t.Fatalf("Stats from memory: %v", err)
+	}
+
+	// The in-memory driver is the executable specification the Postgres
+	// one is checked against; a depth the two disagree on means one of the
+	// predicates was restated rather than reused.
+	if !slices.Equal(fromPostgres.Depths, fromMemory.Depths) {
+		t.Errorf("Postgres depths = %+v, in-memory depths = %+v", fromPostgres.Depths, fromMemory.Depths)
+	}
+	assertAges(t, fromPostgres.Oldest, fromMemory.Oldest, 5)
+}
+
+func TestStatsAgesJobsByTheDatabaseClock(t *testing.T) {
+	d, pool := newDriver(t)
+	ctx := context.Background()
+	row := mustInsert(t, d, "k", "default")
+
+	// The scheduled time is written from the database's own clock, so the
+	// age reported for it can only be right if it was subtracted there
+	// too. A caller subtracting its own now() would be out by whatever the
+	// two machines disagree by, which across a fleet is not zero.
+	if _, err := pool.Exec(ctx,
+		`UPDATE drover_jobs SET scheduled_at = now() - interval '90 seconds' WHERE id = $1`,
+		row.ID); err != nil {
+		t.Fatalf("age the job by the database clock: %v", err)
+	}
+
+	stats, err := d.Stats(ctx)
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+
+	var byDatabase float64
+	if err := pool.QueryRow(ctx,
+		`SELECT EXTRACT(EPOCH FROM (now() - scheduled_at))::float8 FROM drover_jobs WHERE id = $1`,
+		row.ID).Scan(&byDatabase); err != nil {
+		t.Fatalf("read the age the database computes: %v", err)
+	}
+	if len(stats.Oldest) != 1 || stats.Oldest[0].Queue != "default" {
+		t.Fatalf("Oldest = %+v, want one entry for queue default", stats.Oldest)
+	}
+	if skew := math.Abs(stats.Oldest[0].AgeSeconds - byDatabase); skew > 1 {
+		t.Errorf("reported age is %vs from the age the database computes, want it measured by that clock", skew)
+	}
+}
+
+func TestStatsOnAnEmptyDatabaseReportsNothing(t *testing.T) {
+	d, _ := newDriver(t)
+
+	stats, err := d.Stats(context.Background())
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if len(stats.Depths) != 0 || len(stats.Oldest) != 0 {
+		t.Errorf("Stats = %+v, want no depths and no ages", stats)
 	}
 }

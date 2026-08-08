@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strings"
 	"sync"
@@ -12,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/goleak"
 
 	"github.com/augusto-dmh/drover/internal/memdriver"
@@ -518,6 +520,147 @@ func TestLoggingRunsEvenWhenTheCallerConfiguresMiddleware(t *testing.T) {
 	}
 	if !sawStart.Load() {
 		t.Error("the built-in logging did not run outside the configured middleware")
+	}
+}
+
+// probeWriter runs probe at the instant a log record containing on is
+// written, so a test can observe what had happened by then rather than
+// only what had happened by the end.
+type probeWriter struct {
+	on    string
+	probe func()
+}
+
+func (w *probeWriter) Write(p []byte) (int, error) {
+	if strings.Contains(string(p), w.on) {
+		w.probe()
+	}
+	return len(p), nil
+}
+
+// Where the metrics middleware sits is asserted from what the chain
+// does, not from how it is composed: the start record is written before
+// the metrics middleware is entered, and by the time the job's own
+// handler runs it has been.
+//
+// The in-flight gauge is the probe because it is the one metric that
+// changes on the way *in*. A composition that put metrics outermost
+// would leave logging reporting a job that had already been counted as
+// executing.
+func TestJobMetricsAreRecordedInsideTheLoggingMiddleware(t *testing.T) {
+	t.Parallel()
+
+	reg := prometheus.NewRegistry()
+	executing := func() float64 {
+		s, _ := seriesFor(t, reg, "drover_jobs_executing", map[string]string{})
+		return s.value
+	}
+
+	var atStartRecord atomic.Value
+	logs := &probeWriter{on: `msg="drover: job started"`, probe: func() {
+		atStartRecord.Store(executing())
+	}}
+
+	ws := NewWorkers()
+	var duringHandler atomic.Value
+	Register(ws, &funcWorker{fn: func(context.Context, *Job[greetArgs]) error {
+		duringHandler.Store(executing())
+		return nil
+	}})
+	c := newClient(memdriver.New(), Config{
+		Workers:         ws,
+		Logger:          slog.New(slog.NewTextHandler(logs, nil)),
+		MetricsRegistry: reg,
+	})
+
+	job := &JobRow{ID: 1, Kind: "greet", Queue: "default", Args: []byte(`{"name":"ada"}`)}
+	if err := c.chain(context.Background(), job); err != nil {
+		t.Fatalf("chain returned %v, want nil", err)
+	}
+
+	before, ok := atStartRecord.Load().(float64)
+	if !ok {
+		t.Fatal("no start record was written — the logging middleware did not run")
+	}
+	if before != 0 {
+		t.Errorf("drover_jobs_executing = %v when the start record was written, want 0 — "+
+			"the metrics middleware ran outside the logging one", before)
+	}
+	if during, _ := duringHandler.Load().(float64); during != 1 {
+		t.Errorf("drover_jobs_executing = %v while the handler ran, want 1", during)
+	}
+}
+
+// Metrics are installed ahead of whatever the caller configured, so a
+// middleware of theirs cannot decide what is counted. A middleware that
+// swallows the worker's error is the sensor: the chain's verdict is
+// success, so the counters must say success too — and would say failure
+// if the metrics middleware had been composed inside the caller's.
+func TestJobMetricsAreRecordedAheadOfConfiguredMiddleware(t *testing.T) {
+	t.Parallel()
+
+	reg := prometheus.NewRegistry()
+	ws := NewWorkers()
+	Register(ws, &funcWorker{fn: func(context.Context, *Job[greetArgs]) error {
+		return errors.New("worker failed")
+	}})
+	c := newClient(memdriver.New(), Config{
+		Workers:         ws,
+		MetricsRegistry: reg,
+		Middleware: []Middleware{func(next Handler) Handler {
+			return func(ctx context.Context, job *JobRow) error {
+				_ = next(ctx, job)
+				return nil
+			}
+		}},
+	})
+
+	job := &JobRow{ID: 1, Kind: "greet", Queue: "default", Args: []byte(`{"name":"ada"}`)}
+	if err := c.chain(context.Background(), job); err != nil {
+		t.Fatalf("chain returned %v, want nil", err)
+	}
+
+	completed, ok := seriesFor(t, reg, "drover_jobs_completed_total", map[string]string{"queue": "default"})
+	if !ok || completed.value != 1 {
+		t.Errorf("drover_jobs_completed_total = %v (published: %t), want 1 — the metrics middleware "+
+			"was composed inside the configured one, so it saw the error the caller swallowed",
+			completed.value, ok)
+	}
+	if failed, ok := seriesFor(t, reg, "drover_jobs_failed_total", map[string]string{"queue": "default"}); ok && failed.value != 0 {
+		t.Errorf("drover_jobs_failed_total = %v, want 0", failed.value)
+	}
+}
+
+// The same trapdoor the built-in logging closed: configuring middleware
+// must not be a way to end up with no metrics during an incident.
+func TestConfiguringMiddlewareCannotDisableJobMetrics(t *testing.T) {
+	t.Parallel()
+
+	reg := prometheus.NewRegistry()
+	ws := NewWorkers()
+	Register(ws, &funcWorker{fn: func(context.Context, *Job[greetArgs]) error { return nil }})
+	c := newClient(memdriver.New(), Config{
+		Workers:         ws,
+		MetricsRegistry: reg,
+		Middleware: []Middleware{func(next Handler) Handler {
+			return func(ctx context.Context, job *JobRow) error { return next(ctx, job) }
+		}},
+	})
+
+	job := &JobRow{ID: 1, Kind: "greet", Queue: "critical", Args: []byte(`{"name":"ada"}`)}
+	if err := c.chain(context.Background(), job); err != nil {
+		t.Fatalf("chain returned %v, want nil", err)
+	}
+
+	labels := map[string]string{"queue": "critical"}
+	completed, ok := seriesFor(t, reg, "drover_jobs_completed_total", labels)
+	if !ok || completed.value != 1 {
+		t.Errorf("drover_jobs_completed_total{queue=critical} = %v (published: %t), want 1", completed.value, ok)
+	}
+	duration, ok := seriesFor(t, reg, "drover_job_duration_seconds", labels)
+	if !ok || duration.value != 1 {
+		t.Errorf("drover_job_duration_seconds{queue=critical} holds %v observations (published: %t), want 1",
+			duration.value, ok)
 	}
 }
 

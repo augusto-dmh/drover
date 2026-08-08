@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/augusto-dmh/drover/internal/driver"
@@ -65,14 +67,18 @@ type runner struct {
 	stopHeartbeat chan struct{}
 
 	goroutines sync.WaitGroup // fetch loop and workers
-	background sync.WaitGroup // heartbeat and rescuer
+	background sync.WaitGroup // heartbeat, rescuer, and stats refresher
 
 	shutdown sync.Once
 	done     chan struct{} // closed once the shutdown has finished
 	stopErr  error         // written before done is closed
+
+	refresher *statsRefresher
+	ops       *opsServer
+	draining  atomic.Bool
 }
 
-func newRunner(ctx context.Context, c *Client) *runner {
+func newRunner(ctx context.Context, c *Client, ln net.Listener) *runner {
 	// Both are detached from the caller's context. Cancelling that
 	// context must begin an orderly shutdown, not kill work outright: the
 	// watcher goroutine turns it into a full Stop, and the ordering there
@@ -95,17 +101,34 @@ func newRunner(ctx context.Context, c *Client) *runner {
 		cancelJobs:       cancelJobs,
 		stopHeartbeat:    make(chan struct{}),
 		done:             make(chan struct{}),
+		refresher: newStatsRefresher(
+			c.drv, c.metrics, c.queues, c.statsInterval, c.logger,
+		),
 	}
 	for i := 0; i < r.concurrency; i++ {
 		r.slots <- struct{}{}
 	}
+	if ln != nil {
+		interval := c.statsInterval
+		r.ops = newOpsServer(ln, c.registry, func() error {
+			if r.draining.Load() {
+				return errors.New("draining")
+			}
+			if !r.refresher.fresh(time.Now(), 2*interval) {
+				return errors.New("queue stats stale")
+			}
+			return nil
+		}, c.logger)
+	}
 	return r
 }
 
-// start launches the pool: the heartbeat and rescuer that support it,
-// the fetch loop that feeds it, and one goroutine per worker.
+// start launches the pool: the heartbeat, rescuer, and stats refresher
+// that support it, the fetch loop that feeds it, and one goroutine per
+// worker. The ops server, when configured, is launched here too and is
+// joined at the end of drain rather than under background.
 func (r *runner) start(ctx context.Context) {
-	r.background.Add(2)
+	r.background.Add(3)
 	go func() {
 		defer r.background.Done()
 		r.client.heartbeat(r.stopHeartbeat)
@@ -114,6 +137,14 @@ func (r *runner) start(ctx context.Context) {
 		defer r.background.Done()
 		r.client.rescueLoop(r.fetchCtx)
 	}()
+	go func() {
+		defer r.background.Done()
+		r.refresher.run(r.fetchCtx)
+	}()
+
+	if r.ops != nil {
+		go r.ops.serve()
+	}
 
 	r.goroutines.Add(1)
 	go func() {
@@ -164,10 +195,16 @@ func (r *runner) stop(ctx context.Context) error {
 }
 
 // drain performs the ordered shutdown: stop claiming, wait for what is
-// already running, then release the machinery that supported it.
+// already running, then release the machinery that supported it. The ops
+// server is shut down last so /readyz and /metrics still answer while
+// workers drain.
 func (r *runner) drain(ctx context.Context) error {
 	c := r.client
 	c.logger.Info("drover: worker pool stopping", "queues", queueNames(r.queues))
+
+	// Set before anything else so /readyz flips the instant Stop is
+	// called, not one staleness bound after the refresher is cancelled.
+	r.draining.Store(true)
 
 	// Released once nothing is left to run under it.
 	defer r.cancelJobs()
@@ -199,6 +236,18 @@ func (r *runner) drain(ctx context.Context) error {
 	// (AD-018, widened here from the last job to the last worker).
 	close(r.stopHeartbeat)
 	r.background.Wait()
+
+	// Last. Observability matters most during shutdown; the ops server
+	// stays up through the drain so probes see 503 rather than a refused
+	// connection, and scrapes still land.
+	if r.ops != nil {
+		opsCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if shutErr := r.ops.shutdown(opsCtx); shutErr != nil {
+			c.logger.Error("drover: shut down ops server", "error", shutErr)
+			err = errors.Join(err, shutErr)
+		}
+	}
 
 	c.logger.Info("drover: worker pool stopped", "queues", queueNames(r.queues))
 	return err

@@ -4,6 +4,7 @@
 package pgdriver
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -177,6 +178,52 @@ func (d *Driver) MarkSnoozed(ctx context.Context, lease driver.Lease, runAt time
 		return fmt.Errorf("mark job %d snoozed: %w", lease.ID, err)
 	}
 	return d.explain(ctx, lease, affected)
+}
+
+// Stats reports the depth of every queue by state, and how long the
+// oldest job each queue could hand a worker right now has been waiting.
+//
+// The age is subtracted by the database, not here: the scheduled time it
+// is measured from was decided by that clock, so only that clock can say
+// how late a job is. Reading the timestamp back and subtracting the
+// caller's own now() would make the number depend on two machines
+// agreeing, and a client running fast would publish ages no other client
+// in the fleet reports.
+func (d *Driver) Stats(ctx context.Context) (*driver.Stats, error) {
+	depths, err := d.queries.QueueDepths(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("count jobs by queue and state: %w", err)
+	}
+	oldest, err := d.queries.OldestClaimable(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("age the oldest claimable job of each queue: %w", err)
+	}
+
+	stats := &driver.Stats{}
+	for _, row := range depths {
+		stats.Depths = append(stats.Depths, driver.QueueDepth{
+			Queue: row.Queue, State: row.State, Count: row.Count,
+		})
+	}
+	for _, row := range oldest {
+		stats.Oldest = append(stats.Oldest, driver.QueueAge{
+			Queue: row.Queue, AgeSeconds: row.AgeSeconds,
+		})
+	}
+	// GROUP BY has no guaranteed output order and the contract has one,
+	// for the same reason sortedRows exists: a reading is compared against
+	// another driver's reading of the same jobs, and that only means
+	// something if neither leaves the order to the planner.
+	slices.SortFunc(stats.Depths, func(a, b driver.QueueDepth) int {
+		if c := cmp.Compare(a.Queue, b.Queue); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.State, b.State)
+	})
+	slices.SortFunc(stats.Oldest, func(a, b driver.QueueAge) int {
+		return cmp.Compare(a.Queue, b.Queue)
+	})
+	return stats, nil
 }
 
 // explain turns the row count of a guarded transition UPDATE into an

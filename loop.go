@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"slices"
 	"time"
 
@@ -31,12 +32,37 @@ import (
 // backstop for the paths no shutdown code survives; a clean shutdown
 // loses nothing.
 func (c *Client) Start(ctx context.Context) error {
+	// Already-started must win over listen: with a fixed OpsAddr a second
+	// Start would otherwise fail with EADDRINUSE wrapped as a listen
+	// error, and callers checking errors.Is(..., ErrAlreadyStarted) would
+	// miss. Bind still happens before any goroutine so a port conflict
+	// fails Start and leaves the client startable again — not a log line
+	// from a half-started pool.
 	c.mu.Lock()
 	if c.runner != nil {
 		c.mu.Unlock()
 		return ErrAlreadyStarted
 	}
-	r := newRunner(ctx, c)
+	c.mu.Unlock()
+
+	var ln net.Listener
+	if c.opsAddr != "" {
+		var err error
+		ln, err = net.Listen("tcp", c.opsAddr)
+		if err != nil {
+			return fmt.Errorf("drover: listen on ops address %q: %w", c.opsAddr, err)
+		}
+	}
+
+	c.mu.Lock()
+	if c.runner != nil {
+		c.mu.Unlock()
+		if ln != nil {
+			_ = ln.Close()
+		}
+		return ErrAlreadyStarted
+	}
+	r := newRunner(ctx, c, ln)
 	c.runner = r
 	// Launched under the lock, not after it. Publishing the runner and
 	// then starting it in two steps leaves a window in which Stop sees a

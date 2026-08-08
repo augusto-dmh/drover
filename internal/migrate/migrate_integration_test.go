@@ -20,7 +20,7 @@ func TestMain(m *testing.M) { os.Exit(testdb.RunMain(m)) }
 
 // latestVersion is the highest embedded migration; the schema is only
 // correct once every one of them has been applied.
-const latestVersion = 2
+const latestVersion = 3
 
 // indexDefs returns each index on drover_jobs by name, with the
 // definition PostgreSQL reconstructed from the catalog.
@@ -87,6 +87,30 @@ func assertFetchAndLeaseIndexes(t *testing.T, pool *pgxpool.Pool) {
 	}
 }
 
+// assertDeadIndex checks that counting dead jobs per queue has an index
+// of its own. Without it that count is a sequential scan whose cost grows
+// with the completed-job history, so the refresher that reports load
+// becomes a source of it.
+func assertDeadIndex(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	defs := indexDefs(t, pool)
+
+	dead, ok := defs["drover_jobs_dead_idx"]
+	if !ok {
+		t.Fatalf("drover_jobs_dead_idx missing; indexes present: %v", slices.Sorted(maps.Keys(defs)))
+	}
+	// Partial on dead, or it would be maintained on every write to a
+	// table whose rows are overwhelmingly not dead.
+	if !strings.Contains(dead, "WHERE (state = 'dead'") {
+		t.Errorf("dead index is not partial on the dead state: %s", dead)
+	}
+	// Keyed by queue so a per-queue count reads only that queue's
+	// entries, and carrying id lets the count come from the index alone.
+	if !strings.Contains(dead, "(queue, id)") {
+		t.Errorf("dead index key does not serve a per-queue count: %s", dead)
+	}
+}
+
 func TestMigrateFreshDatabaseCreatesSchemaAtLatestVersion(t *testing.T) {
 	pool := testdb.NewDB(t)
 	ctx := context.Background()
@@ -105,6 +129,7 @@ func TestMigrateFreshDatabaseCreatesSchemaAtLatestVersion(t *testing.T) {
 	}
 
 	assertFetchAndLeaseIndexes(t, pool)
+	assertDeadIndex(t, pool)
 
 	rows, err := pool.Query(ctx, `
 		SELECT column_name FROM information_schema.columns
@@ -193,4 +218,48 @@ func TestMigrateIsIdempotent(t *testing.T) {
 	}
 
 	assertFetchAndLeaseIndexes(t, pool)
+	assertDeadIndex(t, pool)
+}
+
+// TestMigrateUpgradesDatabaseAlreadyAtPreviousVersion covers the path a
+// running deployment actually takes: the schema already exists, holds
+// rows, and is one version behind. A fresh database applies every
+// migration in one sequence, which never proves a later migration can be
+// applied to a schema that has been in use.
+func TestMigrateUpgradesDatabaseAlreadyAtPreviousVersion(t *testing.T) {
+	pool := testdb.NewDB(t)
+	ctx := context.Background()
+
+	if err := migrate.Migrate(ctx, pool); err != nil {
+		t.Fatalf("first Migrate: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO drover_jobs (kind, queue, state) VALUES ('k', 'default', 'dead')`); err != nil {
+		t.Fatalf("insert dead job: %v", err)
+	}
+
+	// Wind the schema back to the previous version, leaving the rows in
+	// place, so the next Migrate has to apply the newest migration to a
+	// populated table rather than an empty one.
+	if _, err := pool.Exec(ctx, `DROP INDEX drover_jobs_dead_idx`); err != nil {
+		t.Fatalf("drop dead index: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`DELETE FROM drover_schema_version WHERE version = $1`, latestVersion); err != nil {
+		t.Fatalf("wind back schema version: %v", err)
+	}
+
+	if err := migrate.Migrate(ctx, pool); err != nil {
+		t.Fatalf("upgrade Migrate: %v", err)
+	}
+
+	var version int
+	if err := pool.QueryRow(ctx,
+		`SELECT MAX(version) FROM drover_schema_version`).Scan(&version); err != nil {
+		t.Fatalf("read version: %v", err)
+	}
+	if version != latestVersion {
+		t.Errorf("schema version = %d, want %d", version, latestVersion)
+	}
+	assertDeadIndex(t, pool)
 }

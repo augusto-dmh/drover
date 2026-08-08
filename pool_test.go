@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -251,6 +252,38 @@ func TestStartRefusesToRunTwice(t *testing.T) {
 	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 
 	c := newPoolClient(memdriver.New(), NewWorkers(), 2, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	if err := c.Start(ctx); !errors.Is(err, ErrAlreadyStarted) {
+		t.Errorf("second Start = %v, want ErrAlreadyStarted", err)
+	}
+
+	if err := c.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop returned %v, want nil", err)
+	}
+}
+
+// With a fixed OpsAddr the already-running check must win over listen:
+// otherwise the second Start fails with EADDRINUSE and callers checking
+// errors.Is(..., ErrAlreadyStarted) miss.
+func TestStartWithOpsAddrRefusesSecondStart(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+
+	c := newPoolClient(memdriver.New(), NewWorkers(), 1, func(cfg *Config) {
+		cfg.OpsAddr = addr
+		cfg.StatsInterval = time.Hour
+	})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	if err := c.Start(ctx); err != nil {
@@ -599,7 +632,7 @@ func TestClaimsNeverHandedToAWorkerGoBackToTheQueue(t *testing.T) {
 		t.Fatalf("claimed %d rows, want 2", len(claimed))
 	}
 
-	r := newRunner(context.Background(), c)
+	r := newRunner(context.Background(), c, nil)
 	defer r.cancelJobs()
 	defer r.cancelBackground()
 
@@ -644,7 +677,7 @@ func TestTheFetchLoopHandsBackRowsItNeverDispatched(t *testing.T) {
 	c := newPoolClient(mem, NewWorkers(), 2, nil)
 	ids := insertN(t, c, 2)
 
-	r := newRunner(context.Background(), c)
+	r := newRunner(context.Background(), c, nil)
 	defer r.cancelJobs()
 	defer r.cancelBackground()
 
@@ -759,7 +792,7 @@ func TestAHandBackThatLostItsRaceIsNotReportedAsAFailure(t *testing.T) {
 				t.Fatalf("FetchAvailable: %v", err)
 			}
 
-			r := newRunner(context.Background(), c)
+			r := newRunner(context.Background(), c, nil)
 			defer r.cancelJobs()
 			defer r.cancelBackground()
 			<-r.slots
@@ -805,7 +838,7 @@ func TestOneFailedHandBackDoesNotStopTheRest(t *testing.T) {
 		t.Fatalf("FetchAvailable: %v", err)
 	}
 
-	r := newRunner(context.Background(), c)
+	r := newRunner(context.Background(), c, nil)
 	defer r.cancelJobs()
 	defer r.cancelBackground()
 	for _, row := range claimed {
@@ -1105,7 +1138,7 @@ func TestEscalationReportsNothingWhenNothingWasStranded(t *testing.T) {
 	t.Parallel()
 
 	c := newPoolClient(memdriver.New(), NewWorkers(), 2, nil)
-	r := newRunner(context.Background(), c)
+	r := newRunner(context.Background(), c, nil)
 	defer r.cancelJobs()
 	defer r.cancelBackground()
 

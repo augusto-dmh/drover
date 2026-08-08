@@ -150,6 +150,75 @@ func (d *Driver) ExtendLeases(_ context.Context, leases []driver.Lease, leaseFor
 	return nil
 }
 
+// counted reports whether jobs in this state are worth reporting a depth
+// for. completed and cancelled are absent deliberately: nothing removes
+// those rows, so counting them would tie the cost of a reading to the
+// whole history of the queue rather than to its backlog — in the SQL
+// driver, where that cost is a scan rather than a map walk, that is the
+// difference between a cheap gauge and a source of load.
+func counted(state string) bool {
+	switch state {
+	case "available", "scheduled", "retryable", "running", "dead":
+		return true
+	default:
+		return false
+	}
+}
+
+// Stats reports the depth of every queue by state, and how long the
+// oldest job each queue could hand a worker right now has been waiting,
+// against this store's clock.
+func (d *Driver) Stats(context.Context) (*driver.Stats, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	now := time.Now()
+	type depth struct{ queue, state string }
+	counts := make(map[depth]int64)
+	oldest := make(map[string]time.Time)
+
+	for _, row := range d.jobs {
+		if counted(row.State) {
+			counts[depth{row.Queue, row.State}]++
+		}
+		// The claim's own predicate, not a restatement of it: a job the
+		// fetch would pass over is not waiting on a worker, it is early,
+		// and ageing it would report a deliberate delay as lateness.
+		if !waiting(row.State) || row.ScheduledAt.After(now) {
+			continue
+		}
+		if since, seen := oldest[row.Queue]; !seen || row.ScheduledAt.Before(since) {
+			oldest[row.Queue] = row.ScheduledAt
+		}
+	}
+
+	stats := &driver.Stats{}
+	for key, count := range counts {
+		stats.Depths = append(stats.Depths, driver.QueueDepth{
+			Queue: key.queue, State: key.state, Count: count,
+		})
+	}
+	for queue, since := range oldest {
+		stats.Oldest = append(stats.Oldest, driver.QueueAge{
+			Queue: queue, AgeSeconds: now.Sub(since).Seconds(),
+		})
+	}
+	// Ordered because the contract is, and for the reason it is: a map
+	// walk yields queues in a different order every call, and the two
+	// drivers can only be compared reading against reading if neither
+	// leaves the order to chance.
+	slices.SortFunc(stats.Depths, func(a, b driver.QueueDepth) int {
+		if c := cmp.Compare(a.Queue, b.Queue); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.State, b.State)
+	})
+	slices.SortFunc(stats.Oldest, func(a, b driver.QueueAge) int {
+		return cmp.Compare(a.Queue, b.Queue)
+	})
+	return stats, nil
+}
+
 // selectRows returns the stored rows matching keep, ordered by order and
 // then by id. The caller must hold d.mu; the rows are live pointers, not
 // copies.

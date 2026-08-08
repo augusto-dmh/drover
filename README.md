@@ -75,13 +75,62 @@ err = client.Stop(shutdownCtx)
 
 A full runnable version of this, including the retry path, a custom middleware, and shutdown on SIGINT, lives in [`examples/email`](examples/email).
 
+## Observability
+
+Drover exposes Prometheus metrics on a dedicated ops port, separate from anything your application serves. Per-execution counters and histograms are recorded from the middleware chain; queue depth and oldest-job age are refreshed from the database on an interval, so scrape rate never multiplies database load ([ADR-0005](docs/adr/0005-prometheus-observability-via-ops-port-and-background-gauge-refresh.md)).
+
+```go
+client, err := drover.NewClient(pool, drover.Config{
+    Workers:         workers,
+    Concurrency:     8,
+    Queues:          map[string]int{"default": 1, "bulk": 9},
+    OpsAddr:         "127.0.0.1:9090", // /metrics, /healthz, /readyz
+    StatsInterval:   15 * time.Second, // how often depth/age gauges refresh
+    MetricsRegistry: prometheus.NewRegistry(),
+})
+```
+
+Leave `OpsAddr` empty to record metrics without serving them — pass `MetricsRegistry` to your own `/metrics` handler instead. Bind the ops port to a private interface; TLS and authentication are deployment concerns.
+
+### Ops endpoints
+
+| Path | Meaning |
+| --- | --- |
+| `GET /metrics` | Prometheus text format from this client's registry |
+| `GET /healthz` | Process is alive — always `200` |
+| `GET /readyz` | Worker is started and the last gauge refresh succeeded within twice `StatsInterval`; otherwise `503` with a reason. Removes the worker from rotation on database loss without restarting the process. |
+
+### Metrics
+
+| Name | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `drover_jobs_completed_total` | Counter | `queue` | Executions that returned no error. |
+| `drover_jobs_failed_total` | Counter | `queue` | Executions that returned an error, including recovered panics. Counts **attempts**, not jobs that reached `dead` — a job that fails four times and succeeds on the fifth increments this four times. Use `drover_queue_depth{state="dead"}` for permanent failures. |
+| `drover_job_duration_seconds` | Histogram | `queue` | Wall-clock time one execution took, successful or not. Buckets span 5ms to 10 minutes. |
+| `drover_jobs_executing` | Gauge | — | Executions currently inside the middleware chain. |
+| `drover_pool_concurrency` | Gauge | — | Configured worker count; compare to `drover_jobs_executing` for saturation. |
+| `drover_queue_depth` | Gauge | `queue`, `state` | Jobs held in one state on one queue. States: `available`, `scheduled`, `retryable`, `running`, `dead`. `completed` and `cancelled` are deliberately absent — those rows accumulate forever, and counting them would make this gauge's cost grow with history instead of backlog. |
+| `drover_oldest_job_age_seconds` | Gauge | `queue` | Age in seconds of the oldest job claimable *now* (same predicate the fetch loop uses). `0` when no job is waiting — a configured-but-empty queue publishes zero, not a missing series. |
+
+### Alerting
+
+Recommended primary alert — a queue with work that is not moving:
+
+```promql
+max by (queue) (max_over_time(drover_oldest_job_age_seconds[5m])) > 300
+```
+
+`drover_oldest_job_age_seconds` is the primary alerting metric because it detects a stuck queue regardless of cause: workers dead, fetch broken, database slow, or handlers hanging. Counters tell you jobs failed; depth by state tells you *where* they are; oldest age tells you work is waiting longer than it should. Page on five minutes for most workloads; tune the threshold to your SLA.
+
+Secondary signals: `drover_queue_depth{state="dead"}` for permanent failure accumulation; `drover_jobs_executing / drover_pool_concurrency` near 1.0 for saturation.
+
 ## Roadmap
 
-v0.1.0 = cycles A–E of [RFC-0001](docs/rfc/0001-drover-roadmap.md): walking skeleton → retries/DLQ/rescue → worker pools + graceful shutdown → middleware + scheduled jobs → Prometheus observability. Then: CLI introspection, benchmarks with published methodology, periodic jobs via advisory-lock leader election, and an optional server-rendered status page.
+v0.1.0 = cycles A–E of [RFC-0001](docs/rfc/0001-drover-roadmap.md): walking skeleton → retries/DLQ/rescue → worker pools + graceful shutdown → middleware + scheduled jobs → **Prometheus observability (shipped)**. Then: CLI introspection, benchmarks with published methodology, periodic jobs via advisory-lock leader election, and an optional server-rendered status page.
 
 ## Documentation
 
-- [Architecture Decision Records](docs/adr/) — what was decided and why
+- [Architecture Decision Records](docs/adr/) — what was decided and why, including [observability (ADR-0005)](docs/adr/0005-prometheus-observability-via-ops-port-and-background-gauge-refresh.md)
 - [RFC-0001 roadmap](docs/rfc/0001-drover-roadmap.md) — what ships when
 - [Research](docs/research/) — the evidence behind the decisions (existing-system survey, storage mechanics, delivery semantics, conventions, scope)
 

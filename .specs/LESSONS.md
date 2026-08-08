@@ -56,6 +56,24 @@ Seen once or not yet corroborated. Tracked, not trusted.
 - evidence: pool_test.go:557 M6 / P1-Story2 AC3, AC5 (testing/lifecycle)
 - last seen: 2026-07-26T14:03:33Z
 
+### L-008 — Assert scrape-or-Gather before the first successful gauge refresh still publishes configured queue series at zero rather than omitting them
+- signal: `ac_gap` · recurrence: 1 feature(s) · scope: `metrics` · harmful: 0
+- features: cycle-e-observability
+- evidence: EDGE-01 (metrics)
+- last seen: 2026-08-07T03:56:07Z
+
+### L-009 — Keep a compile-or-Example test for every README config snippet that names shipped API fields
+- signal: `ac_gap` · recurrence: 1 feature(s) · scope: `docs` · harmful: 0
+- features: cycle-e-observability
+- evidence: OBS-13.3 (docs)
+- last seen: 2026-08-07T03:56:07Z
+
+### L-010 — When a constructor gains a parameter beyond the design signature, leave a SPEC_DEVIATION with the reason at the definition site
+- signal: `spec_deviation` · recurrence: 1 feature(s) · scope: `metrics` · harmful: 0
+- features: cycle-e-observability
+- evidence: metrics.go:38 SPEC_DEVIATION (metrics)
+- last seen: 2026-08-07T03:56:07Z
+
 ## Quarantined (failed when applied — ignore)
 
 A confirmed lesson that recurred alongside failure. Kept for the maintainer to review.

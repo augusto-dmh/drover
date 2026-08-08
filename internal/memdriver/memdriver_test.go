@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -93,6 +95,24 @@ func decodeErrors(t *testing.T, row *driver.JobRow) []driver.AttemptError {
 // test here claims at most once, so attempt 1 is what a legitimate
 // holder presents.
 func held(id int64) driver.Lease { return driver.Lease{ID: id, Attempt: 1} }
+
+// due inserts a job on queue whose scheduled time is at: in the past it
+// has been waiting for a worker since then, in the future it is not
+// waiting at all. The state is left to Insert's own due-time rule rather
+// than asserted by the test.
+func due(t *testing.T, d *Driver, queue string, at time.Time) *driver.JobRow {
+	t.Helper()
+	row, err := d.Insert(context.Background(), driver.InsertParams{
+		Kind:        "k",
+		Queue:       queue,
+		Args:        []byte(`{"n":1}`),
+		ScheduledAt: at,
+	})
+	if err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	return row
+}
 
 func TestInsertSetsNewJobDefaults(t *testing.T) {
 	t.Parallel()
@@ -938,5 +958,200 @@ func TestScheduledJobBecomesClaimableWhenItsTimeArrives(t *testing.T) {
 	}
 	if len(claimed) != 1 || claimed[0].ID != row.ID {
 		t.Fatalf("claimed %d job(s) after the scheduled time, want job %d", len(claimed), row.ID)
+	}
+}
+
+func TestStatsCountsOnlyStatesWorthActingOn(t *testing.T) {
+	t.Parallel()
+	d := New()
+	ctx := context.Background()
+
+	// Every job below is claimed while it is the only claimable job on the
+	// queue, so each claim takes the row the next line transitions. The
+	// unclaimed available job is created last for the same reason.
+	dead := due(t, d, "default", time.Now())
+	claimOne(t, d, "default")
+	if err := d.MarkDead(ctx, held(dead.ID), []byte(`{"error":"boom"}`)); err != nil {
+		t.Fatalf("MarkDead: %v", err)
+	}
+
+	completed := due(t, d, "default", time.Now())
+	claimOne(t, d, "default")
+	if err := d.MarkCompleted(ctx, held(completed.ID)); err != nil {
+		t.Fatalf("MarkCompleted: %v", err)
+	}
+
+	cancelled := due(t, d, "default", time.Now())
+	claimOne(t, d, "default")
+	if err := d.MarkCancelled(ctx, held(cancelled.ID), []byte(`{"error":"nope"}`)); err != nil {
+		t.Fatalf("MarkCancelled: %v", err)
+	}
+
+	due(t, d, "default", time.Now())
+	claimOne(t, d, "default")
+
+	snoozed := due(t, d, "default", time.Now())
+	claimOne(t, d, "default")
+	if err := d.MarkSnoozed(ctx, held(snoozed.ID), time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("MarkSnoozed: %v", err)
+	}
+
+	retried := due(t, d, "default", time.Now())
+	claimOne(t, d, "default")
+	if err := d.MarkRetryable(ctx, held(retried.ID), time.Now().Add(time.Minute),
+		[]byte(`{"error":"boom"}`)); err != nil {
+		t.Fatalf("MarkRetryable: %v", err)
+	}
+
+	due(t, d, "default", time.Now())
+
+	stats, err := d.Stats(ctx)
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+
+	// completed and cancelled are absent by design: they are the states
+	// that accumulate forever, and counting them would make the reading
+	// cost grow with history instead of with backlog.
+	want := []driver.QueueDepth{
+		{Queue: "default", State: "available", Count: 1},
+		{Queue: "default", State: "dead", Count: 1},
+		{Queue: "default", State: "retryable", Count: 1},
+		{Queue: "default", State: "running", Count: 1},
+		{Queue: "default", State: "scheduled", Count: 1},
+	}
+	if !slices.Equal(stats.Depths, want) {
+		t.Errorf("Depths = %v, want %v", stats.Depths, want)
+	}
+}
+
+func TestStatsCountsEachQueueSeparately(t *testing.T) {
+	t.Parallel()
+	d := New()
+
+	due(t, d, "alpha", time.Now())
+	due(t, d, "alpha", time.Now())
+	due(t, d, "beta", time.Now())
+
+	stats, err := d.Stats(context.Background())
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+
+	want := []driver.QueueDepth{
+		{Queue: "alpha", State: "available", Count: 2},
+		{Queue: "beta", State: "available", Count: 1},
+	}
+	if !slices.Equal(stats.Depths, want) {
+		t.Errorf("Depths = %v, want %v", stats.Depths, want)
+	}
+}
+
+func TestStatsAgesOnlyJobsClaimableNow(t *testing.T) {
+	t.Parallel()
+
+	const waited = 90 * time.Second
+	// noAge marks a queue that must not be reported as waiting at all.
+	const noAge = -1.0
+
+	tests := []struct {
+		name    string
+		build   func(t *testing.T, d *Driver)
+		wantAge float64
+	}{
+		{
+			name: "a job due in the past has waited since it came due",
+			build: func(t *testing.T, d *Driver) {
+				due(t, d, "q", time.Now().Add(-waited))
+			},
+			wantAge: waited.Seconds(),
+		},
+		{
+			name: "a job scheduled for later is not waiting",
+			build: func(t *testing.T, d *Driver) {
+				due(t, d, "q", time.Now().Add(time.Hour))
+			},
+			wantAge: noAge,
+		},
+		{
+			name: "an overdue job is reported past a job scheduled for later",
+			build: func(t *testing.T, d *Driver) {
+				due(t, d, "q", time.Now().Add(time.Hour))
+				due(t, d, "q", time.Now().Add(-waited))
+			},
+			wantAge: waited.Seconds(),
+		},
+		{
+			name: "a retryable job waits from the end of its backoff",
+			build: func(t *testing.T, d *Driver) {
+				row := due(t, d, "q", time.Now())
+				claimOne(t, d, "q")
+				if err := d.MarkRetryable(context.Background(), held(row.ID),
+					time.Now().Add(-waited), []byte(`{"error":"boom"}`)); err != nil {
+					t.Fatalf("MarkRetryable: %v", err)
+				}
+			},
+			wantAge: waited.Seconds(),
+		},
+		{
+			name: "a running job is being worked on, not waiting",
+			build: func(t *testing.T, d *Driver) {
+				due(t, d, "q", time.Now().Add(-waited))
+				claimOne(t, d, "q")
+			},
+			wantAge: noAge,
+		},
+		{
+			name: "a dead job is never claimable again",
+			build: func(t *testing.T, d *Driver) {
+				row := due(t, d, "q", time.Now().Add(-waited))
+				claimOne(t, d, "q")
+				if err := d.MarkDead(context.Background(), held(row.ID),
+					[]byte(`{"error":"boom"}`)); err != nil {
+					t.Fatalf("MarkDead: %v", err)
+				}
+			},
+			wantAge: noAge,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			d := New()
+			tt.build(t, d)
+
+			stats, err := d.Stats(context.Background())
+			if err != nil {
+				t.Fatalf("Stats: %v", err)
+			}
+			if tt.wantAge == noAge {
+				if len(stats.Oldest) != 0 {
+					t.Fatalf("Oldest = %v, want no queue reported as waiting", stats.Oldest)
+				}
+				return
+			}
+			if len(stats.Oldest) != 1 || stats.Oldest[0].Queue != "q" {
+				t.Fatalf("Oldest = %v, want one entry for queue q", stats.Oldest)
+			}
+			// The tolerance covers the time the test itself takes, and is
+			// far below the hour a job counted from the wrong side of now
+			// would be out by.
+			if got := stats.Oldest[0].AgeSeconds; math.Abs(got-tt.wantAge) > 2 {
+				t.Errorf("AgeSeconds = %v, want %v", got, tt.wantAge)
+			}
+		})
+	}
+}
+
+func TestStatsOnAnEmptyStoreReportsNothing(t *testing.T) {
+	t.Parallel()
+
+	stats, err := New().Stats(context.Background())
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if len(stats.Depths) != 0 || len(stats.Oldest) != 0 {
+		t.Errorf("Stats = %+v, want no depths and no ages", stats)
 	}
 }

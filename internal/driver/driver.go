@@ -91,6 +91,45 @@ type AttemptError struct {
 	Trace   string    `json:"trace,omitempty"`
 }
 
+// QueueDepth is the number of jobs sitting in one state on one queue.
+type QueueDepth struct {
+	Queue string
+	State string
+	Count int64
+}
+
+// QueueAge is how long the oldest job that is claimable right now has
+// been waiting on one queue.
+//
+// It measures lateness, not delay: a job deliberately scheduled for later
+// is not waiting for anything, so only the jobs a claim would take this
+// instant count. Counting the rest would report every deferred job as an
+// outage. The elapsed time is measured by the store's own clock — the one
+// that decides whether a job is due — because a caller subtracting
+// against its own would publish an age no other caller agrees with.
+type QueueAge struct {
+	Queue      string
+	AgeSeconds float64
+}
+
+// Stats is one reading of what the queues hold: how many jobs sit in each
+// state worth acting on, and how far behind each queue is.
+//
+// Both slices are ordered, Depths by queue then state and Oldest by
+// queue, so two drivers over the same jobs return the same reading rather
+// than the same rows in some order.
+//
+// A queue with nothing claimable has no Oldest entry at all: the store
+// reports what it holds, and deciding that "nothing waiting" publishes as
+// an age of zero belongs to the caller that has to name the queues.
+// States nothing ever cleans up — completed, cancelled — are deliberately
+// absent from Depths, so the cost of a reading tracks the backlog rather
+// than the entire history of the queue.
+type Stats struct {
+	Depths []QueueDepth
+	Oldest []QueueAge
+}
+
 // Driver is the storage contract. Every Mark method is guarded on the
 // caller's lease: the job must still be running on the exact attempt the
 // lease names. From any other state it reports ErrInvalidTransition, for
@@ -147,4 +186,14 @@ type Driver interface {
 	// no error and gives back the attempt the claim consumed, floored at
 	// zero, so snoozing can never exhaust a job's attempts.
 	MarkSnoozed(ctx context.Context, lease Lease, runAt time.Time) error
+
+	// Stats reports what the queues hold at this instant: a depth per
+	// queue and state, and how long the oldest job each queue could hand a
+	// worker has been waiting.
+	//
+	// Both readings are taken by the store, and the age in particular is
+	// subtracted there, for the same reason lease durations are passed
+	// rather than deadlines: the clock that decides a job is due is the
+	// only one that can say how late it is.
+	Stats(ctx context.Context) (*Stats, error)
 }

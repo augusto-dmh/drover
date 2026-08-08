@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/augusto-dmh/drover"
 )
@@ -87,6 +88,21 @@ func Example() {
 	defer cancel()
 	if err := client.Stop(shutdown); err != nil {
 		log.Printf("drover: shutdown incomplete: %v", err)
+	}
+}
+
+// ExampleConfig_observability mirrors the README observability snippet
+// so a renamed or removed Config field fails `go test` instead of
+// shipping a non-compiling example again.
+func ExampleConfig_observability() {
+	workers := drover.NewWorkers()
+	_ = drover.Config{
+		Workers:         workers,
+		Concurrency:     8,
+		Queues:          map[string]int{"default": 1, "bulk": 9},
+		OpsAddr:         "127.0.0.1:9090", // /metrics, /healthz, /readyz
+		StatsInterval:   15 * time.Second, // how often depth/age gauges refresh
+		MetricsRegistry: prometheus.NewRegistry(),
 	}
 }
 
