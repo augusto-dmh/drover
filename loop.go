@@ -32,9 +32,19 @@ import (
 // backstop for the paths no shutdown code survives; a clean shutdown
 // loses nothing.
 func (c *Client) Start(ctx context.Context) error {
-	// Bind before any goroutine and before taking the lock. A port
-	// conflict must fail Start and leave the client startable again —
-	// not surface later as a log line from a half-started pool.
+	// Already-started must win over listen: with a fixed OpsAddr a second
+	// Start would otherwise fail with EADDRINUSE wrapped as a listen
+	// error, and callers checking errors.Is(..., ErrAlreadyStarted) would
+	// miss. Bind still happens before any goroutine so a port conflict
+	// fails Start and leaves the client startable again — not a log line
+	// from a half-started pool.
+	c.mu.Lock()
+	if c.runner != nil {
+		c.mu.Unlock()
+		return ErrAlreadyStarted
+	}
+	c.mu.Unlock()
+
 	var ln net.Listener
 	if c.opsAddr != "" {
 		var err error
