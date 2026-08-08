@@ -219,6 +219,24 @@ func (d *Driver) Stats(context.Context) (*driver.Stats, error) {
 	return stats, nil
 }
 
+// Operator list/get/cancel/redrive stubs satisfy driver.Driver until the
+// in-memory implementations land in the next commit.
+func (d *Driver) ListJobs(context.Context, driver.ListJobsParams) ([]*driver.JobRow, error) {
+	panic("memdriver: ListJobs not implemented")
+}
+
+func (d *Driver) GetJob(context.Context, int64) (*driver.JobRow, error) {
+	panic("memdriver: GetJob not implemented")
+}
+
+func (d *Driver) OperatorCancel(context.Context, int64) (*driver.JobRow, error) {
+	panic("memdriver: OperatorCancel not implemented")
+}
+
+func (d *Driver) RedriveDead(context.Context, int64) (*driver.JobRow, error) {
+	panic("memdriver: RedriveDead not implemented")
+}
+
 // selectRows returns the stored rows matching keep, ordered by order and
 // then by id. The caller must hold d.mu; the rows are live pointers, not
 // copies.

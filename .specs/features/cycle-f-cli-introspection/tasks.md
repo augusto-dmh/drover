@@ -87,7 +87,7 @@ T12 → T13
 
 ## Phase 1: Storage
 
-### T1: Driver interface + SQL + sqlc
+### T1: Driver interface + SQL + sqlc ✅
 
 **What**: Add `ListJobsParams`, `ListJobs`, `GetJob`, `OperatorCancel`, `RedriveDead` to
 `internal/driver.Driver`. Add SQL in `queries.sql`; regenerate sqlc.

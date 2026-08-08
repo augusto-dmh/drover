@@ -226,6 +226,24 @@ func (d *Driver) Stats(ctx context.Context) (*driver.Stats, error) {
 	return stats, nil
 }
 
+// Operator list/get/cancel/redrive stubs satisfy driver.Driver until the
+// Postgres implementations land in the next commit.
+func (d *Driver) ListJobs(context.Context, driver.ListJobsParams) ([]*driver.JobRow, error) {
+	panic("pgdriver: ListJobs not implemented")
+}
+
+func (d *Driver) GetJob(context.Context, int64) (*driver.JobRow, error) {
+	panic("pgdriver: GetJob not implemented")
+}
+
+func (d *Driver) OperatorCancel(context.Context, int64) (*driver.JobRow, error) {
+	panic("pgdriver: OperatorCancel not implemented")
+}
+
+func (d *Driver) RedriveDead(context.Context, int64) (*driver.JobRow, error) {
+	panic("pgdriver: RedriveDead not implemented")
+}
+
 // explain turns the row count of a guarded transition UPDATE into an
 // error: zero rows means the lease did not match, and finalizeFailure
 // says why.
