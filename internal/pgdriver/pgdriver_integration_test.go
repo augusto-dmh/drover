@@ -1244,6 +1244,12 @@ func TestListJobsFiltersOrdersAndLimits(t *testing.T) {
 	if len(limited) != 1 || limited[0].ID != all[0].ID {
 		t.Fatalf("ListJobs limit 1 = %+v, want newest id %d", limited, all[0].ID)
 	}
+
+	for _, limit := range []int{0, -1} {
+		if _, err := d.ListJobs(ctx, driver.ListJobsParams{Limit: limit}); err == nil {
+			t.Fatalf("ListJobs limit %d succeeded", limit)
+		}
+	}
 }
 
 func TestGetJobReturnsRowOrNotFound(t *testing.T) {

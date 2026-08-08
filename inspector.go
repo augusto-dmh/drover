@@ -12,7 +12,10 @@ import (
 	"github.com/augusto-dmh/drover/internal/pgdriver"
 )
 
-const defaultListLimit = 100
+const (
+	defaultListLimit = 100
+	maxListLimit     = 1000
+)
 
 // Inspector is the operator API over a drover queue store. It reads and
 // mutates jobs without running workers: construct one with NewInspector
@@ -56,7 +59,7 @@ type QueueStats struct {
 
 // ListJobsOpts filters and bounds a ListJobs read. Empty Queue or State
 // means no filter on that dimension. A Limit of zero or less defaults
-// to 100.
+// to 100. Limits above 1000 are refused.
 type ListJobsOpts struct {
 	Queue string
 	State JobState
@@ -84,7 +87,7 @@ func (in *Inspector) Stats(ctx context.Context) (*QueueStats, error) {
 }
 
 // ListJobs returns jobs matching the optional filters, newest id first,
-// capped by Limit (default 100).
+// capped by Limit (default 100, maximum 1000).
 func (in *Inspector) ListJobs(ctx context.Context, opts *ListJobsOpts) ([]*JobRow, error) {
 	limit := defaultListLimit
 	var queue string
@@ -95,6 +98,9 @@ func (in *Inspector) ListJobs(ctx context.Context, opts *ListJobsOpts) ([]*JobRo
 		if opts.Limit > 0 {
 			limit = opts.Limit
 		}
+	}
+	if limit > maxListLimit {
+		return nil, fmt.Errorf("drover: list limit %d exceeds maximum %d", limit, maxListLimit)
 	}
 	rows, err := in.drv.ListJobs(ctx, driver.ListJobsParams{
 		Queue: queue,

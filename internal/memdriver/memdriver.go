@@ -220,8 +220,12 @@ func (d *Driver) Stats(context.Context) (*driver.Stats, error) {
 }
 
 // ListJobs returns jobs matching optional queue and state filters,
-// newest id first, capped at p.Limit.
+// newest id first, capped at p.Limit. A non-positive Limit is refused.
 func (d *Driver) ListJobs(_ context.Context, p driver.ListJobsParams) ([]*driver.JobRow, error) {
+	if p.Limit <= 0 {
+		return nil, fmt.Errorf("list limit must be positive, got %d", p.Limit)
+	}
+
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
@@ -238,7 +242,7 @@ func (d *Driver) ListJobs(_ context.Context, p driver.ListJobsParams) ([]*driver
 	slices.SortFunc(matched, func(a, b *driver.JobRow) int {
 		return cmp.Compare(b.ID, a.ID)
 	})
-	if p.Limit > 0 && p.Limit < len(matched) {
+	if p.Limit < len(matched) {
 		matched = matched[:p.Limit]
 	}
 	out := make([]*driver.JobRow, len(matched))
@@ -273,37 +277,57 @@ func cancellable(state string) bool {
 
 // OperatorCancel moves a waiting or dead job to cancelled. Running and
 // terminal completed/cancelled rows are refused so the write never races
-// a worker's attempt fence.
+// a worker's attempt fence. When a refusal re-read shows an allowed
+// state, the cancel is retried once (same TOCTOU hardening as pgdriver).
 func (d *Driver) OperatorCancel(_ context.Context, id int64) (*driver.JobRow, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	return d.operatorCancel(id, true)
+}
 
+func (d *Driver) operatorCancel(id int64, allowRetry bool) (*driver.JobRow, error) {
+	d.mu.Lock()
 	row, ok := d.jobs[id]
 	if !ok {
+		d.mu.Unlock()
 		return nil, fmt.Errorf("job %d: %w", id, driver.ErrNotFound)
 	}
 	if !cancellable(row.State) {
-		return nil, fmt.Errorf("job %d is %s: %w", id, row.State, driver.ErrInvalidTransition)
+		state := row.State
+		d.mu.Unlock()
+		return d.afterOperatorMiss(id, state, "cancellable", allowRetry, cancellable, func() (*driver.JobRow, error) {
+			return d.operatorCancel(id, false)
+		})
 	}
 	now := time.Now()
 	row.State = "cancelled"
 	row.FinalizedAt = &now
 	row.LeasedUntil = nil
-	return copyRow(row), nil
+	out := copyRow(row)
+	d.mu.Unlock()
+	return out, nil
 }
 
 // RedriveDead returns a dead job to available with attempt reset and
-// lease cleared, keeping the errors array for triage provenance.
+// lease cleared, keeping the errors array for triage provenance. When a
+// refusal re-read shows dead, the redrive is retried once.
 func (d *Driver) RedriveDead(_ context.Context, id int64) (*driver.JobRow, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	return d.redriveDead(id, true)
+}
 
+func (d *Driver) redriveDead(id int64, allowRetry bool) (*driver.JobRow, error) {
+	d.mu.Lock()
 	row, ok := d.jobs[id]
 	if !ok {
+		d.mu.Unlock()
 		return nil, fmt.Errorf("job %d: %w", id, driver.ErrNotFound)
 	}
 	if row.State != "dead" {
-		return nil, fmt.Errorf("job %d is %s, want dead: %w", id, row.State, driver.ErrInvalidTransition)
+		state := row.State
+		d.mu.Unlock()
+		return d.afterOperatorMiss(id, state, "dead", allowRetry, func(s string) bool {
+			return s == "dead"
+		}, func() (*driver.JobRow, error) {
+			return d.redriveDead(id, false)
+		})
 	}
 	now := time.Now()
 	row.State = "available"
@@ -311,7 +335,37 @@ func (d *Driver) RedriveDead(_ context.Context, id int64) (*driver.JobRow, error
 	row.LeasedUntil = nil
 	row.FinalizedAt = nil
 	row.ScheduledAt = now
-	return copyRow(row), nil
+	out := copyRow(row)
+	d.mu.Unlock()
+	return out, nil
+}
+
+// afterOperatorMiss re-reads after a refused operator mutate. When the
+// row is now eligible and allowRetry is set, retry runs once.
+func (d *Driver) afterOperatorMiss(
+	id int64,
+	observed string,
+	want string,
+	allowRetry bool,
+	eligible func(string) bool,
+	retry func() (*driver.JobRow, error),
+) (*driver.JobRow, error) {
+	if !allowRetry {
+		return nil, fmt.Errorf("job %d is %s, want %s: %w", id, observed, want, driver.ErrInvalidTransition)
+	}
+	d.mu.Lock()
+	row, ok := d.jobs[id]
+	if !ok {
+		d.mu.Unlock()
+		return nil, fmt.Errorf("job %d: %w", id, driver.ErrNotFound)
+	}
+	state := row.State
+	can := eligible(state)
+	d.mu.Unlock()
+	if can {
+		return retry()
+	}
+	return nil, fmt.Errorf("job %d is %s, want %s: %w", id, state, want, driver.ErrInvalidTransition)
 }
 
 // selectRows returns the stored rows matching keep, ordered by order and

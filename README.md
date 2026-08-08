@@ -135,7 +135,7 @@ drover [--database URL] [--json] <command>
 | Command | What it does |
 | --- | --- |
 | `stats` | Per-queue depth and oldest-claimable age |
-| `jobs list` | List jobs; optional `--queue`, `--state`, `--limit` (default 100) |
+| `jobs list` | List jobs; optional `--queue`, `--state`, `--limit` (default 100, maximum 1000) |
 | `retry <id>` | Redrive a `dead` job to `available` (attempt reset; prior errors kept) |
 | `cancel <id>` | Cancel a waiting or dead job (`running` / terminal states are refused) |
 | `enqueue` | Insert a job: `--kind` required; optional `--queue`, `--args` (JSON, default `{}`) |

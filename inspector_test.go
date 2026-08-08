@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -193,6 +194,28 @@ func TestInspectorListJobsFiltersOrderAndLimit(t *testing.T) {
 			if len(rows) != 100 {
 				t.Fatalf("ListJobs(%v) returned %d rows, want default cap 100", opts, len(rows))
 			}
+		}
+	})
+
+	t.Run("limit above maximum refused", func(t *testing.T) {
+		t.Parallel()
+		_, err := in.ListJobs(ctx, &ListJobsOpts{Limit: maxListLimit + 1})
+		if err == nil {
+			t.Fatal("ListJobs accepted limit above maximum")
+		}
+		if !strings.Contains(err.Error(), "exceeds maximum") {
+			t.Fatalf("error = %v, want exceeds maximum", err)
+		}
+	})
+
+	t.Run("limit at maximum accepted", func(t *testing.T) {
+		t.Parallel()
+		rows, err := in.ListJobs(ctx, &ListJobsOpts{Limit: maxListLimit})
+		if err != nil {
+			t.Fatalf("ListJobs: %v", err)
+		}
+		if len(rows) == 0 {
+			t.Fatal("expected at least one row")
 		}
 	})
 }

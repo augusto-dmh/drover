@@ -13,12 +13,16 @@ func runJobsList(ctx context.Context, in inspector, args []string, jsonOut bool,
 	fs.SetOutput(stderr)
 	queue := fs.String("queue", "", "filter by queue name")
 	state := fs.String("state", "", "filter by job state")
-	limit := fs.Int("limit", 0, "max jobs to return (default 100)")
+	limit := fs.Int("limit", 0, "max jobs to return (default 100, maximum 1000)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	if fs.NArg() != 0 {
 		cliPrintf(stderr, "drover: unexpected arguments %v\n", fs.Args())
+		return 2
+	}
+	if *limit > 1000 {
+		cliPrintf(stderr, "drover: --limit %d exceeds maximum 1000\n", *limit)
 		return 2
 	}
 

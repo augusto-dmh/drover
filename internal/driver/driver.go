@@ -131,8 +131,8 @@ type Stats struct {
 }
 
 // ListJobsParams filters and bounds a ListJobs read. Empty Queue or State
-// means no filter on that dimension. Limit is guaranteed by the caller
-// to be greater than zero.
+// means no filter on that dimension. Limit must be greater than zero;
+// adapters refuse non-positive values.
 type ListJobsParams struct {
 	Queue string
 	State string

@@ -1255,6 +1255,18 @@ func TestListJobsFiltersOrdersAndLimits(t *testing.T) {
 			t.Errorf("limited row id = %d, want newest %d", rows[0].ID, all[0].ID)
 		}
 	})
+
+	t.Run("non-positive limit refused", func(t *testing.T) {
+		t.Parallel()
+		d := New()
+		mustInsert(t, d, "a", "default")
+		for _, limit := range []int{0, -1} {
+			_, err := d.ListJobs(ctx, driver.ListJobsParams{Limit: limit})
+			if err == nil {
+				t.Fatalf("ListJobs limit %d succeeded", limit)
+			}
+		}
+	})
 }
 
 func TestGetJobReturnsRowOrNotFound(t *testing.T) {

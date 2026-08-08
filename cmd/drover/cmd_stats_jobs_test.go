@@ -184,6 +184,22 @@ func TestRunJobsListLimitNonPositivePassedThrough(t *testing.T) {
 	}
 }
 
+func TestRunJobsListLimitAboveCapExit2(t *testing.T) {
+	t.Parallel()
+	fake := &fakeInspector{}
+	var stdout, stderr bytes.Buffer
+	code := runJobsList(context.Background(), fake, []string{"--limit", "1001"}, false, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("exit %d want 2 stderr=%q", code, stderr.String())
+	}
+	if fake.listOpts != nil {
+		t.Fatal("must not call ListJobs when limit exceeds cap")
+	}
+	if !strings.Contains(stderr.String(), "exceeds maximum 1000") {
+		t.Fatalf("stderr=%q", stderr.String())
+	}
+}
+
 func TestRunJobsListErrorExit1(t *testing.T) {
 	t.Parallel()
 	fake := &fakeInspector{listErr: errors.New("list failed")}
