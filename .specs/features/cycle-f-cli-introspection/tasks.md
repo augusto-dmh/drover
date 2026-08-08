@@ -174,7 +174,7 @@ and filters (prefer injecting Inspector over live Postgres in unit tests).
 **Gate**: quick (incl. cmd package)
 **Commit**: `feat(cli): add stats and jobs list commands`
 
-### T10: `retry`, `cancel`, `enqueue` commands
+### T10: `retry`, `cancel`, `enqueue` commands ✅
 
 **What**: Wire remaining verbs; validation and exit codes.
 **Done when**: unit tests cover success, not-found, invalid transition, bad JSON, empty kind.
@@ -227,8 +227,8 @@ at this feature.
 | CLI-06 | T5 | Done |
 | CLI-07 | T9 | Done |
 | CLI-08 | T9 | Done |
-| CLI-09 | T10 | Pending |
-| CLI-10 | T10 | Pending |
+| CLI-09 | T10 | Done |
+| CLI-10 | T10 | Done |
 | CLI-11 | T8, T12 | Pending (version done; GoReleaser in T12) |
 
 **Coverage:** 11 total, 11 mapped, 0 unmapped.

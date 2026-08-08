@@ -60,6 +60,18 @@ func run(args []string, stdout, stderr io.Writer, getenv func(string) string, op
 		return withInspector(ctx, cfg, getenv, open, stderr, func(in inspector) int {
 			return runJobsList(ctx, in, rest[2:], cfg.json, stdout, stderr)
 		})
+	case rest[0] == "retry":
+		return withInspector(ctx, cfg, getenv, open, stderr, func(in inspector) int {
+			return runRetry(ctx, in, rest[1:], cfg.json, stdout, stderr)
+		})
+	case rest[0] == "cancel":
+		return withInspector(ctx, cfg, getenv, open, stderr, func(in inspector) int {
+			return runCancel(ctx, in, rest[1:], cfg.json, stdout, stderr)
+		})
+	case rest[0] == "enqueue":
+		return withInspector(ctx, cfg, getenv, open, stderr, func(in inspector) int {
+			return runEnqueue(ctx, in, rest[1:], cfg.json, stdout, stderr)
+		})
 	default:
 		fmt.Fprintf(stderr, "drover: unknown command %q\n\n", rest[0])
 		printUsage(stderr)
