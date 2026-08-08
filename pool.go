@@ -245,6 +245,7 @@ func (r *runner) drain(ctx context.Context) error {
 		defer cancel()
 		if shutErr := r.ops.shutdown(opsCtx); shutErr != nil {
 			c.logger.Error("drover: shut down ops server", "error", shutErr)
+			err = errors.Join(err, shutErr)
 		}
 	}
 
