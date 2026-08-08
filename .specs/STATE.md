@@ -78,12 +78,12 @@ Durable, cross-cycle. Architecture-level decisions live in `docs/adr/`; entries 
 | C — Concurrency | `cycle-c-concurrency` | #6 | 2026-08-02 |
 | D — Middleware + scheduling | `cycle-d-middleware-scheduling` | #8 | 2026-08-02 |
 | E — Observability | `cycle-e-observability` | #9 | 2026-08-08 |
+| F — CLI + introspection | `cycle-f-cli-introspection` | #11 | 2026-08-08 |
 
 ## Handoff
 
-- **In flight**: Cycle F — CLI + introspection (`cycle-f-cli-introspection`) on `feat/cli-introspection`. Implementation complete (storage, Inspector, `cmd/drover`, GoReleaser, README). Ready for Verifier + PR.
-- **Last shipped**: the observability cycle (#9). Cycles A–E are merged; F is the next PR.
-- **What review should look at**: Inspector vs Client separation; operator writes must not reuse lease-fenced `Mark*`; redrive resets attempt but keeps errors; cancel refuses `running`; CLI is stdlib `flag`; unit suite covers Inspector via memdriver; GoReleaser is archives + checksums only (AD-057).
+- **Last shipped**: Cycle F (#11) — exported `Inspector`, `cmd/drover` (`stats`, `jobs list`, `retry`, `cancel`, `enqueue`), GoReleaser, and ship/finalize commit gates that require scoped subjects and reject AI attribution trailers. `main` is green.
+- **What review should look at (for later cycles)**: operator writes stay state-conditioned (not lease-fenced); redrive resets attempt and keeps errors; cancel refuses `running`; ListJobs OR filters still skip partial indexes (deferred from #11 triage); terminal rows still accumulate with no retention story.
 - **Known weak sensors** (carried forward): neither database-clock property — lease deadlines, nor a delayed job's dueness — can be falsified while the test container and the client share a host clock.
-- **Follow-up work carried forward** (recorded, not scheduled): terminal-state retention/pruning; batch shutdown hand-back (Cycle G); `testing/synctest` where viable; constructor panic-vs-error consistency before 1.0; deferred observability niceties from cycle E handoff.
-- **Next after F**: Cycle G — benchmarks + fetch hardening; then H (periodic jobs), I (optional status page).
+- **Follow-up work carried forward** (recorded, not scheduled): terminal-state retention/pruning; batch shutdown hand-back (Cycle G); list-query index-friendly variants; `testing/synctest` where viable; constructor panic-vs-error consistency before 1.0; deferred observability niceties from cycle E handoff.
+- **Next**: Cycle G — Benchmark + hardening: `cmd/drover-bench`, batch insert (`COPY FROM`), fetch tuning (batch claim, poll interval, optional `LISTEN/NOTIFY`), README benchmark table with published methodology. Then H (periodic jobs), I (optional status page).
