@@ -3,7 +3,7 @@
   "promote_threshold": 2,
   "window_days": 45,
   "quarantine_threshold": 2,
-  "next_id": 8,
+  "next_id": 11,
   "lessons": [
     {
       "id": "L-001",
@@ -130,6 +130,60 @@
       ],
       "created": "2026-07-26T14:03:33Z",
       "last_seen": "2026-07-26T14:03:33Z"
+    },
+    {
+      "id": "L-008",
+      "key": "ac_gap::assert scrape or gather before the first successful gauge refresh still publishes configured queue series at zero rather than omitting them",
+      "text": "Assert scrape-or-Gather before the first successful gauge refresh still publishes configured queue series at zero rather than omitting them",
+      "signal": "ac_gap",
+      "scope": "metrics",
+      "status": "candidate",
+      "features": [
+        "cycle-e-observability"
+      ],
+      "recurrence": 1,
+      "harmful": 0,
+      "evidence": [
+        "EDGE-01 (metrics)"
+      ],
+      "created": "2026-08-07T03:56:07Z",
+      "last_seen": "2026-08-07T03:56:07Z"
+    },
+    {
+      "id": "L-009",
+      "key": "ac_gap::keep a compile or example test for every readme config snippet that names shipped api fields",
+      "text": "Keep a compile-or-Example test for every README config snippet that names shipped API fields",
+      "signal": "ac_gap",
+      "scope": "docs",
+      "status": "candidate",
+      "features": [
+        "cycle-e-observability"
+      ],
+      "recurrence": 1,
+      "harmful": 0,
+      "evidence": [
+        "OBS-13.3 (docs)"
+      ],
+      "created": "2026-08-07T03:56:07Z",
+      "last_seen": "2026-08-07T03:56:07Z"
+    },
+    {
+      "id": "L-010",
+      "key": "spec_deviation::when a constructor gains a parameter beyond the design signature leave a spec deviation with the reason at the definition site",
+      "text": "When a constructor gains a parameter beyond the design signature, leave a SPEC_DEVIATION with the reason at the definition site",
+      "signal": "spec_deviation",
+      "scope": "metrics",
+      "status": "candidate",
+      "features": [
+        "cycle-e-observability"
+      ],
+      "recurrence": 1,
+      "harmful": 0,
+      "evidence": [
+        "metrics.go:38 SPEC_DEVIATION (metrics)"
+      ],
+      "created": "2026-08-07T03:56:07Z",
+      "last_seen": "2026-08-07T03:56:07Z"
     }
   ]
 }
