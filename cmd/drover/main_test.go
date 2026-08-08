@@ -9,7 +9,7 @@ import (
 func TestVersionCommand(t *testing.T) {
 	t.Parallel()
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"version"}, &stdout, &stderr, nil)
+	code := run([]string{"version"}, &stdout, &stderr, nil, nil)
 	if code != 0 {
 		t.Fatalf("exit %d, stderr=%q", code, stderr.String())
 	}
@@ -25,7 +25,7 @@ func TestVersionCommand(t *testing.T) {
 func TestVersionFlag(t *testing.T) {
 	t.Parallel()
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"--version"}, &stdout, &stderr, nil)
+	code := run([]string{"--version"}, &stdout, &stderr, nil, nil)
 	if code != 0 {
 		t.Fatalf("exit %d, stderr=%q", code, stderr.String())
 	}
@@ -38,7 +38,7 @@ func TestVersionFlag(t *testing.T) {
 func TestUnknownCommandExit2(t *testing.T) {
 	t.Parallel()
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"nope"}, &stdout, &stderr, nil)
+	code := run([]string{"nope"}, &stdout, &stderr, nil, nil)
 	if code != 2 {
 		t.Fatalf("exit %d, want 2; stderr=%q", code, stderr.String())
 	}
@@ -53,7 +53,7 @@ func TestUnknownCommandExit2(t *testing.T) {
 func TestNoCommandExit2(t *testing.T) {
 	t.Parallel()
 	var stdout, stderr bytes.Buffer
-	code := run(nil, &stdout, &stderr, nil)
+	code := run(nil, &stdout, &stderr, nil, nil)
 	if code != 2 {
 		t.Fatalf("exit %d, want 2", code)
 	}

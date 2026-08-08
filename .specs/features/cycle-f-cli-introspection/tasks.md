@@ -165,7 +165,7 @@ states, refusals, error wrapping with `errors.Is`.
 **Gate**: `go test -race ./cmd/drover/...` + build
 **Commit**: `feat(cli): add drover binary skeleton with version and output helpers`
 
-### T9: `stats` and `jobs list` commands
+### T9: `stats` and `jobs list` commands ✅
 
 **What**: Wire `Inspector.Stats` / `ListJobs` to CLI; human + JSON output.
 **Done when**: command-level tests with a fake or mem-backed Inspector cover AC printing
@@ -225,8 +225,8 @@ at this feature.
 | CLI-04 | T1–T3, T6 | Done |
 | CLI-05 | T1–T3, T6 | Done |
 | CLI-06 | T5 | Done |
-| CLI-07 | T9 | Pending |
-| CLI-08 | T9 | Pending |
+| CLI-07 | T9 | Done |
+| CLI-08 | T9 | Done |
 | CLI-09 | T10 | Pending |
 | CLI-10 | T10 | Pending |
 | CLI-11 | T8, T12 | Pending (version done; GoReleaser in T12) |
