@@ -611,6 +611,61 @@ func TestOpsAddrRebindableAfterStop(t *testing.T) {
 	_ = ln.Close()
 }
 
+// /readyz must report 503 with "stale" once gauge freshness lapses —
+// not only on the draining path. Failed refreshes leave lastSuccess
+// put, so waiting past twice StatsInterval is enough.
+func TestReadyz503WhenQueueStatsAreStale(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	drv := &scriptedStatsDriver{Driver: memdriver.New()}
+	interval := 20 * time.Millisecond
+	c := newClient(drv, Config{
+		Workers:       NewWorkers(),
+		Logger:        newTestLogger(&syncWriter{}),
+		PollInterval:  time.Hour,
+		StatsInterval: interval,
+		Concurrency:   1,
+		OpsAddr:       "127.0.0.1:0",
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	base := opsBaseURL(t, c)
+
+	waitFor(t, func() bool {
+		resp, err := http.Get(base + "/readyz")
+		if err != nil {
+			return false
+		}
+		_ = resp.Body.Close()
+		return resp.StatusCode == http.StatusOK
+	}, "readyz to become ready after first refresh")
+
+	drv.set(nil, errors.New("database unreachable"))
+
+	waitFor(t, func() bool {
+		resp, err := http.Get(base + "/readyz")
+		if err != nil {
+			return false
+		}
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			return false
+		}
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return false
+		}
+		return strings.Contains(string(body), "stale")
+	}, "readyz to report stale after freshness lapses")
+
+	if err := c.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
 // /readyz must flip to 503 the instant Stop begins, not one staleness
 // bound after the refresher is cancelled.
 func TestReadyz503FromInstantStop(t *testing.T) {
