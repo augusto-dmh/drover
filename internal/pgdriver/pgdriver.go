@@ -226,6 +226,125 @@ func (d *Driver) Stats(ctx context.Context) (*driver.Stats, error) {
 	return stats, nil
 }
 
+// ListJobs returns jobs matching optional queue and state filters,
+// newest id first, capped at p.Limit. A non-positive Limit is refused.
+func (d *Driver) ListJobs(ctx context.Context, p driver.ListJobsParams) ([]*driver.JobRow, error) {
+	if p.Limit <= 0 {
+		return nil, fmt.Errorf("list limit must be positive, got %d", p.Limit)
+	}
+	if p.Limit > math.MaxInt32 {
+		return nil, fmt.Errorf("list limit %d out of range", p.Limit)
+	}
+	jobs, err := d.queries.ListJobs(ctx, dbsqlc.ListJobsParams{
+		Queue:   p.Queue,
+		State:   p.State,
+		MaxJobs: int32(p.Limit),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list jobs: %w", err)
+	}
+	rows := make([]*driver.JobRow, len(jobs))
+	for i, job := range jobs {
+		rows[i] = rowFromDB(job)
+	}
+	return rows, nil
+}
+
+// GetJob returns the current row for id, or ErrNotFound.
+func (d *Driver) GetJob(ctx context.Context, id int64) (*driver.JobRow, error) {
+	job, err := d.queries.GetJob(ctx, id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("job %d: %w", id, driver.ErrNotFound)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get job %d: %w", id, err)
+	}
+	return rowFromDB(job), nil
+}
+
+// OperatorCancel moves a waiting or dead job to cancelled. A zero-row
+// update is re-read so missing ids and wrong states stay distinguishable.
+// When the re-read shows an allowed state (TOCTOU with a concurrent
+// transition into eligibility), the UPDATE is retried once.
+func (d *Driver) OperatorCancel(ctx context.Context, id int64) (*driver.JobRow, error) {
+	return d.operatorCancel(ctx, id, true)
+}
+
+func (d *Driver) operatorCancel(ctx context.Context, id int64, allowRetry bool) (*driver.JobRow, error) {
+	job, err := d.queries.OperatorCancel(ctx, id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return d.afterOperatorMiss(ctx, id, "cancellable", allowRetry, func() (*driver.JobRow, error) {
+			return d.operatorCancel(ctx, id, false)
+		})
+	}
+	if err != nil {
+		return nil, fmt.Errorf("cancel job %d: %w", id, err)
+	}
+	return rowFromDB(job), nil
+}
+
+// RedriveDead returns a dead job to available with attempt reset. A
+// zero-row update is re-read so missing ids and wrong states stay
+// distinguishable. When the re-read shows dead (TOCTOU into eligibility),
+// the UPDATE is retried once.
+func (d *Driver) RedriveDead(ctx context.Context, id int64) (*driver.JobRow, error) {
+	return d.redriveDead(ctx, id, true)
+}
+
+func (d *Driver) redriveDead(ctx context.Context, id int64, allowRetry bool) (*driver.JobRow, error) {
+	job, err := d.queries.RedriveDead(ctx, id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return d.afterOperatorMiss(ctx, id, "dead", allowRetry, func() (*driver.JobRow, error) {
+			return d.redriveDead(ctx, id, false)
+		})
+	}
+	if err != nil {
+		return nil, fmt.Errorf("redrive job %d: %w", id, err)
+	}
+	return rowFromDB(job), nil
+}
+
+// operatorEligible reports whether the current state matches what an
+// operator UPDATE for want would accept.
+func operatorEligible(state dbsqlc.DroverJobState, want string) bool {
+	switch want {
+	case "cancellable":
+		switch state {
+		case dbsqlc.DroverJobStateAvailable,
+			dbsqlc.DroverJobStateScheduled,
+			dbsqlc.DroverJobStateRetryable,
+			dbsqlc.DroverJobStateDead:
+			return true
+		}
+	case "dead":
+		return state == dbsqlc.DroverJobStateDead
+	}
+	return false
+}
+
+// afterOperatorMiss explains a zero-row operator UPDATE. When the
+// re-read shows an allowed state and allowRetry is set, retry runs once
+// instead of returning ErrInvalidTransition.
+func (d *Driver) afterOperatorMiss(
+	ctx context.Context,
+	id int64,
+	want string,
+	allowRetry bool,
+	retry func() (*driver.JobRow, error),
+) (*driver.JobRow, error) {
+	job, err := d.queries.GetJob(ctx, id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("job %d: %w", id, driver.ErrNotFound)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("inspect job %d: %w", id, err)
+	}
+	if allowRetry && operatorEligible(job.State, want) {
+		return retry()
+	}
+	return nil, fmt.Errorf("job %d is %s, want %s: %w", id, job.State, want, driver.ErrInvalidTransition)
+}
+
 // explain turns the row count of a guarded transition UPDATE into an
 // error: zero rows means the lease did not match, and finalizeFailure
 // says why.

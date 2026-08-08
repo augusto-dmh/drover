@@ -74,6 +74,18 @@ Seen once or not yet corroborated. Tracked, not trusted.
 - evidence: metrics.go:38 SPEC_DEVIATION (metrics)
 - last seen: 2026-08-07T03:56:07Z
 
+### L-011 — When wrapping Driver.Stats, assert oldest-claimable ages in the Inspector suite, not only published-state depth counts
+- signal: `ac_gap` · recurrence: 1 feature(s) · scope: `inspector` · harmful: 0
+- features: cycle-f-cli-introspection
+- evidence: Inspector Stats AC #2 / CLI-02; inspector_test.go:28-84 (inspector)
+- last seen: 2026-08-08T18:03:26Z
+
+### L-012 — Discrimination on Stats adapters must mutate age mapping away; depth-only assertions leave age regressions green
+- signal: `surviving_mutant` · recurrence: 1 feature(s) · scope: `inspector` · harmful: 0
+- features: cycle-f-cli-introspection
+- evidence: sensor M8 inspector.go Stats Oldest mapping dropped (inspector)
+- last seen: 2026-08-08T18:03:27Z
+
 ## Quarantined (failed when applied — ignore)
 
 A confirmed lesson that recurred alongside failure. Kept for the maintainer to review.

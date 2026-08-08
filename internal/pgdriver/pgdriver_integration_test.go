@@ -1170,3 +1170,330 @@ func TestStatsOnAnEmptyDatabaseReportsNothing(t *testing.T) {
 		t.Errorf("Stats = %+v, want no depths and no ages", stats)
 	}
 }
+
+func TestListJobsFiltersOrdersAndLimits(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	d, _ := newDriver(t)
+
+	mustInsert(t, d, "a", "alpha")
+	mustInsert(t, d, "b", "beta")
+	deadSeed := mustInsert(t, d, "c", "alpha")
+	mustInsert(t, d, "d", "beta")
+
+	claimed, err := d.FetchAvailable(ctx, "alpha", time.Minute, 10)
+	if err != nil {
+		t.Fatalf("FetchAvailable: %v", err)
+	}
+	var deadID int64
+	for _, row := range claimed {
+		if row.ID == deadSeed.ID {
+			if err := d.MarkDead(ctx, driver.Lease{ID: row.ID, Attempt: row.Attempt}, []byte(`{"error":"x"}`)); err != nil {
+				t.Fatalf("MarkDead: %v", err)
+			}
+			deadID = row.ID
+			continue
+		}
+		if err := d.MarkCompleted(ctx, driver.Lease{ID: row.ID, Attempt: row.Attempt}); err != nil {
+			t.Fatalf("MarkCompleted: %v", err)
+		}
+	}
+	if deadID == 0 {
+		t.Fatal("expected dead seed to be claimed")
+	}
+	mustInsert(t, d, "e", "alpha")
+
+	all, err := d.ListJobs(ctx, driver.ListJobsParams{Limit: 100})
+	if err != nil {
+		t.Fatalf("ListJobs: %v", err)
+	}
+	if len(all) < 2 {
+		t.Fatalf("ListJobs returned %d rows, want at least 2", len(all))
+	}
+	for i := 1; i < len(all); i++ {
+		if all[i-1].ID < all[i].ID {
+			t.Fatalf("ids not descending: %d then %d", all[i-1].ID, all[i].ID)
+		}
+	}
+
+	beta, err := d.ListJobs(ctx, driver.ListJobsParams{Queue: "beta", Limit: 100})
+	if err != nil {
+		t.Fatalf("ListJobs queue: %v", err)
+	}
+	if len(beta) == 0 {
+		t.Fatal("expected at least one beta job")
+	}
+	for _, row := range beta {
+		if row.Queue != "beta" {
+			t.Errorf("queue = %q, want beta", row.Queue)
+		}
+	}
+
+	dead, err := d.ListJobs(ctx, driver.ListJobsParams{State: "dead", Limit: 100})
+	if err != nil {
+		t.Fatalf("ListJobs state: %v", err)
+	}
+	if len(dead) != 1 || dead[0].ID != deadID || dead[0].State != "dead" {
+		t.Fatalf("ListJobs dead = %+v, want only id %d", dead, deadID)
+	}
+
+	limited, err := d.ListJobs(ctx, driver.ListJobsParams{Limit: 1})
+	if err != nil {
+		t.Fatalf("ListJobs limit: %v", err)
+	}
+	if len(limited) != 1 || limited[0].ID != all[0].ID {
+		t.Fatalf("ListJobs limit 1 = %+v, want newest id %d", limited, all[0].ID)
+	}
+
+	for _, limit := range []int{0, -1} {
+		if _, err := d.ListJobs(ctx, driver.ListJobsParams{Limit: limit}); err == nil {
+			t.Fatalf("ListJobs limit %d succeeded", limit)
+		}
+	}
+}
+
+func TestGetJobReturnsRowOrNotFound(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	d, _ := newDriver(t)
+	inserted := mustInsert(t, d, "k", "default")
+
+	got, err := d.GetJob(ctx, inserted.ID)
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if got.ID != inserted.ID || got.Kind != "k" || got.State != "available" {
+		t.Errorf("GetJob = %+v, want inserted available job", got)
+	}
+
+	_, err = d.GetJob(ctx, 99999)
+	if !errors.Is(err, driver.ErrNotFound) {
+		t.Errorf("GetJob unknown: %v, want ErrNotFound", err)
+	}
+}
+
+func TestOperatorCancelAllowedAndRefusedStates(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	tests := []struct {
+		name      string
+		setup     func(t *testing.T, d *pgdriver.Driver, pool *pgxpool.Pool) int64
+		wantState string
+		wantErr   error
+	}{
+		{
+			name: "available",
+			setup: func(t *testing.T, d *pgdriver.Driver, _ *pgxpool.Pool) int64 {
+				return mustInsert(t, d, "k", "default").ID
+			},
+			wantState: "cancelled",
+		},
+		{
+			name: "scheduled",
+			setup: func(t *testing.T, d *pgdriver.Driver, pool *pgxpool.Pool) int64 {
+				return park(t, d, pool, "scheduled", time.Now().Add(time.Hour))
+			},
+			wantState: "cancelled",
+		},
+		{
+			name: "retryable",
+			setup: func(t *testing.T, d *pgdriver.Driver, pool *pgxpool.Pool) int64 {
+				return park(t, d, pool, "retryable", time.Now().Add(time.Hour))
+			},
+			wantState: "cancelled",
+		},
+		{
+			name: "dead",
+			setup: func(t *testing.T, d *pgdriver.Driver, _ *pgxpool.Pool) int64 {
+				mustInsert(t, d, "k", "default")
+				row := claimOne(t, d)
+				if err := d.MarkDead(ctx, held(row.ID), []byte(`{"error":"boom"}`)); err != nil {
+					t.Fatal(err)
+				}
+				return row.ID
+			},
+			wantState: "cancelled",
+		},
+		{
+			name: "running refused",
+			setup: func(t *testing.T, d *pgdriver.Driver, _ *pgxpool.Pool) int64 {
+				mustInsert(t, d, "k", "default")
+				return claimOne(t, d).ID
+			},
+			wantErr: driver.ErrInvalidTransition,
+		},
+		{
+			name: "completed refused",
+			setup: func(t *testing.T, d *pgdriver.Driver, _ *pgxpool.Pool) int64 {
+				mustInsert(t, d, "k", "default")
+				row := claimOne(t, d)
+				if err := d.MarkCompleted(ctx, held(row.ID)); err != nil {
+					t.Fatal(err)
+				}
+				return row.ID
+			},
+			wantErr: driver.ErrInvalidTransition,
+		},
+		{
+			name: "cancelled refused",
+			setup: func(t *testing.T, d *pgdriver.Driver, _ *pgxpool.Pool) int64 {
+				id := mustInsert(t, d, "k", "default").ID
+				if _, err := d.OperatorCancel(ctx, id); err != nil {
+					t.Fatal(err)
+				}
+				return id
+			},
+			wantErr: driver.ErrInvalidTransition,
+		},
+		{
+			name:    "unknown id",
+			setup:   func(*testing.T, *pgdriver.Driver, *pgxpool.Pool) int64 { return 99999 },
+			wantErr: driver.ErrNotFound,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			d, pool := newDriver(t)
+			id := tt.setup(t, d, pool)
+			var before storedJob
+			if tt.wantErr != nil && id != 99999 {
+				before = readJob(t, pool, id)
+			}
+
+			got, err := d.OperatorCancel(ctx, id)
+			if tt.wantErr != nil {
+				if !errors.Is(err, tt.wantErr) {
+					t.Fatalf("OperatorCancel: %v, want %v", err, tt.wantErr)
+				}
+				if id != 99999 {
+					after := readJob(t, pool, id)
+					if after.State != before.State {
+						t.Errorf("state changed to %s on refusal, was %s", after.State, before.State)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("OperatorCancel: %v", err)
+			}
+			if got.State != tt.wantState || got.FinalizedAt == nil {
+				t.Errorf("OperatorCancel = state=%s finalized=%v, want %s with finalized_at",
+					got.State, got.FinalizedAt, tt.wantState)
+			}
+			stored := readJob(t, pool, id)
+			if stored.State != "cancelled" || stored.FinalizedAt == nil {
+				t.Errorf("stored = %+v, want cancelled with finalized_at", stored)
+			}
+		})
+	}
+}
+
+func TestRedriveDeadFromDeadOnly(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	t.Run("dead redriven", func(t *testing.T) {
+		t.Parallel()
+		d, pool := newDriver(t)
+		mustInsert(t, d, "k", "default")
+		row := claimOne(t, d)
+		detail := []byte(`{"attempt":1,"error":"boom"}`)
+		if err := d.MarkDead(ctx, held(row.ID), detail); err != nil {
+			t.Fatalf("MarkDead: %v", err)
+		}
+		before := readJob(t, pool, row.ID)
+
+		got, err := d.RedriveDead(ctx, row.ID)
+		if err != nil {
+			t.Fatalf("RedriveDead: %v", err)
+		}
+		if got.State != "available" || got.Attempt != 0 || got.LeasedUntil != nil || got.FinalizedAt != nil {
+			t.Errorf("RedriveDead = %+v, want available attempt=0 cleared lease/finalized", got)
+		}
+		if !slices.Equal(got.Errors, before.Errors) {
+			t.Errorf("errors = %s, want retained %s", got.Errors, before.Errors)
+		}
+		stored := readJob(t, pool, row.ID)
+		if stored.State != "available" || stored.Attempt != 0 || stored.LeasedUntil != nil || stored.FinalizedAt != nil {
+			t.Errorf("stored = %+v, want available attempt=0 cleared lease/finalized", stored)
+		}
+		if !slices.Equal(stored.Errors, before.Errors) {
+			t.Errorf("stored errors = %s, want retained %s", stored.Errors, before.Errors)
+		}
+		// scheduled_at must be the database clock's now — at or after the
+		// prior finalization, and not far in the future.
+		if stored.ScheduledAt.Before(*before.FinalizedAt) {
+			t.Errorf("scheduled_at %v before prior finalized_at %v", stored.ScheduledAt, before.FinalizedAt)
+		}
+	})
+
+	t.Run("non-dead refused", func(t *testing.T) {
+		t.Parallel()
+		tests := []struct {
+			name  string
+			setup func(t *testing.T, d *pgdriver.Driver) int64
+		}{
+			{"available", func(t *testing.T, d *pgdriver.Driver) int64 {
+				return mustInsert(t, d, "k", "default").ID
+			}},
+			{"running", func(t *testing.T, d *pgdriver.Driver) int64 {
+				mustInsert(t, d, "k", "default")
+				return claimOne(t, d).ID
+			}},
+			{"completed", func(t *testing.T, d *pgdriver.Driver) int64 {
+				mustInsert(t, d, "k", "default")
+				id := claimOne(t, d).ID
+				if err := d.MarkCompleted(ctx, held(id)); err != nil {
+					t.Fatal(err)
+				}
+				return id
+			}},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				t.Parallel()
+				d, pool := newDriver(t)
+				id := tt.setup(t, d)
+				before := readJob(t, pool, id)
+				_, err := d.RedriveDead(ctx, id)
+				if !errors.Is(err, driver.ErrInvalidTransition) {
+					t.Fatalf("RedriveDead: %v, want ErrInvalidTransition", err)
+				}
+				after := readJob(t, pool, id)
+				if after.State != before.State || after.Attempt != before.Attempt {
+					t.Errorf("row mutated on refusal: before=%+v after=%+v", before, after)
+				}
+			})
+		}
+	})
+
+	t.Run("unknown id", func(t *testing.T) {
+		t.Parallel()
+		d, _ := newDriver(t)
+		_, err := d.RedriveDead(ctx, 99999)
+		if !errors.Is(err, driver.ErrNotFound) {
+			t.Errorf("RedriveDead: %v, want ErrNotFound", err)
+		}
+	})
+}
+
+func TestOperatorCancelRaceReportsInvalidTransition(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	d, pool := newDriver(t)
+	id := mustInsert(t, d, "k", "default").ID
+
+	if _, err := d.OperatorCancel(ctx, id); err != nil {
+		t.Fatalf("first cancel: %v", err)
+	}
+	_, err := d.OperatorCancel(ctx, id)
+	if !errors.Is(err, driver.ErrInvalidTransition) {
+		t.Fatalf("second cancel: %v, want ErrInvalidTransition", err)
+	}
+	if got := readJob(t, pool, id); got.State != "cancelled" {
+		t.Errorf("state = %s, want cancelled", got.State)
+	}
+}

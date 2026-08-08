@@ -85,6 +85,42 @@ WHERE j.id = held.id
 -- name: GetJob :one
 SELECT * FROM drover_jobs WHERE id = $1;
 
+-- Empty queue or state means no filter. Newest id first so a bounded
+-- listing is stable without a new index, and operators see recent work
+-- first. Limit is the caller's responsibility to keep positive.
+-- name: ListJobs :many
+SELECT * FROM drover_jobs
+WHERE (sqlc.arg(queue) = '' OR queue = sqlc.arg(queue))
+  AND (sqlc.arg(state)::text = '' OR state = sqlc.arg(state)::drover_job_state)
+ORDER BY id DESC
+LIMIT sqlc.arg(max_jobs);
+
+-- Operator cancel is state-conditioned, not lease-fenced: it must not
+-- invent a fake attempt or stomp a running worker. Zero rows means the
+-- caller must re-read to distinguish missing from wrong state.
+-- name: OperatorCancel :one
+UPDATE drover_jobs
+SET state = 'cancelled',
+    finalized_at = now(),
+    leased_until = NULL
+WHERE id = sqlc.arg(id)
+  AND state IN ('available', 'scheduled', 'retryable', 'dead')
+RETURNING *;
+
+-- Redrive resets attempt and the lease, keeps error history for triage,
+-- and uses the database clock for scheduled_at so the job is claimable
+-- immediately against the same clock the fetch predicate uses.
+-- name: RedriveDead :one
+UPDATE drover_jobs
+SET state = 'available',
+    attempt = 0,
+    leased_until = NULL,
+    finalized_at = NULL,
+    scheduled_at = now()
+WHERE id = sqlc.arg(id)
+  AND state = 'dead'
+RETURNING *;
+
 -- Every finalizer is guarded on the attempt as well as the state. The
 -- state alone proves some worker holds the row, not that this one does:
 -- a worker whose heartbeat starved past its lease can find its job

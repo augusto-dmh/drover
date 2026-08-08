@@ -1155,3 +1155,337 @@ func TestStatsOnAnEmptyStoreReportsNothing(t *testing.T) {
 		t.Errorf("Stats = %+v, want no depths and no ages", stats)
 	}
 }
+
+func TestListJobsFiltersOrdersAndLimits(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	seed := func(t *testing.T) (*Driver, int64) {
+		t.Helper()
+		d := New()
+		mustInsert(t, d, "a", "alpha")
+		mustInsert(t, d, "b", "beta")
+		deadSeed := mustInsert(t, d, "c", "alpha")
+		mustInsert(t, d, "d", "beta")
+		rows, err := d.FetchAvailable(ctx, "alpha", time.Minute, 10)
+		if err != nil {
+			t.Fatalf("FetchAvailable: %v", err)
+		}
+		var deadID int64
+		for _, row := range rows {
+			if row.ID == deadSeed.ID {
+				if err := d.MarkDead(ctx, driver.Lease{ID: row.ID, Attempt: row.Attempt}, []byte(`{"error":"x"}`)); err != nil {
+					t.Fatalf("MarkDead: %v", err)
+				}
+				deadID = row.ID
+				continue
+			}
+			if err := d.MarkCompleted(ctx, driver.Lease{ID: row.ID, Attempt: row.Attempt}); err != nil {
+				t.Fatalf("MarkCompleted: %v", err)
+			}
+		}
+		if deadID == 0 {
+			t.Fatal("expected dead seed to be claimed")
+		}
+		mustInsert(t, d, "e", "alpha")
+		return d, deadID
+	}
+
+	t.Run("all newest first", func(t *testing.T) {
+		t.Parallel()
+		d, _ := seed(t)
+		rows, err := d.ListJobs(ctx, driver.ListJobsParams{Limit: 100})
+		if err != nil {
+			t.Fatalf("ListJobs: %v", err)
+		}
+		if len(rows) < 2 {
+			t.Fatalf("ListJobs returned %d rows, want at least 2", len(rows))
+		}
+		for i := 1; i < len(rows); i++ {
+			if rows[i-1].ID < rows[i].ID {
+				t.Fatalf("ids not descending: %d then %d", rows[i-1].ID, rows[i].ID)
+			}
+		}
+	})
+
+	t.Run("queue filter", func(t *testing.T) {
+		t.Parallel()
+		d, _ := seed(t)
+		rows, err := d.ListJobs(ctx, driver.ListJobsParams{Queue: "beta", Limit: 100})
+		if err != nil {
+			t.Fatalf("ListJobs: %v", err)
+		}
+		if len(rows) == 0 {
+			t.Fatal("expected at least one beta job")
+		}
+		for _, row := range rows {
+			if row.Queue != "beta" {
+				t.Errorf("queue = %q, want beta", row.Queue)
+			}
+		}
+	})
+
+	t.Run("state filter", func(t *testing.T) {
+		t.Parallel()
+		d, deadID := seed(t)
+		rows, err := d.ListJobs(ctx, driver.ListJobsParams{State: "dead", Limit: 100})
+		if err != nil {
+			t.Fatalf("ListJobs: %v", err)
+		}
+		if len(rows) != 1 || rows[0].ID != deadID || rows[0].State != "dead" {
+			t.Fatalf("ListJobs dead = %+v, want only id %d", rows, deadID)
+		}
+	})
+
+	t.Run("limit", func(t *testing.T) {
+		t.Parallel()
+		d, _ := seed(t)
+		rows, err := d.ListJobs(ctx, driver.ListJobsParams{Limit: 1})
+		if err != nil {
+			t.Fatalf("ListJobs: %v", err)
+		}
+		if len(rows) != 1 {
+			t.Fatalf("ListJobs limit 1 returned %d rows", len(rows))
+		}
+		all, err := d.ListJobs(ctx, driver.ListJobsParams{Limit: 100})
+		if err != nil {
+			t.Fatalf("ListJobs: %v", err)
+		}
+		if rows[0].ID != all[0].ID {
+			t.Errorf("limited row id = %d, want newest %d", rows[0].ID, all[0].ID)
+		}
+	})
+
+	t.Run("non-positive limit refused", func(t *testing.T) {
+		t.Parallel()
+		d := New()
+		mustInsert(t, d, "a", "default")
+		for _, limit := range []int{0, -1} {
+			_, err := d.ListJobs(ctx, driver.ListJobsParams{Limit: limit})
+			if err == nil {
+				t.Fatalf("ListJobs limit %d succeeded", limit)
+			}
+		}
+	})
+}
+
+func TestGetJobReturnsRowOrNotFound(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	d := New()
+	inserted := mustInsert(t, d, "k", "default")
+
+	got, err := d.GetJob(ctx, inserted.ID)
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if got.ID != inserted.ID || got.Kind != "k" || got.State != "available" {
+		t.Errorf("GetJob = %+v, want inserted available job", got)
+	}
+
+	_, err = d.GetJob(ctx, 99999)
+	if !errors.Is(err, driver.ErrNotFound) {
+		t.Errorf("GetJob unknown: %v, want ErrNotFound", err)
+	}
+}
+
+func TestOperatorCancelAllowedAndRefusedStates(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	tests := []struct {
+		name      string
+		setup     func(t *testing.T, d *Driver) int64
+		wantState string
+		wantErr   error
+	}{
+		{
+			name: "available",
+			setup: func(t *testing.T, d *Driver) int64 {
+				return mustInsert(t, d, "k", "default").ID
+			},
+			wantState: "cancelled",
+		},
+		{
+			name: "scheduled",
+			setup: func(t *testing.T, d *Driver) int64 {
+				return park(t, d, "scheduled", time.Now().Add(time.Hour)).ID
+			},
+			wantState: "cancelled",
+		},
+		{
+			name: "retryable",
+			setup: func(t *testing.T, d *Driver) int64 {
+				return park(t, d, "retryable", time.Now().Add(time.Hour)).ID
+			},
+			wantState: "cancelled",
+		},
+		{
+			name: "dead",
+			setup: func(t *testing.T, d *Driver) int64 {
+				mustInsert(t, d, "k", "default")
+				row := claimOne(t, d, "default")
+				if err := d.MarkDead(ctx, held(row.ID), []byte(`{"error":"boom"}`)); err != nil {
+					t.Fatal(err)
+				}
+				return row.ID
+			},
+			wantState: "cancelled",
+		},
+		{
+			name: "running refused",
+			setup: func(t *testing.T, d *Driver) int64 {
+				mustInsert(t, d, "k", "default")
+				return claimOne(t, d, "default").ID
+			},
+			wantErr: driver.ErrInvalidTransition,
+		},
+		{
+			name: "completed refused",
+			setup: func(t *testing.T, d *Driver) int64 {
+				mustInsert(t, d, "k", "default")
+				row := claimOne(t, d, "default")
+				if err := d.MarkCompleted(ctx, held(row.ID)); err != nil {
+					t.Fatal(err)
+				}
+				return row.ID
+			},
+			wantErr: driver.ErrInvalidTransition,
+		},
+		{
+			name: "cancelled refused",
+			setup: func(t *testing.T, d *Driver) int64 {
+				id := mustInsert(t, d, "k", "default").ID
+				if _, err := d.OperatorCancel(ctx, id); err != nil {
+					t.Fatal(err)
+				}
+				return id
+			},
+			wantErr: driver.ErrInvalidTransition,
+		},
+		{
+			name:    "unknown id",
+			setup:   func(*testing.T, *Driver) int64 { return 99999 },
+			wantErr: driver.ErrNotFound,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			d := New()
+			id := tt.setup(t, d)
+			before, _ := d.Row(id)
+
+			got, err := d.OperatorCancel(ctx, id)
+			if tt.wantErr != nil {
+				if !errors.Is(err, tt.wantErr) {
+					t.Fatalf("OperatorCancel: %v, want %v", err, tt.wantErr)
+				}
+				if before != nil {
+					after, ok := d.Row(id)
+					if !ok {
+						t.Fatal("job disappeared after refused cancel")
+					}
+					if after.State != before.State {
+						t.Errorf("state changed to %s on refusal, was %s", after.State, before.State)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("OperatorCancel: %v", err)
+			}
+			if got.State != tt.wantState || got.FinalizedAt == nil {
+				t.Errorf("OperatorCancel = state=%s finalized=%v, want %s with finalized_at",
+					got.State, got.FinalizedAt, tt.wantState)
+			}
+			stored, ok := d.Row(id)
+			if !ok || stored.State != "cancelled" || stored.FinalizedAt == nil {
+				t.Errorf("stored = %+v, want cancelled with finalized_at", stored)
+			}
+		})
+	}
+}
+
+func TestRedriveDeadFromDeadOnly(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	t.Run("dead redriven", func(t *testing.T) {
+		t.Parallel()
+		d := New()
+		mustInsert(t, d, "k", "default")
+		row := claimOne(t, d, "default")
+		detail := []byte(`{"attempt":1,"error":"boom"}`)
+		if err := d.MarkDead(ctx, held(row.ID), detail); err != nil {
+			t.Fatalf("MarkDead: %v", err)
+		}
+		before, ok := d.Row(row.ID)
+		if !ok {
+			t.Fatal("dead job missing")
+		}
+
+		got, err := d.RedriveDead(ctx, row.ID)
+		if err != nil {
+			t.Fatalf("RedriveDead: %v", err)
+		}
+		if got.State != "available" || got.Attempt != 0 || got.LeasedUntil != nil || got.FinalizedAt != nil {
+			t.Errorf("RedriveDead = %+v, want available attempt=0 cleared lease/finalized", got)
+		}
+		if !slices.Equal(got.Errors, before.Errors) {
+			t.Errorf("errors = %s, want retained %s", got.Errors, before.Errors)
+		}
+		if got.ScheduledAt.Before(before.FinalizedAt.Add(-time.Second)) {
+			t.Errorf("scheduled_at %v looks stale vs prior finalized %v", got.ScheduledAt, before.FinalizedAt)
+		}
+	})
+
+	t.Run("non-dead refused", func(t *testing.T) {
+		t.Parallel()
+		tests := []struct {
+			name  string
+			setup func(t *testing.T, d *Driver) int64
+		}{
+			{"available", func(t *testing.T, d *Driver) int64 {
+				return mustInsert(t, d, "k", "default").ID
+			}},
+			{"running", func(t *testing.T, d *Driver) int64 {
+				mustInsert(t, d, "k", "default")
+				return claimOne(t, d, "default").ID
+			}},
+			{"completed", func(t *testing.T, d *Driver) int64 {
+				mustInsert(t, d, "k", "default")
+				id := claimOne(t, d, "default").ID
+				if err := d.MarkCompleted(ctx, held(id)); err != nil {
+					t.Fatal(err)
+				}
+				return id
+			}},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				t.Parallel()
+				d := New()
+				id := tt.setup(t, d)
+				before, _ := d.Row(id)
+				_, err := d.RedriveDead(ctx, id)
+				if !errors.Is(err, driver.ErrInvalidTransition) {
+					t.Fatalf("RedriveDead: %v, want ErrInvalidTransition", err)
+				}
+				after, ok := d.Row(id)
+				if !ok || after.State != before.State || after.Attempt != before.Attempt {
+					t.Errorf("row mutated on refusal: before=%+v after=%+v", before, after)
+				}
+			})
+		}
+	})
+
+	t.Run("unknown id", func(t *testing.T) {
+		t.Parallel()
+		_, err := New().RedriveDead(ctx, 99999)
+		if !errors.Is(err, driver.ErrNotFound) {
+			t.Errorf("RedriveDead: %v, want ErrNotFound", err)
+		}
+	})
+}

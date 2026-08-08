@@ -130,12 +130,25 @@ type Stats struct {
 	Oldest []QueueAge
 }
 
+// ListJobsParams filters and bounds a ListJobs read. Empty Queue or State
+// means no filter on that dimension. Limit must be greater than zero;
+// adapters refuse non-positive values.
+type ListJobsParams struct {
+	Queue string
+	State string
+	Limit int
+}
+
 // Driver is the storage contract. Every Mark method is guarded on the
 // caller's lease: the job must still be running on the exact attempt the
 // lease names. From any other state it reports ErrInvalidTransition, for
 // an unknown id ErrNotFound, and for an attempt that has moved on
 // ErrLeaseLost. All of them clear the lease, so no finalized or waiting
 // row carries a stale one.
+//
+// OperatorCancel and RedriveDead are not lease-fenced: they are
+// state-conditioned updates for waiting or dead rows, and refuse running
+// jobs so they never fight a live worker's attempt.
 //
 // Lease durations are passed rather than deadlines because the database
 // clock is the one that decides expiry. Computing the instant on the
@@ -196,4 +209,23 @@ type Driver interface {
 	// rather than deadlines: the clock that decides a job is due is the
 	// only one that can say how late it is.
 	Stats(ctx context.Context) (*Stats, error)
+
+	// ListJobs returns jobs matching optional queue and state filters,
+	// newest id first, capped at p.Limit.
+	ListJobs(ctx context.Context, p ListJobsParams) ([]*JobRow, error)
+
+	// GetJob returns the current row for id, or ErrNotFound.
+	GetJob(ctx context.Context, id int64) (*JobRow, error)
+
+	// OperatorCancel moves available, scheduled, retryable, or dead jobs
+	// to cancelled with finalized_at set. Running, completed, and already
+	// cancelled jobs are refused with ErrInvalidTransition; a missing id
+	// is ErrNotFound.
+	OperatorCancel(ctx context.Context, id int64) (*JobRow, error)
+
+	// RedriveDead moves a dead job back to available with attempt reset
+	// to 0, lease cleared, finalized_at cleared, and scheduled_at set to
+	// the store clock's now, keeping the errors array. Any other state is
+	// ErrInvalidTransition; a missing id is ErrNotFound.
+	RedriveDead(ctx context.Context, id int64) (*JobRow, error)
 }

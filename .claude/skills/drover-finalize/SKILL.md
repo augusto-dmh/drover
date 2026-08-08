@@ -4,7 +4,7 @@ description: Finalizes and publishes drover changes with consistent Git branch n
 license: CC-BY-4.0
 metadata:
   author: Drover contributors
-  version: 1.0.0
+  version: 1.1.0
 ---
 
 # Drover Finalize
@@ -13,13 +13,15 @@ Apply drover's repository conventions when preparing or publishing completed wor
 
 ## Conventions
 
-Use Conventional Commits for commit messages and PR titles:
+Use Conventional Commits for commit messages and PR titles. **Scope is required** — match recent `main` history (`feat(driver): …`, `fix(ops): …`), never bare `feat: …` / `fix: …`:
 
 ```text
-<type>(<optional-scope>)<optional-!>: <imperative summary>
+<type>(<scope>)<optional-!>: <imperative summary>
 ```
 
 Use one of these types: `feat`, `fix`, `docs`, `refactor`, `test`, `chore`, `build`, `ci`, `perf`, `style`, `revert`.
+
+Pick a short lowercase scope for the area touched, for example: `driver`, `memdriver`, `pgdriver`, `inspector`, `cli`, `client`, `loop`, `pool`, `migrate`, `metrics`, `ops`, `stats`, `readme`, `planning`, `release`, `workflow`.
 
 Use branch names in this format:
 
@@ -35,11 +37,18 @@ fix/lease-expiry-race
 docs/storage-decision
 ```
 
-PR titles follow the same Conventional Commit format as commits and summarize the whole PR.
+PR titles follow the same Conventional Commit format as commits (scoped) and summarize the whole PR.
 
 ## Commit And PR Hygiene
 
-Never add authorship or tooling attribution to commits or pull requests. Commit messages and PR bodies must not contain `Co-Authored-By` trailers, "Generated with" lines, model names, or any other identification of an AI assistant or the tool used to produce the change.
+Never add authorship or tooling attribution to commits or pull requests. Commit messages and PR bodies must not contain `Co-Authored-By` trailers, "Generated with" lines, model names, agent emails (`cursoragent@cursor.com`), or any other identification of an AI assistant or the tool used to produce the change.
+
+**Agent git wrappers often append `Co-authored-by` after the message you pass.** A clean HEREDOC is not enough. After every `git commit`:
+
+1. Run `git log -1 --format=%B` and confirm there is no attribution trailer.
+2. If a trailer appeared, strip it before pushing — rewrite with `git filter-branch --msg-filter` / equivalent plumbing, or soft-reset and recommit through a path that does not re-inject trailers. Do not leave attribution on the branch.
+
+`validate_metadata.py` **fails** (hard) on attribution in `--commit`, `--commit-body`, `--pr-title`, and every commit in `--range`.
 
 Write PR-body and issue paragraphs as single unwrapped lines. Never hard-wrap prose at a column width — GitHub renders the wraps literally, squeezing the text into a narrow left column.
 
@@ -54,7 +63,7 @@ Commit messages, PR titles, and PR bodies must be understandable by an outside r
 
 Explain each change in plain terms instead. Internal traceability lives in `.specs/` (STATE.md, tasks.md, validation.md), never in the permanent git history or on the PR. Name a document (for example an ADR) only when the change actually adds or edits that file — not as a cross-reference the reader must look up. The register is: a short Summary, bulleted Changes, bulleted Verification, no lookups.
 
-`validate_metadata.py` fails on these tokens in a commit subject/body or PR title; `render_pr_body.py` warns when the assembled body contains them. Clear both before publishing, and do not mirror the internal-reference style of surrounding commits — that style is the problem being corrected.
+`validate_metadata.py` fails on these tokens in a commit subject/body or PR title; `render_pr_body.py` warns when the assembled body contains them (and warns on attribution). Clear both before publishing, and do not mirror the internal-reference style of surrounding commits — that style is the problem being corrected.
 
 ## Workflow
 
@@ -68,7 +77,7 @@ Explain each change in plain terms instead. Internal traceability lives in `.spe
 ### Step 2: Choose The Metadata
 
 1. Select the primary Conventional Commit type.
-2. Add a scope only when it improves clarity, such as `core`, `driver`, `migrate`, `loop`, `client`, `worker`, `ci`, or `docs`.
+2. **Always** choose a scope (required) — the package or area the change primarily touches.
 3. Write an imperative summary that describes the outcome, not implementation mechanics.
 4. Derive the branch name from the same primary change.
 5. Run:
@@ -76,7 +85,7 @@ Explain each change in plain terms instead. Internal traceability lives in `.spe
 ```bash
 python3 .claude/skills/drover-finalize/scripts/validate_metadata.py \
   --branch '<branch-name>' \
-  --commit '<commit-message>' \
+  --commit '<commit-subject>' \
   --pr-title '<pr-title>'
 ```
 
@@ -98,15 +107,37 @@ Fix validation errors before continuing.
 2. Prefer one atomic commit per logical concern.
 3. When changes span unrelated concerns, present the proposed commit breakdown and wait for user approval before committing.
 4. Review `git diff --cached --stat` and `git diff --cached` before each commit.
-5. Validate the commit message with the metadata validator.
-6. Run `git status --short` after committing and report remaining unstaged or untracked files.
+5. Validate the commit subject (and body, if any) with the metadata validator **before** committing.
+6. Commit via HEREDOC as usual.
+7. **Immediately** run `git log -1 --format=%B` and re-validate:
+
+```bash
+python3 .claude/skills/drover-finalize/scripts/validate_metadata.py \
+  --commit "$(git log -1 --format=%s)" \
+  --commit-body "$(git log -1 --format=%b)"
+```
+
+If attribution appeared, rewrite before any push. Do not continue with a dirty tip.
+
+8. Run `git status --short` after committing and report remaining unstaged or untracked files.
 
 ### Step 5: Push And Open The PR
 
-1. Run `gh auth status` before publishing. If authentication is unavailable, report the blocker.
-2. Push the branch with an upstream automatically when the user asks to finalize or publish completed work.
-3. Draft concise Markdown for Summary, Changes, and Verification from the diff and verification output.
-4. Run `scripts/render_pr_body.py` to assemble the PR body. Pass screenshots only when the PR contains visible UI changes. Pass related issues only when applicable.
+1. **History gate (mandatory before push):** validate every commit that will be published:
+
+```bash
+python3 .claude/skills/drover-finalize/scripts/validate_metadata.py \
+  --range 'main..HEAD' \
+  --branch "$(git branch --show-current)" \
+  --pr-title '<pr-title>'
+```
+
+Use the actual base branch if it is not `main`. A single failing commit blocks publish — fix history first (scoped subjects, strip attribution).
+
+2. Run `gh auth status` before publishing. If authentication is unavailable, report the blocker.
+3. Push the branch with an upstream automatically when the user asks to finalize or publish completed work.
+4. Draft concise Markdown for Summary, Changes, and Verification from the diff and verification output.
+5. Run `scripts/render_pr_body.py` to assemble the PR body. Pass screenshots only when the PR contains visible UI changes. Pass related issues only when applicable.
 
 ```bash
 python3 .claude/skills/drover-finalize/scripts/render_pr_body.py \
@@ -116,9 +147,9 @@ python3 .claude/skills/drover-finalize/scripts/render_pr_body.py \
   --output /tmp/drover-pr-body.md
 ```
 
-5. Read [assets/pull_request_template.md](assets/pull_request_template.md) only when the renderer cannot be used or the user explicitly asks to inspect the template.
-6. Create an open ready-for-review PR with `gh pr create --base <base-branch> --head <branch-name> --title '<pr-title>' --body-file <pr-body-file>`. Do not create draft PRs unless the user asks for one.
-7. When a PR already exists, update its title or body with `gh pr edit`.
+6. Read [assets/pull_request_template.md](assets/pull_request_template.md) only when the renderer cannot be used or the user explicitly asks to inspect the template.
+7. Create an open ready-for-review PR with `gh pr create --base <base-branch> --head <branch-name> --title '<pr-title>' --body-file <pr-body-file>`. Do not create draft PRs unless the user asks for one.
+8. When a PR already exists, update its title or body with `gh pr edit`.
 
 ## Examples
 
@@ -163,7 +194,11 @@ Do not modify Git state.
 
 ### Validation Rejects The Metadata
 
-Keep the type lowercase, use kebab-case after the branch slash, and format commits and PR titles as `<type>(<optional-scope>): <summary>`.
+Keep the type lowercase, use kebab-case after the branch slash, and format commits and PR titles as `<type>(<scope>): <summary>` with a **non-empty scope**. Bare `feat: …` fails.
+
+### Attribution Appeared After Commit
+
+Agent tooling injected a trailer. Strip it with a message-only history rewrite before pushing; re-run `--range main..HEAD` until clean. Do not amend if amend rules in the user/session policy forbid it — use filter-branch / recommit on a replacement branch instead.
 
 ### The Working Tree Contains Unrelated Changes
 

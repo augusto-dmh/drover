@@ -242,6 +242,56 @@ func (q *Queries) InsertJob(ctx context.Context, arg InsertJobParams) (DroverJob
 	return i, err
 }
 
+const listJobs = `-- name: ListJobs :many
+SELECT id, kind, queue, args, state, attempt, max_attempts, errors, scheduled_at, leased_until, created_at, finalized_at FROM drover_jobs
+WHERE ($1 = '' OR queue = $1)
+  AND ($2::text = '' OR state = $2::drover_job_state)
+ORDER BY id DESC
+LIMIT $3
+`
+
+type ListJobsParams struct {
+	Queue   interface{}
+	State   string
+	MaxJobs int32
+}
+
+// Empty queue or state means no filter. Newest id first so a bounded
+// listing is stable without a new index, and operators see recent work
+// first. Limit is the caller's responsibility to keep positive.
+func (q *Queries) ListJobs(ctx context.Context, arg ListJobsParams) ([]DroverJob, error) {
+	rows, err := q.db.Query(ctx, listJobs, arg.Queue, arg.State, arg.MaxJobs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []DroverJob
+	for rows.Next() {
+		var i DroverJob
+		if err := rows.Scan(
+			&i.ID,
+			&i.Kind,
+			&i.Queue,
+			&i.Args,
+			&i.State,
+			&i.Attempt,
+			&i.MaxAttempts,
+			&i.Errors,
+			&i.ScheduledAt,
+			&i.LeasedUntil,
+			&i.CreatedAt,
+			&i.FinalizedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const markCancelled = `-- name: MarkCancelled :execrows
 UPDATE drover_jobs
 SET state = 'cancelled',
@@ -414,6 +464,39 @@ func (q *Queries) OldestClaimable(ctx context.Context) ([]OldestClaimableRow, er
 	return items, nil
 }
 
+const operatorCancel = `-- name: OperatorCancel :one
+UPDATE drover_jobs
+SET state = 'cancelled',
+    finalized_at = now(),
+    leased_until = NULL
+WHERE id = $1
+  AND state IN ('available', 'scheduled', 'retryable', 'dead')
+RETURNING id, kind, queue, args, state, attempt, max_attempts, errors, scheduled_at, leased_until, created_at, finalized_at
+`
+
+// Operator cancel is state-conditioned, not lease-fenced: it must not
+// invent a fake attempt or stomp a running worker. Zero rows means the
+// caller must re-read to distinguish missing from wrong state.
+func (q *Queries) OperatorCancel(ctx context.Context, id int64) (DroverJob, error) {
+	row := q.db.QueryRow(ctx, operatorCancel, id)
+	var i DroverJob
+	err := row.Scan(
+		&i.ID,
+		&i.Kind,
+		&i.Queue,
+		&i.Args,
+		&i.State,
+		&i.Attempt,
+		&i.MaxAttempts,
+		&i.Errors,
+		&i.ScheduledAt,
+		&i.LeasedUntil,
+		&i.CreatedAt,
+		&i.FinalizedAt,
+	)
+	return i, err
+}
+
 const queueDepths = `-- name: QueueDepths :many
 SELECT queue, state::text AS state, count(*) AS count
 FROM drover_jobs
@@ -456,4 +539,39 @@ func (q *Queries) QueueDepths(ctx context.Context) ([]QueueDepthsRow, error) {
 		return nil, err
 	}
 	return items, nil
+}
+
+const redriveDead = `-- name: RedriveDead :one
+UPDATE drover_jobs
+SET state = 'available',
+    attempt = 0,
+    leased_until = NULL,
+    finalized_at = NULL,
+    scheduled_at = now()
+WHERE id = $1
+  AND state = 'dead'
+RETURNING id, kind, queue, args, state, attempt, max_attempts, errors, scheduled_at, leased_until, created_at, finalized_at
+`
+
+// Redrive resets attempt and the lease, keeps error history for triage,
+// and uses the database clock for scheduled_at so the job is claimable
+// immediately against the same clock the fetch predicate uses.
+func (q *Queries) RedriveDead(ctx context.Context, id int64) (DroverJob, error) {
+	row := q.db.QueryRow(ctx, redriveDead, id)
+	var i DroverJob
+	err := row.Scan(
+		&i.ID,
+		&i.Kind,
+		&i.Queue,
+		&i.Args,
+		&i.State,
+		&i.Attempt,
+		&i.MaxAttempts,
+		&i.Errors,
+		&i.ScheduledAt,
+		&i.LeasedUntil,
+		&i.CreatedAt,
+		&i.FinalizedAt,
+	)
+	return i, err
 }
