@@ -10,6 +10,14 @@ import (
 // returns an empty string.
 var ErrInvalidKind = errors.New("drover: job kind must be non-empty")
 
+// ErrNotFound is returned by Inspector methods when the requested job
+// id does not exist.
+var ErrNotFound = errors.New("drover: job not found")
+
+// ErrInvalidTransition is returned by Inspector methods when a job is
+// in a state that refuses the requested operator action.
+var ErrInvalidTransition = errors.New("drover: invalid job state transition")
+
 // ErrAlreadyStarted is returned by Start when the client is already
 // running or has already been stopped. A client's lifecycle runs once.
 var ErrAlreadyStarted = errors.New("drover: client already started")

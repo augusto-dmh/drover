@@ -126,7 +126,7 @@ ordering, limit, cancel allowed states, redrive from dead only, not-found.
 
 ## Phase 2: Inspector API
 
-### T5: Root sentinels + Inspector core (Stats, List, Get, Enqueue)
+### T5: Root sentinels + Inspector core (Stats, List, Get, Enqueue) ✅
 
 **What**: Export `ErrNotFound` / `ErrInvalidTransition` (or document mapping); add
 `inspector.go` with `NewInspector`, `newInspector`, Stats/ListJobs/GetJob/Enqueue;
@@ -219,12 +219,12 @@ at this feature.
 
 | Requirement ID | Task(s) | Status |
 | --- | --- | --- |
-| CLI-01 | T5 | Pending |
-| CLI-02 | T5 | Pending |
-| CLI-03 | T1–T3, T5 | Pending |
+| CLI-01 | T5 | Done |
+| CLI-02 | T5 | Done |
+| CLI-03 | T1–T3, T5 | Done |
 | CLI-04 | T1–T3, T6 | Pending |
 | CLI-05 | T1–T3, T6 | Pending |
-| CLI-06 | T5 | Pending |
+| CLI-06 | T5 | Done |
 | CLI-07 | T9 | Pending |
 | CLI-08 | T9 | Pending |
 | CLI-09 | T10 | Pending |
