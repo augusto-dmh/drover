@@ -7,9 +7,11 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"go.uber.org/goleak"
 
 	"github.com/augusto-dmh/drover/internal/driver"
 	"github.com/augusto-dmh/drover/internal/memdriver"
@@ -397,24 +399,38 @@ func TestFreshIsPureFunctionOfRecordedState(t *testing.T) {
 	}
 }
 
-func TestRunRefreshesImmediatelyBeforeFirstTick(t *testing.T) {
-	t.Parallel()
+func TestRunRefreshesImmediatelyAndOnEachTick(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 
-	drv := &scriptedStatsDriver{Driver: memdriver.New()}
-	m, _, _ := newTestMetricSet(t, 1)
-	// A long interval would hide a missing immediate refresh until the
-	// test timed out waiting for the first tick.
-	r := newStatsRefresher(drv, m, []weightedQueue{{name: "default", weight: 1}}, time.Hour, newTestLogger(&syncWriter{}))
+	synctest.Test(t, func(t *testing.T) {
+		drv := &scriptedStatsDriver{Driver: memdriver.New()}
+		m, _, _ := newTestMetricSet(t, 1)
+		r := newStatsRefresher(
+			drv, m, []weightedQueue{{name: "default", weight: 1}},
+			time.Second, newTestLogger(&syncWriter{}),
+		)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go r.run(ctx)
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			r.run(ctx)
+		}()
 
-	waitFor(t, func() bool { return drv.calls.Load() >= 1 }, "the immediate first refresh")
-	if n := drv.calls.Load(); n != 1 {
-		t.Errorf("Stats calls = %d, want 1 from the immediate refresh alone", n)
-	}
-	cancel()
+		synctest.Wait()
+		if n := drv.calls.Load(); n != 1 {
+			t.Fatalf("Stats calls after immediate refresh = %d, want 1", n)
+		}
+
+		time.Sleep(time.Second)
+		synctest.Wait()
+		if n := drv.calls.Load(); n < 2 {
+			t.Fatalf("Stats calls after first tick = %d, want at least 2", n)
+		}
+
+		cancel()
+		<-done
+	})
 }
 
 func TestRefreshDeletesDrainedSeriesWithoutBlankingSurvivors(t *testing.T) {
