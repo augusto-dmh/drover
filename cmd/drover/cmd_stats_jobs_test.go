@@ -184,6 +184,19 @@ func TestRunJobsListLimitNonPositivePassedThrough(t *testing.T) {
 	}
 }
 
+func TestRunJobsListErrorExit1(t *testing.T) {
+	t.Parallel()
+	fake := &fakeInspector{listErr: errors.New("list failed")}
+	var stdout, stderr bytes.Buffer
+	code := runJobsList(context.Background(), fake, nil, false, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("exit %d want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "list failed") {
+		t.Fatalf("stderr=%q", stderr.String())
+	}
+}
+
 func TestJobsListUnknownNestedExit2(t *testing.T) {
 	t.Parallel()
 	var stdout, stderr bytes.Buffer

@@ -21,6 +21,9 @@ func TestRunRetrySuccess(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit %d stderr=%q", code, stderr.String())
 	}
+	if fake.retryID != 9 {
+		t.Fatalf("retry id=%d want 9", fake.retryID)
+	}
 	if !strings.Contains(stdout.String(), "redrove job 9") {
 		t.Fatalf("stdout=%q", stdout.String())
 	}
@@ -35,6 +38,9 @@ func TestRunRetryJSON(t *testing.T) {
 	code := runRetry(context.Background(), fake, []string{"9"}, true, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("exit %d", code)
+	}
+	if fake.retryID != 9 {
+		t.Fatalf("retry id=%d want 9", fake.retryID)
 	}
 	var got drover.JobRow
 	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
@@ -52,6 +58,9 @@ func TestRunRetryNotFoundExit1(t *testing.T) {
 	code := runRetry(context.Background(), fake, []string{"99"}, false, &stdout, &stderr)
 	if code != 1 {
 		t.Fatalf("exit %d want 1", code)
+	}
+	if fake.retryID != 99 {
+		t.Fatalf("retry id=%d want 99", fake.retryID)
 	}
 	if stderr.Len() == 0 {
 		t.Fatal("expected stderr")
@@ -77,6 +86,27 @@ func TestRunRetryMissingIDExit2(t *testing.T) {
 	}
 }
 
+func TestRunRetryBadJobIDExit2(t *testing.T) {
+	t.Parallel()
+	for _, id := range []string{"abc", "0", "-1", "1.5"} {
+		t.Run(id, func(t *testing.T) {
+			t.Parallel()
+			fake := &fakeInspector{}
+			var stdout, stderr bytes.Buffer
+			code := runRetry(context.Background(), fake, []string{id}, false, &stdout, &stderr)
+			if code != 2 {
+				t.Fatalf("exit %d want 2 stderr=%q", code, stderr.String())
+			}
+			if fake.retryID != 0 {
+				t.Fatalf("must not call RetryJob for bad id %q", id)
+			}
+			if !strings.Contains(stderr.String(), "invalid job id") {
+				t.Fatalf("stderr=%q", stderr.String())
+			}
+		})
+	}
+}
+
 func TestRunCancelSuccess(t *testing.T) {
 	t.Parallel()
 	fake := &fakeInspector{
@@ -87,8 +117,49 @@ func TestRunCancelSuccess(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit %d stderr=%q", code, stderr.String())
 	}
+	if fake.cancelID != 4 {
+		t.Fatalf("cancel id=%d want 4", fake.cancelID)
+	}
 	if !strings.Contains(stdout.String(), "cancelled job 4") {
 		t.Fatalf("stdout=%q", stdout.String())
+	}
+}
+
+func TestRunCancelJSON(t *testing.T) {
+	t.Parallel()
+	fake := &fakeInspector{
+		cancelJob: &drover.JobRow{ID: 4, State: drover.StateCancelled, Args: json.RawMessage(`{}`)},
+	}
+	var stdout, stderr bytes.Buffer
+	code := runCancel(context.Background(), fake, []string{"4"}, true, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	if fake.cancelID != 4 {
+		t.Fatalf("cancel id=%d want 4", fake.cancelID)
+	}
+	var got drover.JobRow
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != 4 || got.State != drover.StateCancelled {
+		t.Fatalf("got=%+v", got)
+	}
+}
+
+func TestRunCancelNotFoundExit1(t *testing.T) {
+	t.Parallel()
+	fake := &fakeInspector{cancelErr: drover.ErrNotFound}
+	var stdout, stderr bytes.Buffer
+	code := runCancel(context.Background(), fake, []string{"99"}, false, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("exit %d want 1", code)
+	}
+	if fake.cancelID != 99 {
+		t.Fatalf("cancel id=%d want 99", fake.cancelID)
+	}
+	if stderr.Len() == 0 {
+		t.Fatal("expected stderr")
 	}
 }
 
@@ -99,6 +170,33 @@ func TestRunCancelIneligibleExit1(t *testing.T) {
 	code := runCancel(context.Background(), fake, []string{"4"}, false, &stdout, &stderr)
 	if code != 1 {
 		t.Fatalf("exit %d want 1", code)
+	}
+}
+
+func TestRunCancelMissingIDExit2(t *testing.T) {
+	t.Parallel()
+	var stdout, stderr bytes.Buffer
+	code := runCancel(context.Background(), &fakeInspector{}, nil, false, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("exit %d want 2", code)
+	}
+}
+
+func TestRunCancelBadJobIDExit2(t *testing.T) {
+	t.Parallel()
+	for _, id := range []string{"nope", "0", "-3"} {
+		t.Run(id, func(t *testing.T) {
+			t.Parallel()
+			fake := &fakeInspector{}
+			var stdout, stderr bytes.Buffer
+			code := runCancel(context.Background(), fake, []string{id}, false, &stdout, &stderr)
+			if code != 2 {
+				t.Fatalf("exit %d want 2", code)
+			}
+			if fake.cancelID != 0 {
+				t.Fatalf("must not call CancelJob for bad id %q", id)
+			}
+		})
 	}
 }
 
@@ -208,6 +306,9 @@ func TestRetryCancelEnqueueViaRun(t *testing.T) {
 		if code != 0 {
 			t.Fatalf("exit %d stderr=%q", code, stderr.String())
 		}
+		if fake.retryID != 1 {
+			t.Fatalf("retry id=%d want 1", fake.retryID)
+		}
 	})
 	t.Run("cancel", func(t *testing.T) {
 		t.Parallel()
@@ -219,6 +320,9 @@ func TestRetryCancelEnqueueViaRun(t *testing.T) {
 		code := run([]string{"cancel", "2"}, &stdout, &stderr, getenv, open)
 		if code != 0 {
 			t.Fatalf("exit %d stderr=%q", code, stderr.String())
+		}
+		if fake.cancelID != 2 {
+			t.Fatalf("cancel id=%d want 2", fake.cancelID)
 		}
 	})
 	t.Run("enqueue", func(t *testing.T) {

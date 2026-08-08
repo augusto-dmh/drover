@@ -247,6 +247,42 @@ func TestInspectorEnqueue(t *testing.T) {
 		}
 	})
 
+	t.Run("nil opts uses default queue", func(t *testing.T) {
+		t.Parallel()
+		mem := memdriver.New()
+		in := newInspector(mem)
+
+		row, err := in.Enqueue(ctx, "ping", json.RawMessage(`{}`), nil)
+		if err != nil {
+			t.Fatalf("Enqueue: %v", err)
+		}
+		if row.Queue != defaultQueue {
+			t.Errorf("Queue = %q, want %q", row.Queue, defaultQueue)
+		}
+		stored, ok := mem.Row(row.ID)
+		if !ok || stored.Queue != defaultQueue {
+			t.Errorf("stored = %+v, want queue %q", stored, defaultQueue)
+		}
+	})
+
+	t.Run("empty InsertOpts uses default queue", func(t *testing.T) {
+		t.Parallel()
+		mem := memdriver.New()
+		in := newInspector(mem)
+
+		row, err := in.Enqueue(ctx, "ping", json.RawMessage(`{}`), &InsertOpts{})
+		if err != nil {
+			t.Fatalf("Enqueue: %v", err)
+		}
+		if row.Queue != defaultQueue {
+			t.Errorf("Queue = %q, want %q", row.Queue, defaultQueue)
+		}
+		stored, ok := mem.Row(row.ID)
+		if !ok || stored.Queue != defaultQueue {
+			t.Errorf("stored = %+v, want queue %q", stored, defaultQueue)
+		}
+	})
+
 	t.Run("empty kind refuses without insert", func(t *testing.T) {
 		t.Parallel()
 		mem := memdriver.New()

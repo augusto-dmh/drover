@@ -16,12 +16,13 @@ type fakeInspector struct {
 	listOpts *drover.ListJobsOpts
 	listErr  error
 
-	getJob    *drover.JobRow
-	getErr    error
+	cancelID  int64
 	cancelJob *drover.JobRow
 	cancelErr error
-	retryJob  *drover.JobRow
-	retryErr  error
+
+	retryID  int64
+	retryJob *drover.JobRow
+	retryErr error
 
 	enqueueKind string
 	enqueueArgs json.RawMessage
@@ -40,15 +41,13 @@ func (f *fakeInspector) ListJobs(_ context.Context, opts *drover.ListJobsOpts) (
 	return f.jobs, f.listErr
 }
 
-func (f *fakeInspector) GetJob(context.Context, int64) (*drover.JobRow, error) {
-	return f.getJob, f.getErr
-}
-
-func (f *fakeInspector) CancelJob(context.Context, int64) (*drover.JobRow, error) {
+func (f *fakeInspector) CancelJob(_ context.Context, id int64) (*drover.JobRow, error) {
+	f.cancelID = id
 	return f.cancelJob, f.cancelErr
 }
 
-func (f *fakeInspector) RetryJob(context.Context, int64) (*drover.JobRow, error) {
+func (f *fakeInspector) RetryJob(_ context.Context, id int64) (*drover.JobRow, error) {
+	f.retryID = id
 	return f.retryJob, f.retryErr
 }
 

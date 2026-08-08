@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -111,5 +113,24 @@ func TestPeelGlobalsJSONAnywhere(t *testing.T) {
 	}
 	if len(rest) != 1 || rest[0] != "stats" {
 		t.Fatalf("rest=%v", rest)
+	}
+}
+
+func TestOpenFailureExit1(t *testing.T) {
+	t.Parallel()
+	open := func(context.Context, string) (inspector, func(), error) {
+		return nil, nil, errors.New("connect refused")
+	}
+	var stdout, stderr bytes.Buffer
+	code := run(
+		[]string{"--database", "postgres://test", "stats"},
+		&stdout, &stderr,
+		nil, open,
+	)
+	if code != 1 {
+		t.Fatalf("exit %d want 1 stderr=%q", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "connect refused") {
+		t.Fatalf("stderr=%q", stderr.String())
 	}
 }
