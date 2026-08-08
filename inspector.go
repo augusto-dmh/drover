@@ -145,6 +145,28 @@ func (in *Inspector) Enqueue(ctx context.Context, kind string, args json.RawMess
 	return rowFromDriver(row), nil
 }
 
+// CancelJob moves a waiting or dead job to cancelled. Running,
+// completed, and already-cancelled jobs are refused with
+// ErrInvalidTransition; a missing id is ErrNotFound.
+func (in *Inspector) CancelJob(ctx context.Context, id int64) (*JobRow, error) {
+	row, err := in.drv.OperatorCancel(ctx, id)
+	if err != nil {
+		return nil, mapDriverErr(err)
+	}
+	return rowFromDriver(row), nil
+}
+
+// RetryJob redrives a dead job to available with attempt reset to 0,
+// lease cleared, and prior errors retained. Any other state is
+// ErrInvalidTransition; a missing id is ErrNotFound.
+func (in *Inspector) RetryJob(ctx context.Context, id int64) (*JobRow, error) {
+	row, err := in.drv.RedriveDead(ctx, id)
+	if err != nil {
+		return nil, mapDriverErr(err)
+	}
+	return rowFromDriver(row), nil
+}
+
 // mapDriverErr translates driver sentinels to root-package ones so
 // callers can errors.Is without importing internal/driver, while
 // keeping the driver's detail message.

@@ -136,7 +136,7 @@ map driver rows to public `JobRow`; default list limit 100; validate kind + JSON
 **Gate**: quick
 **Commit**: `feat: add Inspector for queue stats, list, get, and enqueue`
 
-### T6: Inspector Cancel + Retry
+### T6: Inspector Cancel + Retry ✅
 
 **What**: `CancelJob` / `RetryJob` wrapping operator driver methods; tests for allowed
 states, refusals, error wrapping with `errors.Is`.
@@ -222,8 +222,8 @@ at this feature.
 | CLI-01 | T5 | Done |
 | CLI-02 | T5 | Done |
 | CLI-03 | T1–T3, T5 | Done |
-| CLI-04 | T1–T3, T6 | Pending |
-| CLI-05 | T1–T3, T6 | Pending |
+| CLI-04 | T1–T3, T6 | Done |
+| CLI-05 | T1–T3, T6 | Done |
 | CLI-06 | T5 | Done |
 | CLI-07 | T9 | Pending |
 | CLI-08 | T9 | Pending |

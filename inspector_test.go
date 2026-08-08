@@ -247,6 +247,226 @@ func TestInspectorEnqueue(t *testing.T) {
 	})
 }
 
+func TestInspectorCancelJob(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	tests := []struct {
+		name      string
+		setup     func(t *testing.T, mem *memdriver.Driver, in *Inspector) int64
+		wantState JobState
+		wantErr   error
+	}{
+		{
+			name: "available",
+			setup: func(t *testing.T, _ *memdriver.Driver, in *Inspector) int64 {
+				return mustEnqueue(t, in, "k", "default", `{}`).ID
+			},
+			wantState: StateCancelled,
+		},
+		{
+			name: "scheduled",
+			setup: func(t *testing.T, _ *memdriver.Driver, in *Inspector) int64 {
+				row, err := in.Enqueue(ctx, "k", json.RawMessage(`{}`), &InsertOpts{
+					ScheduledAt: time.Now().Add(time.Hour),
+				})
+				if err != nil {
+					t.Fatalf("Enqueue: %v", err)
+				}
+				if row.State != StateScheduled {
+					t.Fatalf("State = %q, want scheduled", row.State)
+				}
+				return row.ID
+			},
+			wantState: StateCancelled,
+		},
+		{
+			name: "retryable",
+			setup: func(t *testing.T, mem *memdriver.Driver, in *Inspector) int64 {
+				mustEnqueue(t, in, "k", "default", `{}`)
+				row := claimOne(t, mem, "default")
+				if err := mem.MarkRetryable(ctx, driver.Lease{ID: row.ID, Attempt: row.Attempt},
+					time.Now().Add(time.Hour), []byte(`{"error":"later"}`)); err != nil {
+					t.Fatalf("MarkRetryable: %v", err)
+				}
+				return row.ID
+			},
+			wantState: StateCancelled,
+		},
+		{
+			name: "dead",
+			setup: func(t *testing.T, mem *memdriver.Driver, in *Inspector) int64 {
+				mustEnqueue(t, in, "k", "default", `{}`)
+				row := claimOne(t, mem, "default")
+				if err := mem.MarkDead(ctx, driver.Lease{ID: row.ID, Attempt: row.Attempt},
+					[]byte(`{"error":"boom"}`)); err != nil {
+					t.Fatalf("MarkDead: %v", err)
+				}
+				return row.ID
+			},
+			wantState: StateCancelled,
+		},
+		{
+			name: "running refused",
+			setup: func(t *testing.T, mem *memdriver.Driver, in *Inspector) int64 {
+				mustEnqueue(t, in, "k", "default", `{}`)
+				return claimOne(t, mem, "default").ID
+			},
+			wantErr: ErrInvalidTransition,
+		},
+		{
+			name: "completed refused",
+			setup: func(t *testing.T, mem *memdriver.Driver, in *Inspector) int64 {
+				mustEnqueue(t, in, "k", "default", `{}`)
+				row := claimOne(t, mem, "default")
+				if err := mem.MarkCompleted(ctx, driver.Lease{ID: row.ID, Attempt: row.Attempt}); err != nil {
+					t.Fatalf("MarkCompleted: %v", err)
+				}
+				return row.ID
+			},
+			wantErr: ErrInvalidTransition,
+		},
+		{
+			name: "cancelled refused",
+			setup: func(t *testing.T, _ *memdriver.Driver, in *Inspector) int64 {
+				id := mustEnqueue(t, in, "k", "default", `{}`).ID
+				if _, err := in.CancelJob(ctx, id); err != nil {
+					t.Fatalf("first CancelJob: %v", err)
+				}
+				return id
+			},
+			wantErr: ErrInvalidTransition,
+		},
+		{
+			name:    "unknown id",
+			setup:   func(*testing.T, *memdriver.Driver, *Inspector) int64 { return 99999 },
+			wantErr: ErrNotFound,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			mem := memdriver.New()
+			in := newInspector(mem)
+			id := tt.setup(t, mem, in)
+			before, _ := mem.Row(id)
+
+			got, err := in.CancelJob(ctx, id)
+			if tt.wantErr != nil {
+				if !errors.Is(err, tt.wantErr) {
+					t.Fatalf("CancelJob: %v, want %v", err, tt.wantErr)
+				}
+				if before != nil {
+					after, ok := mem.Row(id)
+					if !ok {
+						t.Fatal("job disappeared after refused cancel")
+					}
+					if after.State != before.State {
+						t.Errorf("state changed to %s on refusal, was %s", after.State, before.State)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("CancelJob: %v", err)
+			}
+			if got.State != tt.wantState || got.FinalizedAt == nil {
+				t.Errorf("CancelJob = state=%s finalized=%v, want %s with finalized_at",
+					got.State, got.FinalizedAt, tt.wantState)
+			}
+			stored, ok := mem.Row(id)
+			if !ok || stored.State != "cancelled" || stored.FinalizedAt == nil {
+				t.Errorf("stored = %+v, want cancelled with finalized_at", stored)
+			}
+		})
+	}
+}
+
+func TestInspectorRetryJob(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	t.Run("dead redriven", func(t *testing.T) {
+		t.Parallel()
+		mem := memdriver.New()
+		in := newInspector(mem)
+		mustEnqueue(t, in, "k", "default", `{}`)
+		row := claimOne(t, mem, "default")
+		detail := []byte(`{"attempt":1,"error":"boom"}`)
+		if err := mem.MarkDead(ctx, driver.Lease{ID: row.ID, Attempt: row.Attempt}, detail); err != nil {
+			t.Fatalf("MarkDead: %v", err)
+		}
+		before, ok := mem.Row(row.ID)
+		if !ok {
+			t.Fatal("dead job missing")
+		}
+
+		got, err := in.RetryJob(ctx, row.ID)
+		if err != nil {
+			t.Fatalf("RetryJob: %v", err)
+		}
+		if got.State != StateAvailable || got.Attempt != 0 || got.LeasedUntil != nil || got.FinalizedAt != nil {
+			t.Errorf("RetryJob = %+v, want available attempt=0 cleared lease/finalized", got)
+		}
+		if string(got.Errors) != string(before.Errors) {
+			t.Errorf("errors = %s, want retained %s", got.Errors, before.Errors)
+		}
+		if !got.ScheduledAt.Before(time.Now().Add(time.Second)) {
+			t.Errorf("scheduled_at %v is not at or before now", got.ScheduledAt)
+		}
+	})
+
+	t.Run("non-dead refused", func(t *testing.T) {
+		t.Parallel()
+		tests := []struct {
+			name  string
+			setup func(t *testing.T, mem *memdriver.Driver, in *Inspector) int64
+		}{
+			{"available", func(t *testing.T, _ *memdriver.Driver, in *Inspector) int64 {
+				return mustEnqueue(t, in, "k", "default", `{}`).ID
+			}},
+			{"running", func(t *testing.T, mem *memdriver.Driver, in *Inspector) int64 {
+				mustEnqueue(t, in, "k", "default", `{}`)
+				return claimOne(t, mem, "default").ID
+			}},
+			{"completed", func(t *testing.T, mem *memdriver.Driver, in *Inspector) int64 {
+				mustEnqueue(t, in, "k", "default", `{}`)
+				row := claimOne(t, mem, "default")
+				if err := mem.MarkCompleted(ctx, driver.Lease{ID: row.ID, Attempt: row.Attempt}); err != nil {
+					t.Fatal(err)
+				}
+				return row.ID
+			}},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				t.Parallel()
+				mem := memdriver.New()
+				in := newInspector(mem)
+				id := tt.setup(t, mem, in)
+				before, _ := mem.Row(id)
+				_, err := in.RetryJob(ctx, id)
+				if !errors.Is(err, ErrInvalidTransition) {
+					t.Fatalf("RetryJob: %v, want ErrInvalidTransition", err)
+				}
+				after, ok := mem.Row(id)
+				if !ok || after.State != before.State || after.Attempt != before.Attempt {
+					t.Errorf("row mutated on refusal: before=%+v after=%+v", before, after)
+				}
+			})
+		}
+	})
+
+	t.Run("unknown id", func(t *testing.T) {
+		t.Parallel()
+		_, err := newInspector(memdriver.New()).RetryJob(ctx, 99999)
+		if !errors.Is(err, ErrNotFound) {
+			t.Errorf("RetryJob: %v, want ErrNotFound", err)
+		}
+	})
+}
+
 func mustEnqueue(t *testing.T, in *Inspector, kind, queue, args string) *JobRow {
 	t.Helper()
 	row, err := in.Enqueue(context.Background(), kind, json.RawMessage(args), &InsertOpts{Queue: queue})
