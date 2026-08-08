@@ -2,6 +2,7 @@ package drover
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net"
 	"net/http"
@@ -35,11 +36,11 @@ func newOpsServer(
 		logger = slog.Default()
 	}
 	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+	mux.Handle("GET /metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
-	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, _ *http.Request) {
 		if ready == nil {
 			w.WriteHeader(http.StatusOK)
 			return
@@ -67,16 +68,21 @@ func newOpsServer(
 func (s *opsServer) serve() {
 	defer close(s.done)
 	err := s.server.Serve(s.ln)
-	if err != nil && err != http.ErrServerClosed {
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
 		s.logger.Error("drover: ops server", "error", err)
 	}
 }
 
 // shutdown stops accepting and waits until the serving goroutine has
 // returned. Waiting on done is what makes goleak pass; Shutdown alone
-// does not join Serve.
+// does not join Serve. When Shutdown returns an error — typically a
+// deadline — Close aborts lingering handlers so Serve can return; without
+// it Stop would unblock while handler goroutines were still running.
 func (s *opsServer) shutdown(ctx context.Context) error {
 	err := s.server.Shutdown(ctx)
+	if err != nil {
+		_ = s.server.Close()
+	}
 	<-s.done
 	return err
 }
