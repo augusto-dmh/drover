@@ -20,6 +20,12 @@ INTERNAL_REF_PATTERNS = (
     ("internal spec path", re.compile(r"\.specs/")),
 )
 
+ATTRIBUTION_PATTERNS = (
+    ("Co-authored-by trailer", re.compile(r"(?im)^co-authored-by:\s*.+$")),
+    ("Generated-with line", re.compile(r"(?im)^generated\s+with\b.*$")),
+    ("Cursor agent email", re.compile(r"(?i)cursoragent@cursor\.com")),
+)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -53,21 +59,41 @@ def render_section(title: str, content: str) -> str:
     return f"## {title}\n\n{content}"
 
 
-def warn_internal_refs(body: str) -> None:
+def warn_patterns(
+    body: str,
+    patterns: tuple[tuple[str, re.Pattern[str]], ...],
+    heading: str,
+    hint: str,
+) -> None:
     hits = [
-        (name, match.group(0))
-        for name, pattern in INTERNAL_REF_PATTERNS
+        (name, match.group(0).strip())
+        for name, pattern in patterns
         for match in pattern.finditer(body)
     ]
     if not hits:
         return
 
-    print("WARN: PR body may contain internal references (keep it self-contained):", file=sys.stderr)
+    print(f"WARN: {heading}", file=sys.stderr)
     for name, token in sorted(set(hits)):
         print(f"  - {name}: {token!r}", file=sys.stderr)
-    print(
-        "  Rephrase in plain terms; name a doc only if this PR adds or edits it.",
-        file=sys.stderr,
+    print(f"  {hint}", file=sys.stderr)
+
+
+def warn_internal_refs(body: str) -> None:
+    warn_patterns(
+        body,
+        INTERNAL_REF_PATTERNS,
+        "PR body may contain internal references (keep it self-contained):",
+        "Rephrase in plain terms; name a doc only if this PR adds or edits it.",
+    )
+
+
+def warn_attribution(body: str) -> None:
+    warn_patterns(
+        body,
+        ATTRIBUTION_PATTERNS,
+        "PR body may contain AI/tooling attribution (forbidden on drover PRs):",
+        "Remove Co-authored-by / Generated-with lines before publishing.",
     )
 
 
@@ -89,6 +115,7 @@ def main() -> int:
 
     body = "\n\n".join(sections) + "\n"
     warn_internal_refs(body)
+    warn_attribution(body)
 
     if args.output is None:
         print(body, end="")

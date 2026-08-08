@@ -62,13 +62,26 @@ Invoke `tlc-spec-driven` for the cycle (Specify → Design → Tasks → Execute
 - it adds an external dependency that the stdlib-first decision says needs its own justification, and no clear recommendation exists, or
 - no option is defensible as recommended.
 
-Execute honors the full tlc contract (tests from acceptance criteria, gate per task, atomic commits, mandatory fresh Verifier). A Verifier FAIL stops the pipeline with the report — do not continue to Stage 2.
+Execute honors the full tlc contract (tests from acceptance criteria, gate per task, atomic commits, mandatory fresh Verifier). Commit subjects must be scoped Conventional Commits with no attribution trailers — same rules as Stage 2; workers re-check `git log -1 --format=%B` after each commit. A Verifier FAIL stops the pipeline with the report — do not continue to Stage 2.
 
 **Gates for this repo:** quick = `go test -race ./...`; full = quick plus `go test -race -tags=integration ./...` (requires Docker — probe `docker ps` and tell the user to start Docker Desktop rather than debugging further); build = `go build ./... && go vet ./...`; before publishing also run `go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest run`, and regenerate sqlc if `.sql` files changed.
 
 ## Stage 2 — Publish (drover-finalize)
 
-Invoke `drover-finalize` for branch, commit hygiene, verification notes, and the PR. Include the cycle's planning artifacts (`.specs/features/<feature>/*`, `.specs/STATE.md`) in the PR. Capture the PR number for all later stages. Wait for CI with `gh pr checks <N> --watch` as a background task — never `sleep N && gh …`.
+Invoke `drover-finalize` for branch, commit hygiene, verification notes, and the PR. Include the cycle's planning artifacts (`.specs/features/<feature>/*`, `.specs/STATE.md`) in the PR.
+
+**History gate (blocking):** before push and before `gh pr create` / `gh pr edit`, run:
+
+```bash
+python3 .claude/skills/drover-finalize/scripts/validate_metadata.py \
+  --range 'main..HEAD' \
+  --branch "$(git branch --show-current)" \
+  --pr-title '<pr-title>'
+```
+
+This must pass for **every** commit on the branch — scoped Conventional Commit subjects (`type(scope): …`), no internal IDs, no AI/tooling attribution trailers. Validating only the PR title is not enough; agent git wrappers often append `Co-authored-by` after a clean HEREDOC. If the range fails, rewrite history and re-run until clean; do not publish a dirty tip.
+
+Capture the PR number for all later stages. Wait for CI with `gh pr checks <N> --watch` as a background task — never `sleep N && gh …`.
 
 ## Stage 3 — Review (fresh context, author ≠ reviewer)
 
@@ -84,7 +97,7 @@ Spawn ONE subagent via the Agent tool (`general-purpose`, fresh context) with a 
 
 ## Stage 5 — Fix
 
-Apply every "fix" finding. Group into atomic Conventional Commits per `drover-finalize` rules (plain-language messages, no internal IDs, no AI attribution). Re-run the cycle's gates (unit `-race`, integration when storage/loop behavior changed, lint) before pushing. Push to the PR branch.
+Apply every "fix" finding. Group into atomic Conventional Commits per `drover-finalize` rules: **scoped** subjects (`fix(driver): …`, not `fix: …`), plain-language messages, no internal IDs, no AI attribution. After each commit, verify `git log -1 --format=%B` has no `Co-authored-by` / generated-with trailer; if tooling injected one, strip it before continuing. Re-run the cycle's gates (unit `-race`, integration when storage/loop behavior changed, lint), then re-run the history gate (`validate_metadata.py --range main..HEAD`) before pushing. Push to the PR branch.
 
 ## Stage 6 — Clean Comments
 
@@ -97,7 +110,9 @@ Re-fetch both endpoints and verify zero remain. If a submitted *review* (not a c
 
 ## Stage 7 — Merge Gate (the one user prompt)
 
-Present a compact ship report: cycle, PR number, Verifier result, triage counts (real/false, fixed/won't-fix), fix commits, gate and CI results, comment cleanup status. In `once` mode, ask the user (AskUserQuestion): merge now or hold. In `auto`/`until` mode with a clean report, merge without asking.
+Re-run the history gate once (`validate_metadata.py --range main..HEAD`) so a late force-push or fix commit cannot sneak attribution or unscoped subjects past Stage 2/5. If it fails, stop and repair — do not ask to merge a dirty tip.
+
+Present a compact ship report: cycle, PR number, Verifier result, triage counts (real/false, fixed/won't-fix), fix commits, gate and CI results, comment cleanup status, history-gate result. In `once` mode, ask the user (AskUserQuestion): merge now or hold. In `auto`/`until` mode with a clean report, merge without asking.
 
 On approval: `gh pr merge {N} --merge` (merge commit — keeps the atomic commit history visible), then `git checkout main && git pull` and delete the local feature branch. If `gh pr merge` or `gh pr edit` fails with a GraphQL Projects-classic deprecation error, fall back to the REST API (`gh api -X PATCH/PUT repos/{repo}/pulls/{N}...`).
 
@@ -150,8 +165,8 @@ A delegated worker's brief must give it **what must be true when it finishes**, 
 - The **binding decisions** — the ADRs and `AD-NNN` rows the phase must conform to, and any accepted assumption it must not relitigate.
 - The **invariants that must hold**, named as invariants: "a claimed job is executed by exactly one worker", "clean shutdown never drops an in-flight job". Require a sensor for each; do **not** dictate the test's shape or name.
 - **Environment facts** that cost time to rediscover — Docker availability for integration tests, the baseline test counts, gate commands.
-- The **non-negotiable contract** — tests derive from acceptance criteria, gate green before done, one atomic commit per task, no attribution, no internal IDs.
-- The **report contract** — what the closing summary must contain, including that deviations be stated plainly rather than buried.
+- The **non-negotiable contract** — tests derive from acceptance criteria, gate green before done, one atomic commit per task, **scoped** Conventional Commit subjects (`type(scope): …`), no attribution, no internal IDs. After each commit the worker must confirm `git log -1 --format=%B` is trailer-clean (agent wrappers may append `Co-authored-by`); strip before the phase summary.
+- The **report contract** — what the closing summary must contain, including that deviations be stated plainly rather than buried. Commit hashes in the summary must still pass `validate_metadata.py --commit` (scoped, no attribution).
 
 **Don't give:** an ordered list of edits; an enumerated list of tests to write; a solution the worker is meant to transcribe. If you find yourself writing the implementation into the brief, either the unit is a fully-specified chore (where a step list is correct) or you are doing the worker's thinking and should hand it the constraint instead.
 
@@ -163,8 +178,10 @@ A delegated worker's brief must give it **what must be true when it finishes**, 
 
 ## Hygiene (applies to every stage)
 
-- No AI/tooling attribution anywhere public (commits, PR, comments).
+- No AI/tooling attribution anywhere public (commits, PR, comments). Treat a clean HEREDOC as insufficient — always inspect the created commit message.
+- Commit subjects (and PR titles) use **required** scope: `feat(cli): …`, never `feat: …`.
 - No internal IDs (task/AD/requirement/cycle/Gate labels) in commits, PR bodies, or PR comments — they live only under `.specs/`. Validate with `drover-finalize`'s `validate_metadata.py`.
+- Before every push that updates a PR tip (Stage 2 publish, Stage 5 fixes), and again at Stage 7 before asking to merge: `python3 .claude/skills/drover-finalize/scripts/validate_metadata.py --range main..HEAD`.
 - Multiline `gh` bodies go through `--body-file`/`-F body=@file`, never `-f body=@file`.
 - Never post PR-level content as a review (`gh pr review`) — reviews cannot be deleted.
 - Wait on CI with `gh pr checks <N> --watch` as a background task — never `sleep N && gh …`.
