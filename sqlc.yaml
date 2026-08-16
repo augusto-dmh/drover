@@ -2,7 +2,9 @@ version: "2"
 sql:
   - engine: "postgresql"
     queries: "internal/pgdriver/queries.sql"
-    schema: "internal/migrate/migrations"
+    schema:
+      - "internal/migrate/migrations"
+      - "internal/pgdriver/sqlc_schema.sql"
     gen:
       go:
         package: "dbsqlc"

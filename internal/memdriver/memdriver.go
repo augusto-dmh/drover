@@ -73,6 +73,16 @@ func (d *Driver) InsertTx(context.Context, any, driver.InsertParams) (*driver.Jo
 	return nil, driver.ErrTxUnsupported
 }
 
+// Batch-insert stubs satisfy driver.Driver until the in-memory
+// implementations land in the next commit.
+func (d *Driver) InsertMany(context.Context, []driver.InsertParams) ([]*driver.JobRow, error) {
+	panic("memdriver: InsertMany not implemented")
+}
+
+func (d *Driver) InsertManyTx(context.Context, any, []driver.InsertParams) ([]*driver.JobRow, error) {
+	panic("memdriver: InsertManyTx not implemented")
+}
+
 // waiting reports whether a job in this state is queued for execution:
 // never run, awaiting a retry backoff, or snoozed.
 func waiting(state string) bool {

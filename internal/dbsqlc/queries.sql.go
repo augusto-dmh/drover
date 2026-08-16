@@ -242,6 +242,58 @@ func (q *Queries) InsertJob(ctx context.Context, arg InsertJobParams) (DroverJob
 	return i, err
 }
 
+const insertJobsFromStaging = `-- name: InsertJobsFromStaging :many
+INSERT INTO drover_jobs (kind, queue, args, scheduled_at, state)
+SELECT
+    kind,
+    queue,
+    args,
+    coalesce(scheduled_at, now()),
+    CASE WHEN coalesce(scheduled_at, now()) > now()
+         THEN 'scheduled'::drover_job_state
+         ELSE 'available'::drover_job_state
+    END
+FROM drover_insert_batch
+ORDER BY ord
+RETURNING id, kind, queue, args, state, attempt, max_attempts, errors, scheduled_at, leased_until, created_at, finalized_at
+`
+
+// Same CASE as InsertJob: dueness is the database clock's, not the
+// client's. Rows are taken from the session-temp staging table in the
+// order CopyFrom loaded them.
+func (q *Queries) InsertJobsFromStaging(ctx context.Context) ([]DroverJob, error) {
+	rows, err := q.db.Query(ctx, insertJobsFromStaging)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []DroverJob
+	for rows.Next() {
+		var i DroverJob
+		if err := rows.Scan(
+			&i.ID,
+			&i.Kind,
+			&i.Queue,
+			&i.Args,
+			&i.State,
+			&i.Attempt,
+			&i.MaxAttempts,
+			&i.Errors,
+			&i.ScheduledAt,
+			&i.LeasedUntil,
+			&i.CreatedAt,
+			&i.FinalizedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listJobs = `-- name: ListJobs :many
 SELECT id, kind, queue, args, state, attempt, max_attempts, errors, scheduled_at, leased_until, created_at, finalized_at FROM drover_jobs
 WHERE ($1 = '' OR queue = $1)

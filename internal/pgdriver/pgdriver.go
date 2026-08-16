@@ -59,6 +59,16 @@ func (d *Driver) InsertTx(ctx context.Context, tx any, params driver.InsertParam
 	return rowFromDB(job), nil
 }
 
+// Batch-insert stubs satisfy driver.Driver until the Postgres
+// implementations land in the next commit.
+func (d *Driver) InsertMany(context.Context, []driver.InsertParams) ([]*driver.JobRow, error) {
+	panic("pgdriver: InsertMany not implemented")
+}
+
+func (d *Driver) InsertManyTx(context.Context, any, []driver.InsertParams) ([]*driver.JobRow, error) {
+	panic("pgdriver: InsertManyTx not implemented")
+}
+
 // FetchAvailable claims up to limit due jobs with FOR UPDATE SKIP
 // LOCKED, returning them in id order as running with a lease lasting
 // leaseFor, measured by the database clock.

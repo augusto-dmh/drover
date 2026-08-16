@@ -57,6 +57,14 @@ func (ns NullDroverJobState) Value() (driver.Value, error) {
 	return string(ns.DroverJobState), nil
 }
 
+type DroverInsertBatch struct {
+	Ord         int32
+	Kind        string
+	Queue       string
+	Args        []byte
+	ScheduledAt *time.Time
+}
+
 type DroverJob struct {
 	ID          int64
 	Kind        string

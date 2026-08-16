@@ -108,9 +108,9 @@ T11
 
 **Done when**:
 
-- [ ] Interface compiles with both new methods
-- [ ] Generated sqlc is committed and `sqlc generate` is drift-free
-- [ ] Staging SELECT uses the database clock for state (AD-035)
+- [x] Interface compiles with both new methods
+- [x] Generated sqlc is committed and `sqlc generate` is drift-free
+- [x] Staging SELECT uses the database clock for state (AD-035)
 
 **Tests**: none (generated/interface — implementations in T2/T3)
 **Gate**: build
