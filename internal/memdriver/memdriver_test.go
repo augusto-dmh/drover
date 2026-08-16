@@ -294,6 +294,46 @@ func TestInsertManyZeroScheduledAtIsDue(t *testing.T) {
 	}
 }
 
+func TestConcurrentInsertManyAssignsUniqueIDs(t *testing.T) {
+	t.Parallel()
+	d := New()
+	const writers = 10
+	const per = 20
+	var wg sync.WaitGroup
+	ids := make(chan int64, writers*per)
+	for range writers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			batch := make([]driver.InsertParams, per)
+			for i := range batch {
+				batch[i] = driver.InsertParams{Kind: "k", Queue: "default", Args: []byte(`{}`)}
+			}
+			rows, err := d.InsertMany(context.Background(), batch)
+			if err != nil {
+				t.Errorf("InsertMany: %v", err)
+				return
+			}
+			for _, row := range rows {
+				ids <- row.ID
+			}
+		}()
+	}
+	wg.Wait()
+	close(ids)
+
+	seen := make(map[int64]struct{}, writers*per)
+	for id := range ids {
+		if _, dup := seen[id]; dup {
+			t.Fatalf("duplicate id %d from concurrent InsertMany", id)
+		}
+		seen[id] = struct{}{}
+	}
+	if len(seen) != writers*per {
+		t.Fatalf("got %d unique ids, want %d", len(seen), writers*per)
+	}
+}
+
 func TestInsertManyTxIsUnsupported(t *testing.T) {
 	t.Parallel()
 	d := New()
