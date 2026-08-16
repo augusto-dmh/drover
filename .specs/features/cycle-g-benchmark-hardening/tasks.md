@@ -297,11 +297,11 @@ drain, p50/p95/p99. Invalid flags exit 2. Not added to GoReleaser.
 
 **Done when**:
 
-- [ ] Unit tests: missing DSN, jobs<1, batch<1, bad mode → exit 2 and no
+- [x] Unit tests: missing DSN, jobs<1, batch<1, bad mode → exit 2 and no
       insert (inject a fake runner / `open` func)
-- [ ] Methodology keys appear on a successful fake enqueue run
-- [ ] `go build ./cmd/drover-bench`
-- [ ] Quick gate green (`go test -race ./...` includes the new package)
+- [x] Methodology keys appear on a successful fake enqueue run
+- [x] `go build ./cmd/drover-bench`
+- [x] Quick gate green (`go test -race ./...` includes the new package)
 
 **Tests**: unit
 **Gate**: quick
