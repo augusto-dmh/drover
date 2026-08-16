@@ -92,13 +92,13 @@ Durable, cross-cycle. Architecture-level decisions live in `docs/adr/`; entries 
 ## Handoff
 
 - **Feature**: `cycle-g-benchmark-hardening`
-- **Phase / Task**: Specify/Design/Tasks complete; Execute starting at Phase 1 T1
+- **Phase / Task**: Execute complete (T1–T11); Verifier next
 - **Last shipped**: Cycle F (#11)
-- **In-progress**: Cycle G — batch insert (`COPY FROM`), optional `NotifyWakeup`, `cmd/drover-bench`, README table
-- **Next step**: Phase 1 T1 — driver `InsertMany` + staging SQL
+- **Completed this cycle**: `InsertMany`/`InsertManyTx` (COPY FROM), `Config.NotifyWakeup`, `cmd/drover-bench`, README benchmark table
+- **Next step**: fresh Verifier on the feature branch, then Stage 2 publish
 - **Blockers**: none
-- **Branch**: `feat/batch-insert-notify-bench` (to be created at first Execute commit)
-- **What review should look at**: COPY+staging all-or-nothing and two-`InsertManyTx`-one-tx; no prefetch (AD-022/AD-064); NOTIFY coalesced and flag-gated; LISTEN failure must not fail `Start`; Tx notify only on commit; README numbers from a real harness run
+- **Branch**: `feat/batch-insert-notify-bench`
+- **What review should look at**: COPY+staging all-or-nothing and two-`InsertManyTx`-one-tx; no prefetch (AD-022/AD-064); NOTIFY coalesced and flag-gated; LISTEN failure must not fail `Start`; Tx notify only on commit; README numbers from a real harness run (WSL2 / PG 16.14 Docker, 2026-08-15)
 - **Known weak sensors** (carried forward): neither database-clock property — lease deadlines, nor a delayed job's dueness — can be falsified while the test container and the client share a host clock
 - **Follow-up work carried forward** (recorded, not scheduled): terminal-state retention/pruning; list-query index-friendly variants; `testing/synctest` where viable; constructor panic-vs-error consistency before 1.0; deferred observability niceties from cycle E; batch completer; `go test -bench` CI job
 - **Next after this cycle**: Cycle H — Periodic jobs: cron scheduler with advisory-lock leader election; unique jobs via partial unique index. Then I (optional status page).

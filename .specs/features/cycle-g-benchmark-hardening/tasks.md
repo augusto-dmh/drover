@@ -327,10 +327,10 @@ Update `.specs/STATE.md` Handoff. Mark spec requirements Verified.
 
 **Done when**:
 
-- [ ] README table numbers match the harness output captured in the cycle
-- [ ] `go test` compiles new Examples
-- [ ] Quick gate green
-- [ ] Spec success criteria checkboxes updated
+- [x] README table numbers match the harness output captured in the cycle
+- [x] `go test` compiles new Examples
+- [x] Quick gate green
+- [x] Spec success criteria checkboxes updated
 
 **Tests**: unit (Examples)
 **Gate**: quick

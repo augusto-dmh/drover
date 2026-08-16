@@ -11,15 +11,15 @@ harness, and a README table that states methodology next to any figure.
 
 ## Goals
 
-- [ ] `Client.InsertMany` / `InsertManyTx` persist a batch atomically, with
+- [x] `Client.InsertMany` / `InsertManyTx` persist a batch atomically, with
       Postgres using `COPY FROM`, returning rows in input order.
-- [ ] Optional `Config.NotifyWakeup` interrupts idle poll sleep when new
+- [x] Optional `Config.NotifyWakeup` interrupts idle poll sleep when new
       work is committed, without replacing polling as the source of truth.
-- [ ] `cmd/drover-bench` measures enqueue throughput and drain latency
+- [x] `cmd/drover-bench` measures enqueue throughput and drain latency
       with printed methodology (hardware, Postgres version, flags).
-- [ ] README publishes a benchmark table with methodology and a command
+- [x] README publishes a benchmark table with methodology and a command
       that reproduces the run.
-- [ ] Unit coverage of batch insert and same-process wake-up via
+- [x] Unit coverage of batch insert and same-process wake-up via
       `memdriver` (no Docker required for the unit suite).
 
 ## Out of Scope
@@ -278,8 +278,8 @@ table against the harness output recorded in the cycle.
 
 ## Success Criteria
 
-- [ ] A producer can flush N jobs in one `InsertMany` / `InsertManyTx` call
-- [ ] A worker with `NotifyWakeup` starts a just-inserted job without waiting a full poll interval
-- [ ] `go run ./cmd/drover-bench --mode drain …` prints jobs/sec and percentiles with methodology
-- [ ] README table matches a real harness run and Examples compile
-- [ ] `go test -race ./...` stays Docker-free; integration covers COPY and cross-client NOTIFY
+- [x] A producer can flush N jobs in one `InsertMany` / `InsertManyTx` call
+- [x] A worker with `NotifyWakeup` starts a just-inserted job without waiting a full poll interval
+- [x] `go run ./cmd/drover-bench --mode drain …` prints jobs/sec and percentiles with methodology
+- [x] README table matches a real harness run and Examples compile
+- [x] `go test -race ./...` stays Docker-free; integration covers COPY and cross-client NOTIFY
