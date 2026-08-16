@@ -1678,6 +1678,34 @@ func TestInsertManyTxVisibilityFollowsTransaction(t *testing.T) {
 	}
 }
 
+func TestInsertManyTxOnRolledBackTransactionPersistsNothing(t *testing.T) {
+	d, pool := newDriver(t)
+	ctx := context.Background()
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+
+	_, err = d.InsertManyTx(ctx, tx, []driver.InsertParams{
+		{Kind: "k", Queue: "default", Args: []byte(`{}`)},
+	})
+	if err == nil {
+		t.Fatal("InsertManyTx error = nil, want a failure after the transaction was rolled back")
+	}
+
+	var n int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM drover_jobs`).Scan(&n); err != nil {
+		t.Fatalf("count jobs: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("drover_jobs has %d rows after a failed InsertManyTx, want 0", n)
+	}
+}
+
 func TestInsertManyTxTwiceInOneTransaction(t *testing.T) {
 	d, pool := newDriver(t)
 	ctx := context.Background()

@@ -1082,6 +1082,71 @@ func TestStartSucceedsWhenListenFails(t *testing.T) {
 	}
 }
 
+type listenDropDriver struct {
+	*memdriver.Driver
+	calls atomic.Int32
+}
+
+func (d *listenDropDriver) ListenWakeups(ctx context.Context, _ chan struct{}) error {
+	n := d.calls.Add(1)
+	if n == 1 {
+		return errors.New("listen dropped")
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// A listen session that dies after Start must be retried; the pool must
+// keep polling in the meantime. A stub that returns once and never
+// retries would still satisfy "Start succeeds when LISTEN fails".
+func TestListenReconnectsAfterDropAndKeepsPolling(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	logs := &syncWriter{}
+	mem := memdriver.New()
+	drv := &listenDropDriver{Driver: mem}
+	entered := make(chan int64, 1)
+	ws := NewWorkers()
+	Register(ws, &funcWorker{fn: func(_ context.Context, job *Job[greetArgs]) error {
+		entered <- job.ID
+		return nil
+	}})
+
+	worker := newPoolClient(drv, ws, 1, func(cfg *Config) {
+		cfg.NotifyWakeup = true
+		cfg.PollInterval = 20 * time.Millisecond
+		cfg.Logger = newTestLogger(logs)
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := worker.Start(ctx); err != nil {
+		t.Fatalf("Start: %v, want nil after a dropped LISTEN", err)
+	}
+
+	waitFor(t, func() bool { return drv.calls.Load() >= 2 }, "LISTEN to be retried after the drop")
+	waitFor(t, func() bool {
+		return strings.Contains(logs.String(), `msg="drover: listen for job notifications"`)
+	}, "LISTEN drop to be logged")
+
+	producer := newClient(mem, Config{})
+	row, err := producer.Insert(context.Background(), greetArgs{Name: "ada"}, nil)
+	if err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	select {
+	case id := <-entered:
+		if id != row.ID {
+			t.Errorf("ran job %d, want %d", id, row.ID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("job was not claimed after LISTEN dropped — the pool stopped polling")
+	}
+
+	if err := worker.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop returned %v, want nil", err)
+	}
+}
+
 // The spec's ordering is that claiming ceases before shutdown begins
 // waiting, not merely by the time it returns. Sampling twice while a
 // blocked handler holds the drain open is what tells those apart.

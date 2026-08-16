@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/goleak"
 
@@ -1171,4 +1172,59 @@ func TestFailedInsertDoesNotNudgeWhenNotifyWakeup(t *testing.T) {
 	if got := len(c.wake); got != 0 {
 		t.Errorf("wake channel length = %d, want 0 after a rejected insert", got)
 	}
+}
+
+type memTxDriver struct {
+	*memdriver.Driver
+}
+
+func (d *memTxDriver) InsertTx(ctx context.Context, _ any, params driver.InsertParams) (*driver.JobRow, error) {
+	return d.Insert(ctx, params)
+}
+
+func (d *memTxDriver) InsertManyTx(ctx context.Context, _ any, batch []driver.InsertParams) ([]*driver.JobRow, error) {
+	return d.InsertMany(ctx, batch)
+}
+
+func TestInsertTxDoesNotNudgeBeforeCommit(t *testing.T) {
+	t.Parallel()
+	c := newClient(&memTxDriver{Driver: memdriver.New()}, Config{NotifyWakeup: true})
+
+	var tx pgx.Tx
+	if _, err := c.InsertTx(context.Background(), tx, greetArgs{Name: "ada"}, nil); err != nil {
+		t.Fatalf("InsertTx: %v", err)
+	}
+	if got := len(c.wake); got != 0 {
+		t.Errorf("wake channel length = %d after InsertTx, want 0 — a local nudge would wake fetch before the caller commits", got)
+	}
+
+	if _, err := c.InsertManyTx(context.Background(), tx, []InsertItem{{Args: greetArgs{Name: "grace"}}}); err != nil {
+		t.Fatalf("InsertManyTx: %v", err)
+	}
+	if got := len(c.wake); got != 0 {
+		t.Errorf("wake channel length = %d after InsertManyTx, want 0", got)
+	}
+}
+
+type insertManyFailDriver struct {
+	*memdriver.Driver
+}
+
+func (d *insertManyFailDriver) InsertMany(context.Context, []driver.InsertParams) ([]*driver.JobRow, error) {
+	return nil, errors.New("copy failed")
+}
+
+func TestInsertManyWriteFailurePersistsNothing(t *testing.T) {
+	t.Parallel()
+	mem := memdriver.New()
+	c := newClient(&insertManyFailDriver{Driver: mem}, Config{})
+
+	_, err := c.InsertMany(context.Background(), []InsertItem{{Args: greetArgs{Name: "ada"}}})
+	if err == nil {
+		t.Fatal("InsertMany error = nil, want the driver write failure")
+	}
+	if !strings.Contains(err.Error(), "copy failed") {
+		t.Errorf("InsertMany error = %v, want it wrapped around copy failed", err)
+	}
+	assertNothingPersisted(t, mem)
 }
