@@ -63,6 +63,15 @@ Durable, cross-cycle. Architecture-level decisions live in `docs/adr/`; entries 
 | AD-055 | Database URL from `--database` or `DATABASE_URL`; no YAML config this cycle | cycle-f D-7 |
 | AD-056 | CLI enqueue takes `--kind`, optional `--queue`, and `--args` as a JSON object string | cycle-f D-8 |
 | AD-057 | GoReleaser ships multi-OS/arch archives + checksums with version ldflags; no Homebrew tap or Docker image this cycle | cycle-f D-9 |
+| AD-058 | Batch enqueue is `InsertMany`/`InsertManyTx` taking `[]InsertItem` (per-item `Args` + `*InsertOpts`) | cycle-g `context.md` D-1 |
+| AD-059 | Postgres batch insert stages via session-temp table + `COPY FROM` + `INSERT … SELECT … RETURNING`, reusing InsertJob's database-clock CASE | cycle-g D-2 |
+| AD-060 | `Config.NotifyWakeup` is opt-in (default false); polling remains the source of truth | cycle-g D-3 |
+| AD-061 | When the flag is set, the inserting Client emits one `pg_notify('drover','')` per successful Insert/InsertMany; Tx variants emit inside the caller transaction | cycle-g D-4 |
+| AD-062 | Idle fetch is woken by a capacity-1 client channel (local insert) plus an optional pgdriver LISTEN goroutine (other processes). LISTEN is not on `driver.Driver` | cycle-g D-5 |
+| AD-063 | LISTEN failure logs and degrades to poll; `Start` still succeeds. PgBouncer transaction pooling is incompatible with the flag | cycle-g D-6 |
+| AD-064 | Claim batch size stays idle-worker count (AD-022). Cycle G does not add a prefetch or FetchBatchSize knob | cycle-g D-7 |
+| AD-065 | `cmd/drover-bench` measures enqueue throughput and drain latency percentiles and prints methodology; it is not a GoReleaser artifact | cycle-g D-8 |
+| AD-066 | Empty InsertMany is success with no write; `memdriver.InsertManyTx` returns `ErrTxUnsupported` | cycle-g D-9 |
 
 **Amended by cycle C:** AD-018 is generalised, not superseded — the heartbeat now stops after the last *pool worker* drains rather than after the fetch loop returns. Same principle, wider scope.
 
@@ -82,8 +91,14 @@ Durable, cross-cycle. Architecture-level decisions live in `docs/adr/`; entries 
 
 ## Handoff
 
-- **Last shipped**: Cycle F (#11) — exported `Inspector`, `cmd/drover` (`stats`, `jobs list`, `retry`, `cancel`, `enqueue`), GoReleaser, and ship/finalize commit gates that require scoped subjects and reject AI attribution trailers. `main` is green.
-- **What review should look at (for later cycles)**: operator writes stay state-conditioned (not lease-fenced); redrive resets attempt and keeps errors; cancel refuses `running`; ListJobs OR filters still skip partial indexes (deferred from #11 triage); terminal rows still accumulate with no retention story.
-- **Known weak sensors** (carried forward): neither database-clock property — lease deadlines, nor a delayed job's dueness — can be falsified while the test container and the client share a host clock.
-- **Follow-up work carried forward** (recorded, not scheduled): terminal-state retention/pruning; batch shutdown hand-back (Cycle G); list-query index-friendly variants; `testing/synctest` where viable; constructor panic-vs-error consistency before 1.0; deferred observability niceties from cycle E handoff.
-- **Next**: Cycle G — Benchmark + hardening: `cmd/drover-bench`, batch insert (`COPY FROM`), fetch tuning (batch claim, poll interval, optional `LISTEN/NOTIFY`), README benchmark table with published methodology. Then H (periodic jobs), I (optional status page).
+- **Feature**: `cycle-g-benchmark-hardening`
+- **Phase / Task**: Specify/Design/Tasks complete; Execute starting at Phase 1 T1
+- **Last shipped**: Cycle F (#11)
+- **In-progress**: Cycle G — batch insert (`COPY FROM`), optional `NotifyWakeup`, `cmd/drover-bench`, README table
+- **Next step**: Phase 1 T1 — driver `InsertMany` + staging SQL
+- **Blockers**: none
+- **Branch**: `feat/batch-insert-notify-bench` (to be created at first Execute commit)
+- **What review should look at**: COPY+staging all-or-nothing and two-`InsertManyTx`-one-tx; no prefetch (AD-022/AD-064); NOTIFY coalesced and flag-gated; LISTEN failure must not fail `Start`; Tx notify only on commit; README numbers from a real harness run
+- **Known weak sensors** (carried forward): neither database-clock property — lease deadlines, nor a delayed job's dueness — can be falsified while the test container and the client share a host clock
+- **Follow-up work carried forward** (recorded, not scheduled): terminal-state retention/pruning; list-query index-friendly variants; `testing/synctest` where viable; constructor panic-vs-error consistency before 1.0; deferred observability niceties from cycle E; batch completer; `go test -bench` CI job
+- **Next after this cycle**: Cycle H — Periodic jobs: cron scheduler with advisory-lock leader election; unique jobs via partial unique index. Then I (optional status page).
