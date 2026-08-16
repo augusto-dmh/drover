@@ -59,14 +59,84 @@ func (d *Driver) InsertTx(ctx context.Context, tx any, params driver.InsertParam
 	return rowFromDB(job), nil
 }
 
-// Batch-insert stubs satisfy driver.Driver until the Postgres
-// implementations land in the next commit.
-func (d *Driver) InsertMany(context.Context, []driver.InsertParams) ([]*driver.JobRow, error) {
-	panic("pgdriver: InsertMany not implemented")
+// InsertMany persists every job in batch in one transaction, loading
+// rows through COPY FROM a session-temp staging table. An empty or nil
+// batch is success with no write.
+func (d *Driver) InsertMany(ctx context.Context, batch []driver.InsertParams) ([]*driver.JobRow, error) {
+	if len(batch) == 0 {
+		return []*driver.JobRow{}, nil
+	}
+	tx, err := d.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin insert many: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+
+	rows, err := d.insertMany(ctx, tx, batch)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit insert many: %w", err)
+	}
+	return rows, nil
 }
 
-func (d *Driver) InsertManyTx(context.Context, any, []driver.InsertParams) ([]*driver.JobRow, error) {
-	panic("pgdriver: InsertManyTx not implemented")
+// InsertManyTx is InsertMany inside the caller's pgx.Tx, so the jobs
+// exist if and only if that transaction commits.
+func (d *Driver) InsertManyTx(ctx context.Context, tx any, batch []driver.InsertParams) ([]*driver.JobRow, error) {
+	pgxTx, ok := tx.(pgx.Tx)
+	if !ok {
+		return nil, fmt.Errorf("pgdriver: tx is %T, want pgx.Tx: %w", tx, driver.ErrTxUnsupported)
+	}
+	if len(batch) == 0 {
+		return []*driver.JobRow{}, nil
+	}
+	return d.insertMany(ctx, pgxTx, batch)
+}
+
+const insertBatchDDL = `
+CREATE TEMP TABLE IF NOT EXISTS drover_insert_batch (
+	ord int NOT NULL,
+	kind text NOT NULL,
+	queue text NOT NULL,
+	args jsonb NOT NULL,
+	scheduled_at timestamptz
+) ON COMMIT DROP`
+
+func (d *Driver) insertMany(ctx context.Context, tx pgx.Tx, batch []driver.InsertParams) ([]*driver.JobRow, error) {
+	if _, err := tx.Exec(ctx, insertBatchDDL); err != nil {
+		return nil, fmt.Errorf("create insert-many staging table: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `TRUNCATE drover_insert_batch`); err != nil {
+		return nil, fmt.Errorf("truncate insert-many staging table: %w", err)
+	}
+
+	rows := make([][]any, len(batch))
+	for i, params := range batch {
+		var scheduledAt any
+		if !params.ScheduledAt.IsZero() {
+			scheduledAt = params.ScheduledAt
+		}
+		rows[i] = []any{i, params.Kind, params.Queue, params.Args, scheduledAt}
+	}
+	if _, err := tx.CopyFrom(ctx,
+		pgx.Identifier{"drover_insert_batch"},
+		[]string{"ord", "kind", "queue", "args", "scheduled_at"},
+		pgx.CopyFromRows(rows),
+	); err != nil {
+		return nil, fmt.Errorf("copy insert-many batch: %w", err)
+	}
+
+	jobs, err := d.queries.WithTx(tx).InsertJobsFromStaging(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("insert many jobs from staging: %w", err)
+	}
+	out := make([]*driver.JobRow, len(jobs))
+	for i, job := range jobs {
+		out[i] = rowFromDB(job)
+	}
+	return out, nil
 }
 
 // FetchAvailable claims up to limit due jobs with FOR UPDATE SKIP

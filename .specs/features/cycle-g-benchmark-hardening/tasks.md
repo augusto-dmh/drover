@@ -153,11 +153,11 @@ persist.
 
 **Done when**:
 
-- [ ] Integration tests: N rows from one call, input order, scheduled vs
+- [x] Integration tests: N rows from one call, input order, scheduled vs
       available via DB clock, rollback of `InsertManyTx`, two
       `InsertManyTx` in one tx, empty batch
-- [ ] The implementation calls `CopyFrom` (not a loop of `InsertJob`)
-- [ ] Full gate green
+- [x] The implementation calls `CopyFrom` (not a loop of `InsertJob`)
+- [x] Full gate green
 
 **Tests**: integration
 **Gate**: full
