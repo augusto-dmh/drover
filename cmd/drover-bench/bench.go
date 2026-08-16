@@ -44,16 +44,27 @@ func newNoopWorker(jobs int, insertedAt map[int64]time.Time) *noopWorker {
 }
 
 func (w *noopWorker) Work(_ context.Context, job *drover.Job[noopArgs]) error {
-	if start, ok := w.insertedAt[job.ID]; ok {
-		i := int(w.latN.Add(1) - 1)
-		if i >= 0 && i < len(w.latencies) {
-			w.latencies[i] = time.Since(start)
-		}
+	start, ok := w.insertedAt[job.ID]
+	if !ok {
+		return nil
+	}
+	i := int(w.latN.Add(1) - 1)
+	if i >= 0 && i < len(w.latencies) {
+		w.latencies[i] = time.Since(start)
 	}
 	if w.done.Add(1) == w.target {
 		close(w.allDone)
 	}
 	return nil
+}
+
+func waitDrain(ctx context.Context, allDone <-chan struct{}) error {
+	select {
+	case <-allDone:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func defaultExecute(ctx context.Context, cfg benchConfig) (benchOutcome, error) {
@@ -110,7 +121,12 @@ func defaultExecute(ctx context.Context, cfg benchConfig) (benchOutcome, error) 
 		return benchOutcome{}, fmt.Errorf("start: %w", err)
 	}
 	drainStart := time.Now()
-	<-worker.allDone
+	if err := waitDrain(ctx, worker.allDone); err != nil {
+		if stopErr := client.Stop(context.Background()); stopErr != nil {
+			return benchOutcome{}, fmt.Errorf("drain: %w (stop: %w)", err, stopErr)
+		}
+		return benchOutcome{}, fmt.Errorf("drain: %w", err)
+	}
 	out.elapsed = time.Since(drainStart)
 	out.latencies = append([]time.Duration(nil), worker.latencies...)
 	if err := client.Stop(ctx); err != nil {

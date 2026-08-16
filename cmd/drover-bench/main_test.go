@@ -122,7 +122,7 @@ func TestEnqueueMethodologyKeys(t *testing.T) {
 		"batch=56",
 		"concurrency=7",
 		"handlers=no-op",
-		"jobs/sec=",
+		"jobs/sec=617.00",
 	}
 	for _, key := range keys {
 		if !strings.Contains(out, key) {
@@ -160,9 +160,9 @@ func TestDatabaseURLFallbackRuns(t *testing.T) {
 
 func TestDrainPrintsJobsPerSecAndPercentiles(t *testing.T) {
 	t.Parallel()
-	lats := make([]time.Duration, 10)
+	lats := make([]time.Duration, 100)
 	for i := range lats {
-		lats[i] = 3 * time.Millisecond
+		lats[i] = time.Duration(i+1) * time.Millisecond
 	}
 	exec := func(context.Context, benchConfig) (benchOutcome, error) {
 		return benchOutcome{
@@ -180,7 +180,7 @@ func TestDrainPrintsJobsPerSecAndPercentiles(t *testing.T) {
 		t.Fatalf("exit %d, stderr=%q", code, stderr.String())
 	}
 	out := stdout.String()
-	for _, key := range []string{"jobs/sec=", "p50=3ms", "p95=3ms", "p99=3ms", "handlers=no-op"} {
+	for _, key := range []string{"jobs/sec=10.00", "p50=50ms", "p95=95ms", "p99=99ms", "handlers=no-op"} {
 		if !strings.Contains(out, key) {
 			t.Errorf("stdout missing %q:\n%s", key, out)
 		}

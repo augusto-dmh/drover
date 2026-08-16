@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -81,34 +83,75 @@ func TestInsertManyChunksOfBatch(t *testing.T) {
 
 func TestNoopWorkerSignalsWhenAllJobsComplete(t *testing.T) {
 	t.Parallel()
-	start := time.Now().Add(-20 * time.Millisecond)
-	insertedAt := map[int64]time.Time{1: start, 2: start}
-	w := newNoopWorker(2, insertedAt)
+	const n = 32
+	start := time.Now().Add(-50 * time.Millisecond)
+	insertedAt := make(map[int64]time.Time, n)
+	for id := int64(1); id <= n; id++ {
+		insertedAt[id] = start
+	}
+	w := newNoopWorker(n, insertedAt)
 
-	if err := w.Work(context.Background(), &drover.Job[noopArgs]{ID: 1}); err != nil {
-		t.Fatalf("Work(1): %v", err)
+	var wg sync.WaitGroup
+	for id := int64(1); id <= n; id++ {
+		wg.Add(1)
+		go func(id int64) {
+			defer wg.Done()
+			if err := w.Work(context.Background(), &drover.Job[noopArgs]{ID: id}); err != nil {
+				t.Errorf("Work(%d): %v", id, err)
+			}
+		}(id)
 	}
-	select {
-	case <-w.allDone:
-		t.Fatal("signaled complete after 1 of 2 jobs")
-	default:
-	}
+	wg.Wait()
 
-	if err := w.Work(context.Background(), &drover.Job[noopArgs]{ID: 2}); err != nil {
-		t.Fatalf("Work(2): %v", err)
-	}
 	select {
 	case <-w.allDone:
 	default:
 		t.Fatal("want complete after every job returned")
 	}
 
-	if len(w.latencies) != 2 {
-		t.Fatalf("recorded %d latencies, want 2", len(w.latencies))
+	if len(w.latencies) != n {
+		t.Fatalf("recorded %d latencies, want %d", len(w.latencies), n)
 	}
 	for i, lat := range w.latencies {
-		if lat < 20*time.Millisecond {
-			t.Errorf("latency[%d]=%s, want enqueue-to-completion from insert time (>=20ms)", i, lat)
+		if lat < 50*time.Millisecond {
+			t.Errorf("latency[%d]=%s, want enqueue-to-completion from insert time (>=50ms)", i, lat)
 		}
+		if lat > 500*time.Millisecond {
+			t.Errorf("latency[%d]=%s, want bounded enqueue-to-completion (<=500ms)", i, lat)
+		}
+	}
+}
+
+func TestNoopWorkerIgnoresJobsNotInsertedThisRun(t *testing.T) {
+	t.Parallel()
+	start := time.Now()
+	w := newNoopWorker(1, map[int64]time.Time{1: start})
+
+	if err := w.Work(context.Background(), &drover.Job[noopArgs]{ID: 99}); err != nil {
+		t.Fatalf("Work(leftover): %v", err)
+	}
+	select {
+	case <-w.allDone:
+		t.Fatal("leftover job must not count toward this run")
+	default:
+	}
+
+	if err := w.Work(context.Background(), &drover.Job[noopArgs]{ID: 1}); err != nil {
+		t.Fatalf("Work(1): %v", err)
+	}
+	select {
+	case <-w.allDone:
+	default:
+		t.Fatal("want complete after this run's job returned")
+	}
+}
+
+func TestWaitDrainHonoursContext(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := waitDrain(ctx, make(chan struct{}))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("waitDrain = %v, want context.Canceled", err)
 	}
 }
