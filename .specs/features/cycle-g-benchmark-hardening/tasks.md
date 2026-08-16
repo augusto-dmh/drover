@@ -128,12 +128,12 @@ no-op success.
 
 **Done when**:
 
-- [ ] Tests cover empty batch, mixed queues, future vs due `ScheduledAt`,
+- [x] Tests cover empty batch, mixed queues, future vs due `ScheduledAt`,
       all-or-nothing (if the driver is asked to insert after a bad params
       slice it must not keep a prefix — client validation is T5, but the
       driver still no-ops on empty)
-- [ ] `InsertManyTx` is `errors.Is(..., ErrTxUnsupported)`
-- [ ] Quick gate green
+- [x] `InsertManyTx` is `errors.Is(..., ErrTxUnsupported)`
+- [x] Quick gate green
 
 **Tests**: unit
 **Gate**: quick
