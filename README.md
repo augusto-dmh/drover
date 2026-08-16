@@ -167,7 +167,7 @@ Validate the config locally with `goreleaser check`. Snapshot builds without pub
 
 Numbers from one run of `cmd/drover-bench` on 2026-08-15. They are not a promise: they describe no-op handlers on a single node. Re-run the harness on your hardware before comparing.
 
-**Machine**: WSL2, Linux 6.6, Intel Core 7 240H (16 logical CPUs), Go 1.26.2. **Postgres**: 16.14 in Docker (`postgres:16-alpine`) on the same host. **Workload**: 10,000 no-op jobs, `InsertMany` batch 256, drain concurrency 10, `NotifyWakeup` off, queue `default`.
+**Machine**: WSL2, Linux 6.6 (`GOOS=linux`, `GOARCH=amd64`), Intel Core 7 240H (16 logical CPUs), Go 1.26.2. **Postgres**: 16.14 in Docker (`postgres:16-alpine`) on the same host. **Workload**: 10,000 no-op jobs, `InsertMany` batch 256, drain concurrency 10, `NotifyWakeup` off, queue `default`.
 
 | Mode | jobs/sec | p50 | p95 | p99 |
 | --- | ---: | ---: | ---: | ---: |
