@@ -229,10 +229,23 @@ func startNotifyWorker(t *testing.T, pool *pgxpool.Pool, entered chan int64) *Cl
 	if err := c.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	// Fetch idles on the first empty round; LISTEN needs the dedicated
-	// connection sitting in WaitForNotification before a NOTIFY can land.
-	time.Sleep(300 * time.Millisecond)
+	// Fetch idles on the first empty round; LISTEN must be registered
+	// before a NOTIFY can land — Postgres does not queue it.
+	waitUntilListening(t, pool)
 	return c
+}
+
+func waitUntilListening(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	waitFor(t, func() bool {
+		var n int
+		err := pool.QueryRow(context.Background(), `
+			SELECT count(*) FROM pg_stat_activity
+			WHERE datname = current_database()
+			  AND query ILIKE 'LISTEN drover%'
+		`).Scan(&n)
+		return err == nil && n > 0
+	}, "the worker to LISTEN on drover")
 }
 
 func TestNotifyWakeupCrossClientInsertRunsBeforePollInterval(t *testing.T) {

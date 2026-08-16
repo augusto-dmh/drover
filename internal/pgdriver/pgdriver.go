@@ -96,9 +96,12 @@ func (d *Driver) InsertManyTx(ctx context.Context, tx any, batch []driver.Insert
 }
 
 const (
-	droverListenSQL   = `LISTEN drover`
-	droverUnlistenSQL = `UNLISTEN drover`
-	droverNotifySQL   = `SELECT pg_notify('drover', '')`
+	droverListenSQL          = `LISTEN drover`
+	droverUnlistenSQL        = `UNLISTEN drover`
+	droverNotifySQL          = `SELECT pg_notify('drover', '')`
+	droverNotifySavepointSQL = `SAVEPOINT drover_notify`
+	droverNotifyRollbackSQL  = `ROLLBACK TO SAVEPOINT drover_notify`
+	droverNotifyReleaseSQL   = `RELEASE SAVEPOINT drover_notify`
 )
 
 // Notify emits one coalesced wake-up on the drover channel. Callers that
@@ -111,14 +114,22 @@ func (d *Driver) Notify(ctx context.Context) error {
 }
 
 // NotifyTx emits the wake-up inside the caller's transaction, so
-// listeners fire only if that transaction commits.
-func (d *Driver) NotifyTx(ctx context.Context, tx any) error {
-	pgxTx, ok := tx.(pgx.Tx)
-	if !ok {
-		return fmt.Errorf("pgdriver: tx is %T, want pgx.Tx: %w", tx, driver.ErrTxUnsupported)
+// listeners fire only if that transaction commits. The notify runs
+// under a savepoint: a statement error must not abort the caller's
+// insert.
+func (d *Driver) NotifyTx(ctx context.Context, tx pgx.Tx) error {
+	if _, err := tx.Exec(ctx, droverNotifySavepointSQL); err != nil {
+		return fmt.Errorf("notify drover savepoint: %w", err)
 	}
-	if _, err := pgxTx.Exec(ctx, droverNotifySQL); err != nil {
+	if _, err := tx.Exec(ctx, droverNotifySQL); err != nil {
+		rollbackCtx := context.WithoutCancel(ctx)
+		if _, rbErr := tx.Exec(rollbackCtx, droverNotifyRollbackSQL); rbErr != nil {
+			return fmt.Errorf("notify drover in tx: %w (rollback savepoint: %w)", err, rbErr)
+		}
 		return fmt.Errorf("notify drover in tx: %w", err)
+	}
+	if _, err := tx.Exec(ctx, droverNotifyReleaseSQL); err != nil {
+		return fmt.Errorf("notify drover release savepoint: %w", err)
 	}
 	return nil
 }

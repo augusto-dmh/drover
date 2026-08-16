@@ -449,7 +449,7 @@ func (c *Client) InsertManyTx(ctx context.Context, tx pgx.Tx, items []InsertItem
 // It is not on driver.Driver: memdriver has no session to listen on.
 type notifier interface {
 	Notify(ctx context.Context) error
-	NotifyTx(ctx context.Context, tx any) error
+	NotifyTx(ctx context.Context, tx pgx.Tx) error
 }
 
 // wakeupListener is the optional pgdriver surface that waits on Postgres
@@ -501,7 +501,7 @@ func insertParamsForMany(items []InsertItem) ([]driver.InsertParams, error) {
 	for i, item := range items {
 		params, err := insertParamsFor(item.Args, item.Opts)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("item %d: %w", i, err)
 		}
 		batch[i] = params
 	}

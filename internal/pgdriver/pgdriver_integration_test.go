@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/augusto-dmh/drover/internal/driver"
@@ -1870,6 +1871,56 @@ func TestNotifyTxDeliversOnlyOnCommit(t *testing.T) {
 	}
 	if n.Channel != "drover" {
 		t.Errorf("channel = %q, want drover", n.Channel)
+	}
+}
+
+// notifyFailTx lets SAVEPOINT/ROLLBACK reach Postgres but replaces
+// pg_notify with a statement error so the savepoint must absorb it.
+type notifyFailTx struct {
+	pgx.Tx
+}
+
+func (t notifyFailTx) Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error) {
+	if strings.Contains(sql, "pg_notify") {
+		return t.Tx.Exec(ctx, "SELECT 1/0")
+	}
+	return t.Tx.Exec(ctx, sql, arguments...)
+}
+
+func TestNotifyTxFailureDoesNotAbortCallerTransaction(t *testing.T) {
+	t.Parallel()
+	d, pool := newDriver(t)
+	ctx := context.Background()
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // commit path succeeds; rollback after commit is a no-op
+
+	row, err := d.InsertTx(ctx, tx, driver.InsertParams{
+		Kind:  "k",
+		Queue: "default",
+		Args:  []byte(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("InsertTx: %v", err)
+	}
+
+	if err := d.NotifyTx(ctx, notifyFailTx{Tx: tx}); err == nil {
+		t.Fatal("NotifyTx error = nil, want the injected statement failure")
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("Commit after notify failure: %v — notify must not abort the caller transaction", err)
+	}
+
+	got, err := d.GetJob(ctx, row.ID)
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if got == nil || got.ID != row.ID {
+		t.Fatalf("job %d missing after commit; notify failure rolled back the insert", row.ID)
 	}
 }
 

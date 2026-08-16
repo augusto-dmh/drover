@@ -471,6 +471,9 @@ func TestInsertManyRejectsInvalidItems(t *testing.T) {
 				tt.bad,
 			})
 			tt.want(t, err)
+			if err != nil && !strings.Contains(err.Error(), "item 1:") {
+				t.Errorf("error = %q, want it to name item 1", err)
+			}
 			assertNothingPersisted(t, mem)
 		})
 	}
@@ -1217,7 +1220,7 @@ func (d *insertManyFailDriver) InsertMany(context.Context, []driver.InsertParams
 func TestInsertManyWriteFailurePersistsNothing(t *testing.T) {
 	t.Parallel()
 	mem := memdriver.New()
-	c := newClient(&insertManyFailDriver{Driver: mem}, Config{})
+	c := newClient(&insertManyFailDriver{Driver: mem}, Config{NotifyWakeup: true})
 
 	_, err := c.InsertMany(context.Background(), []InsertItem{{Args: greetArgs{Name: "ada"}}})
 	if err == nil {
@@ -1225,6 +1228,9 @@ func TestInsertManyWriteFailurePersistsNothing(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "copy failed") {
 		t.Errorf("InsertMany error = %v, want it wrapped around copy failed", err)
+	}
+	if got := len(c.wake); got != 0 {
+		t.Errorf("wake channel length = %d, want 0 after a failed InsertMany", got)
 	}
 	assertNothingPersisted(t, mem)
 }
