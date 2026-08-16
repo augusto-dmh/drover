@@ -901,6 +901,128 @@ func TestStopDoesNotWaitOutThePollInterval(t *testing.T) {
 	}
 }
 
+const (
+	notifyWakePollInterval = 3 * time.Second
+	notifyWakeUpperBound   = time.Second
+	notifyWakeQuietWindow  = 150 * time.Millisecond
+)
+
+// With NotifyWakeup, a same-client insert must resume idle fetch before
+// PollInterval elapses. The sensor is elapsed time, not a fetch-count
+// lower bound: a busy loop would satisfy a "at least one more fetch"
+// check without ever waiting.
+func TestNotifyWakeupClaimsInsertBeforePollInterval(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	counting := &countingDriver{Driver: memdriver.New()}
+	entered := make(chan int64, 1)
+	ws := NewWorkers()
+	Register(ws, &funcWorker{fn: func(_ context.Context, job *Job[greetArgs]) error {
+		entered <- job.ID
+		return nil
+	}})
+
+	c := newPoolClient(counting, ws, 1, func(cfg *Config) {
+		cfg.PollInterval = notifyWakePollInterval
+		cfg.NotifyWakeup = true
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	waitFor(t, func() bool { return counting.fetches.Load() > 0 }, "the pool to reach its idle wait")
+
+	start := time.Now()
+	row, err := c.Insert(context.Background(), greetArgs{Name: "ada"}, nil)
+	if err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	select {
+	case id := <-entered:
+		if id != row.ID {
+			t.Errorf("ran job %d, want %d", id, row.ID)
+		}
+	case <-time.After(notifyWakeUpperBound):
+		t.Fatalf("job was not claimed within %v against a %v poll interval", notifyWakeUpperBound, notifyWakePollInterval)
+	}
+	if elapsed := time.Since(start); elapsed > notifyWakeUpperBound {
+		t.Errorf("claim took %v against a %v poll interval — idle fetch waited out the timer", elapsed, notifyWakePollInterval)
+	}
+
+	if err := c.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop returned %v, want nil", err)
+	}
+}
+
+// Flag off: an insert must not resume idle fetch. A short observation
+// window well under PollInterval is what kills both an always-nudge
+// implementation and a busy loop that never sleeps.
+func TestNotifyWakeupOffDoesNotWakeFetchOnInsert(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	counting := &countingDriver{Driver: memdriver.New()}
+	ws := NewWorkers()
+	Register(ws, &funcWorker{fn: func(context.Context, *Job[greetArgs]) error { return nil }})
+
+	c := newPoolClient(counting, ws, 1, func(cfg *Config) {
+		cfg.PollInterval = notifyWakePollInterval
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	waitFor(t, func() bool { return counting.fetches.Load() > 0 }, "the pool to reach its idle wait")
+
+	before := counting.fetches.Load()
+	row, err := c.Insert(context.Background(), greetArgs{Name: "ada"}, nil)
+	if err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	time.Sleep(notifyWakeQuietWindow)
+	if got := counting.fetches.Load(); got != before {
+		t.Errorf("FetchAvailable count went from %d to %d after Insert with NotifyWakeup unset; idle fetch must not resume until the poll interval", before, got)
+	}
+	stored, ok := counting.Row(row.ID)
+	if !ok {
+		t.Fatal("inserted job missing")
+	}
+	if stored.State != "available" {
+		t.Errorf("job state = %q, want available — a wake claimed it before the poll interval", stored.State)
+	}
+
+	if err := c.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop returned %v, want nil", err)
+	}
+}
+
+// The wake arm must not delay shutdown: Stop still interrupts an idle
+// wait when NotifyWakeup is on.
+func TestStopDoesNotWaitOutThePollIntervalWithNotifyWakeup(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	counting := &countingDriver{Driver: memdriver.New()}
+	c := newPoolClient(counting, NewWorkers(), 2, func(cfg *Config) {
+		cfg.PollInterval = notifyWakePollInterval
+		cfg.NotifyWakeup = true
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	waitFor(t, func() bool { return counting.fetches.Load() > 0 }, "the pool to reach its idle wait")
+
+	start := time.Now()
+	if err := c.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop returned %v, want nil", err)
+	}
+	if elapsed := time.Since(start); elapsed > notifyWakeUpperBound {
+		t.Errorf("Stop took %v against a %v poll interval — shutdown waited out an idle tick", elapsed, notifyWakePollInterval)
+	}
+}
+
 // The spec's ordering is that claiming ceases before shutdown begins
 // waiting, not merely by the time it returns. Sampling twice while a
 // blocked handler holds the drain open is what tells those apart.

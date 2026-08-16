@@ -229,14 +229,14 @@ must still wait the timer (existing poll tests remain valid).
 
 **Done when**:
 
-- [ ] With a long `PollInterval` and `NotifyWakeup`, a same-client
+- [x] With a long `PollInterval` and `NotifyWakeup`, a same-client
       `Insert` after `Start` is claimed in well under the interval
       (elapsed-time **upper bound**)
-- [ ] `Stop` during idle wait still does not wait out `PollInterval`
-- [ ] Flag false: no wake on insert (job is claimed only after a poll;
+- [x] `Stop` during idle wait still does not wait out `PollInterval`
+- [x] Flag false: no wake on insert (job is claimed only after a poll;
       use a fake clock or a long interval plus a short observation window)
-- [ ] goleak on the new path
-- [ ] Quick gate green
+- [x] goleak on the new path
+- [x] Quick gate green
 
 **Tests**: unit
 **Gate**: quick

@@ -130,6 +130,9 @@ func TestConfigZeroValuesGetDefaults(t *testing.T) {
 	if c.pollInterval != time.Second {
 		t.Errorf("PollInterval default = %v, want 1s", c.pollInterval)
 	}
+	if c.notifyWakeup {
+		t.Error("NotifyWakeup default is true, want false")
+	}
 	if c.workers == nil {
 		t.Error("Workers default is nil, want empty registry")
 	}
@@ -1107,5 +1110,65 @@ func TestStopJoinsOpsServer(t *testing.T) {
 
 	if err := c.Stop(context.Background()); err != nil {
 		t.Fatalf("Stop: %v", err)
+	}
+}
+
+func TestNotifyWakeupCoalescesLocalNudges(t *testing.T) {
+	t.Parallel()
+	c := newClient(memdriver.New(), Config{NotifyWakeup: true})
+
+	for i := 0; i < 32; i++ {
+		if _, err := c.Insert(context.Background(), greetArgs{Name: "ada"}, nil); err != nil {
+			t.Fatalf("Insert %d: %v", i, err)
+		}
+	}
+	if _, err := c.InsertMany(context.Background(), []InsertItem{{Args: greetArgs{Name: "grace"}}}); err != nil {
+		t.Fatalf("InsertMany: %v", err)
+	}
+	if got := len(c.wake); got != 1 {
+		t.Errorf("wake channel length = %d, want 1 (extra wakes must coalesce)", got)
+	}
+}
+
+func TestNotifyWakeupOffDoesNotNudge(t *testing.T) {
+	t.Parallel()
+	c := newClient(memdriver.New(), Config{})
+
+	if _, err := c.Insert(context.Background(), greetArgs{Name: "ada"}, nil); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	if _, err := c.InsertMany(context.Background(), []InsertItem{{Args: greetArgs{Name: "grace"}}}); err != nil {
+		t.Fatalf("InsertMany: %v", err)
+	}
+	if got := len(c.wake); got != 0 {
+		t.Errorf("wake channel length = %d, want 0 when NotifyWakeup is unset", got)
+	}
+}
+
+func TestEmptyInsertManyDoesNotNudgeWhenNotifyWakeup(t *testing.T) {
+	t.Parallel()
+	c := newClient(memdriver.New(), Config{NotifyWakeup: true})
+
+	rows, err := c.InsertMany(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("InsertMany: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("InsertMany returned %d rows, want 0", len(rows))
+	}
+	if got := len(c.wake); got != 0 {
+		t.Errorf("wake channel length = %d, want 0 after an empty batch", got)
+	}
+}
+
+func TestFailedInsertDoesNotNudgeWhenNotifyWakeup(t *testing.T) {
+	t.Parallel()
+	c := newClient(memdriver.New(), Config{NotifyWakeup: true})
+
+	if _, err := c.Insert(context.Background(), emptyKindArgs{}, nil); !errors.Is(err, ErrInvalidKind) {
+		t.Fatalf("Insert error = %v, want ErrInvalidKind", err)
+	}
+	if got := len(c.wake); got != 0 {
+		t.Errorf("wake channel length = %d, want 0 after a rejected insert", got)
 	}
 }

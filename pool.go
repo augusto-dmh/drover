@@ -561,14 +561,17 @@ func (r *runner) stopping() bool {
 }
 
 // sleep waits one poll interval, reporting false when shutdown began
-// first so a stopping pool never sits out an idle tick.
+// first so a stopping pool never sits out an idle tick. A local insert
+// (or a LISTEN wake) can end the wait early; stop still wins if both
+// are ready, so a flooded wake channel cannot delay shutdown.
 func (r *runner) sleep() bool {
 	timer := time.NewTimer(r.client.pollInterval)
 	defer timer.Stop()
 	select {
 	case <-r.stopFetch:
 		return false
+	case <-r.client.wake:
 	case <-timer.C:
-		return true
 	}
+	return !r.stopping()
 }
