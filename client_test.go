@@ -15,6 +15,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/goleak"
 
+	"github.com/augusto-dmh/drover/internal/driver"
 	"github.com/augusto-dmh/drover/internal/memdriver"
 )
 
@@ -324,6 +325,276 @@ func TestInsertOptsChooseQueueAndSchedule(t *testing.T) {
 				t.Errorf("ScheduledAt = %v, want a job due now", row.ScheduledAt)
 			}
 		})
+	}
+}
+
+func TestInsertManyPersistsTypedJobs(t *testing.T) {
+	t.Parallel()
+	mem := memdriver.New()
+	c := newClient(mem, Config{})
+
+	items := []InsertItem{
+		{Args: greetArgs{Name: "ada"}},
+		{Args: greetArgs{Name: "grace"}},
+		{Args: greetArgs{Name: "barbara"}},
+	}
+	rows, err := c.InsertMany(context.Background(), items)
+	if err != nil {
+		t.Fatalf("InsertMany: %v", err)
+	}
+	if len(rows) != len(items) {
+		t.Fatalf("InsertMany returned %d rows, want %d", len(rows), len(items))
+	}
+
+	wantArgs := []string{`{"name":"ada"}`, `{"name":"grace"}`, `{"name":"barbara"}`}
+	seen := make(map[int64]struct{}, len(rows))
+	for i, row := range rows {
+		if row.ID <= 0 {
+			t.Errorf("row %d ID = %d, want a positive id", i, row.ID)
+		}
+		if _, dup := seen[row.ID]; dup {
+			t.Errorf("row %d ID %d is not distinct", i, row.ID)
+		}
+		seen[row.ID] = struct{}{}
+		if row.Kind != "greet" {
+			t.Errorf("row %d Kind = %q, want greet", i, row.Kind)
+		}
+		if row.Queue != "default" {
+			t.Errorf("row %d Queue = %q, want default", i, row.Queue)
+		}
+		if row.State != StateAvailable {
+			t.Errorf("row %d State = %q, want %q", i, row.State, StateAvailable)
+		}
+		if string(row.Args) != wantArgs[i] {
+			t.Errorf("row %d Args = %s, want %s", i, row.Args, wantArgs[i])
+		}
+		stored, ok := mem.Row(row.ID)
+		if !ok || stored.State != "available" {
+			t.Errorf("stored row %d missing or not available: %+v", row.ID, stored)
+		}
+	}
+
+	claimed, err := mem.FetchAvailable(context.Background(), "default", time.Minute, 10)
+	if err != nil {
+		t.Fatalf("FetchAvailable: %v", err)
+	}
+	if len(claimed) != len(items) {
+		t.Fatalf("FetchAvailable claimed %d jobs, want %d", len(claimed), len(items))
+	}
+}
+
+func TestInsertManyEmptyOrNilWritesNothing(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name  string
+		items []InsertItem
+	}{
+		{name: "nil slice", items: nil},
+		{name: "empty slice", items: []InsertItem{}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			mem := memdriver.New()
+			c := newClient(mem, Config{})
+
+			rows, err := c.InsertMany(context.Background(), tt.items)
+			if err != nil {
+				t.Fatalf("InsertMany: %v", err)
+			}
+			if rows == nil {
+				t.Fatal("got nil result, want an empty slice")
+			}
+			if len(rows) != 0 {
+				t.Fatalf("got %d rows, want 0", len(rows))
+			}
+			assertNothingPersisted(t, mem)
+		})
+	}
+}
+
+func TestInsertManyRejectsInvalidItems(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		bad  InsertItem
+		want func(*testing.T, error)
+	}{
+		{
+			name: "nil Args",
+			bad:  InsertItem{Args: nil},
+			want: func(t *testing.T, err error) {
+				t.Helper()
+				if !errors.Is(err, ErrInvalidKind) {
+					t.Fatalf("error = %v, want ErrInvalidKind", err)
+				}
+			},
+		},
+		{
+			name: "empty kind",
+			bad:  InsertItem{Args: emptyKindArgs{}},
+			want: func(t *testing.T, err error) {
+				t.Helper()
+				if !errors.Is(err, ErrInvalidKind) {
+					t.Fatalf("error = %v, want ErrInvalidKind", err)
+				}
+			},
+		},
+		{
+			name: "marshal failure",
+			bad:  InsertItem{Args: badArgs{}},
+			want: func(t *testing.T, err error) {
+				t.Helper()
+				if err == nil {
+					t.Fatal("InsertMany succeeded with unmarshalable args")
+				}
+				if !strings.Contains(err.Error(), `kind "bad"`) {
+					t.Errorf("error = %q, want it to name the kind", err)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			mem := memdriver.New()
+			c := newClient(mem, Config{})
+
+			_, err := c.InsertMany(context.Background(), []InsertItem{
+				{Args: greetArgs{Name: "ada"}},
+				tt.bad,
+			})
+			tt.want(t, err)
+			assertNothingPersisted(t, mem)
+		})
+	}
+}
+
+func TestInsertManyHonoursOptsAndQueues(t *testing.T) {
+	t.Parallel()
+	mem := memdriver.New()
+	c := newClient(mem, Config{})
+
+	future := time.Now().Add(time.Hour)
+	past := time.Now().Add(-time.Hour)
+	rows, err := c.InsertMany(context.Background(), []InsertItem{
+		{Args: greetArgs{Name: "ada"}, Opts: nil},
+		{Args: greetArgs{Name: "grace"}, Opts: &InsertOpts{Queue: "critical"}},
+		{Args: greetArgs{Name: "barbara"}, Opts: &InsertOpts{ScheduledAt: future}},
+		{Args: greetArgs{Name: "katherine"}, Opts: &InsertOpts{ScheduledAt: past}},
+	})
+	if err != nil {
+		t.Fatalf("InsertMany: %v", err)
+	}
+	if len(rows) != 4 {
+		t.Fatalf("InsertMany returned %d rows, want 4", len(rows))
+	}
+
+	if rows[0].Queue != "default" || rows[0].State != StateAvailable {
+		t.Errorf("nil opts: queue/state = %q/%q, want default/%q", rows[0].Queue, rows[0].State, StateAvailable)
+	}
+	if rows[0].ScheduledAt.After(time.Now().Add(time.Minute)) {
+		t.Errorf("nil opts ScheduledAt = %v, want a job due now", rows[0].ScheduledAt)
+	}
+	if rows[1].Queue != "critical" || rows[1].State != StateAvailable {
+		t.Errorf("named queue: queue/state = %q/%q, want critical/%q", rows[1].Queue, rows[1].State, StateAvailable)
+	}
+	if rows[2].Queue != "default" || rows[2].State != StateScheduled {
+		t.Errorf("future schedule: queue/state = %q/%q, want default/%q", rows[2].Queue, rows[2].State, StateScheduled)
+	}
+	if !rows[2].ScheduledAt.Equal(future) {
+		t.Errorf("future ScheduledAt = %v, want %v", rows[2].ScheduledAt, future)
+	}
+	if rows[3].Queue != "default" || rows[3].State != StateAvailable {
+		t.Errorf("past schedule: queue/state = %q/%q, want default/%q", rows[3].Queue, rows[3].State, StateAvailable)
+	}
+
+	defaultClaimed, err := mem.FetchAvailable(context.Background(), "default", time.Minute, 10)
+	if err != nil {
+		t.Fatalf("FetchAvailable default: %v", err)
+	}
+	if len(defaultClaimed) != 2 {
+		t.Fatalf("default queue claimed %d jobs, want 2", len(defaultClaimed))
+	}
+	claimedDefault := map[int64]bool{rows[0].ID: false, rows[3].ID: false}
+	for _, row := range defaultClaimed {
+		if _, ok := claimedDefault[row.ID]; !ok {
+			t.Errorf("default queue claimed unexpected id %d", row.ID)
+		}
+		claimedDefault[row.ID] = true
+	}
+
+	criticalClaimed, err := mem.FetchAvailable(context.Background(), "critical", time.Minute, 10)
+	if err != nil {
+		t.Fatalf("FetchAvailable critical: %v", err)
+	}
+	if len(criticalClaimed) != 1 || criticalClaimed[0].ID != rows[1].ID {
+		t.Fatalf("critical queue claimed %d jobs, want only id %d", len(criticalClaimed), rows[1].ID)
+	}
+
+	stored, ok := mem.Row(rows[2].ID)
+	if !ok {
+		t.Fatal("scheduled job missing from store")
+	}
+	if stored.State != "scheduled" {
+		t.Errorf("scheduled job state = %q, want scheduled", stored.State)
+	}
+}
+
+func TestInsertManyTxValidatesBeforeTouchingTransaction(t *testing.T) {
+	t.Parallel()
+	mem := memdriver.New()
+	c := newClient(mem, Config{})
+
+	valid := InsertItem{Args: greetArgs{Name: "ada"}}
+	if _, err := c.InsertManyTx(context.Background(), nil, []InsertItem{valid, {Args: nil}}); !errors.Is(err, ErrInvalidKind) {
+		t.Fatalf("InsertManyTx nil Args: %v, want ErrInvalidKind", err)
+	}
+	if _, err := c.InsertManyTx(context.Background(), nil, []InsertItem{valid, {Args: emptyKindArgs{}}}); !errors.Is(err, ErrInvalidKind) {
+		t.Fatalf("InsertManyTx empty kind: %v, want ErrInvalidKind", err)
+	}
+	if _, err := c.InsertManyTx(context.Background(), nil, []InsertItem{valid, {Args: badArgs{}}}); err == nil || !strings.Contains(err.Error(), `kind "bad"`) {
+		t.Fatalf("InsertManyTx marshal failure: %v, want wrapped error naming the kind", err)
+	}
+	assertNothingPersisted(t, mem)
+}
+
+func TestInsertManyTxEmptyDoesNotTouchTransaction(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name  string
+		items []InsertItem
+	}{
+		{name: "nil slice", items: nil},
+		{name: "empty slice", items: []InsertItem{}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			c := newClient(memdriver.New(), Config{})
+			rows, err := c.InsertManyTx(context.Background(), nil, tt.items)
+			if err != nil {
+				t.Fatalf("InsertManyTx: %v, want success without touching the driver", err)
+			}
+			if rows == nil {
+				t.Fatal("got nil result, want an empty slice")
+			}
+			if len(rows) != 0 {
+				t.Fatalf("got %d rows, want 0", len(rows))
+			}
+		})
+	}
+}
+
+func TestInsertManyTxUnsupportedOnMemdriver(t *testing.T) {
+	t.Parallel()
+	c := newClient(memdriver.New(), Config{})
+
+	_, err := c.InsertManyTx(context.Background(), nil, []InsertItem{{Args: greetArgs{Name: "ada"}}})
+	if !errors.Is(err, driver.ErrTxUnsupported) {
+		t.Fatalf("InsertManyTx = %v, want ErrTxUnsupported", err)
 	}
 }
 

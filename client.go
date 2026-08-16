@@ -332,6 +332,13 @@ func checkedMiddleware(mws []Middleware) []Middleware {
 	return mws
 }
 
+// InsertItem is one job in an InsertMany batch: the args to persist and
+// optional enqueue choices. A nil Opts means the same defaults as Insert.
+type InsertItem struct {
+	Args JobArgs
+	Opts *InsertOpts
+}
+
 // InsertOpts are the per-job choices made at enqueue time. A nil
 // *InsertOpts, or a zero value, means the defaults: the "default" queue,
 // runnable immediately.
@@ -383,7 +390,65 @@ func (c *Client) InsertTx(ctx context.Context, tx pgx.Tx, args JobArgs, opts *In
 	return rowFromDriver(row), nil
 }
 
+// InsertMany enqueues every item in one atomic write. The returned rows
+// match the input order. An empty or nil slice succeeds without writing.
+func (c *Client) InsertMany(ctx context.Context, items []InsertItem) ([]*JobRow, error) {
+	batch, err := insertParamsForMany(items)
+	if err != nil {
+		return nil, err
+	}
+	if len(batch) == 0 {
+		return []*JobRow{}, nil
+	}
+	rows, err := c.drv.InsertMany(ctx, batch)
+	if err != nil {
+		return nil, fmt.Errorf("drover: insert jobs: %w", err)
+	}
+	return rowsFromDriver(rows), nil
+}
+
+// InsertManyTx enqueues every item inside the caller's transaction: the
+// jobs exist if and only if tx commits, so a domain write and its jobs
+// are atomic.
+func (c *Client) InsertManyTx(ctx context.Context, tx pgx.Tx, items []InsertItem) ([]*JobRow, error) {
+	batch, err := insertParamsForMany(items)
+	if err != nil {
+		return nil, err
+	}
+	if len(batch) == 0 {
+		return []*JobRow{}, nil
+	}
+	rows, err := c.drv.InsertManyTx(ctx, tx, batch)
+	if err != nil {
+		return nil, fmt.Errorf("drover: insert jobs in tx: %w", err)
+	}
+	return rowsFromDriver(rows), nil
+}
+
+func insertParamsForMany(items []InsertItem) ([]driver.InsertParams, error) {
+	batch := make([]driver.InsertParams, len(items))
+	for i, item := range items {
+		params, err := insertParamsFor(item.Args, item.Opts)
+		if err != nil {
+			return nil, err
+		}
+		batch[i] = params
+	}
+	return batch, nil
+}
+
+func rowsFromDriver(rows []*driver.JobRow) []*JobRow {
+	out := make([]*JobRow, len(rows))
+	for i, row := range rows {
+		out[i] = rowFromDriver(row)
+	}
+	return out
+}
+
 func insertParamsFor(args JobArgs, opts *InsertOpts) (driver.InsertParams, error) {
+	if args == nil {
+		return driver.InsertParams{}, ErrInvalidKind
+	}
 	kind := args.Kind()
 	if kind == "" {
 		return driver.InsertParams{}, ErrInvalidKind

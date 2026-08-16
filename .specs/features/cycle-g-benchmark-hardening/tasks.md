@@ -192,11 +192,11 @@ error, no driver write. Wrap driver errors like `Insert` does.
 
 **Done when**:
 
-- [ ] Unit tests: happy path, empty, nil Args, empty kind, marshal failure
+- [x] Unit tests: happy path, empty, nil Args, empty kind, marshal failure
       inserts zero, opts defaults, mixed queues
-- [ ] Integration: `InsertManyTx` visibility follows the caller
+- [x] Integration: `InsertManyTx` visibility follows the caller
       transaction (mirror `TestInsertTxVisibilityFollowsCallerTransaction`)
-- [ ] Full gate green
+- [x] Full gate green
 
 **Tests**: unit + integration
 **Gate**: full

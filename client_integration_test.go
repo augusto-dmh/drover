@@ -65,6 +65,68 @@ func TestInsertTxVisibilityFollowsCallerTransaction(t *testing.T) {
 	}
 }
 
+func TestInsertManyTxVisibilityFollowsCallerTransaction(t *testing.T) {
+	pool := testdb.NewDB(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	c, err := NewClient(pool, Config{})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	countJobs := func() int {
+		var n int
+		if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM drover_jobs`).Scan(&n); err != nil {
+			t.Fatalf("count jobs: %v", err)
+		}
+		return n
+	}
+
+	items := []InsertItem{
+		{Args: greetArgs{Name: "ada"}},
+		{Args: greetArgs{Name: "grace"}},
+	}
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if _, err := c.InsertManyTx(ctx, tx, items); err != nil {
+		t.Fatalf("InsertManyTx: %v", err)
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+	if n := countJobs(); n != 0 {
+		t.Fatalf("after rollback: %d jobs, want 0", n)
+	}
+
+	tx, err = pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	rows, err := c.InsertManyTx(ctx, tx, items)
+	if err != nil {
+		t.Fatalf("InsertManyTx: %v", err)
+	}
+	if len(rows) != len(items) {
+		t.Fatalf("InsertManyTx returned %d rows, want %d", len(rows), len(items))
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if n := countJobs(); n != len(items) {
+		t.Fatalf("after commit: %d jobs, want %d", n, len(items))
+	}
+	for _, row := range rows {
+		if row.State != StateAvailable {
+			t.Errorf("State = %q, want %q", row.State, StateAvailable)
+		}
+	}
+}
+
 // Options must reach storage through the transactional path too, and the
 // job must still exist only if the caller's transaction commits.
 func TestInsertTxHonoursInsertOpts(t *testing.T) {
