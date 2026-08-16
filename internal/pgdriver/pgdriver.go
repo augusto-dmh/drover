@@ -95,6 +95,74 @@ func (d *Driver) InsertManyTx(ctx context.Context, tx any, batch []driver.Insert
 	return d.insertMany(ctx, pgxTx, batch)
 }
 
+const (
+	droverListenSQL   = `LISTEN drover`
+	droverUnlistenSQL = `UNLISTEN drover`
+	droverNotifySQL   = `SELECT pg_notify('drover', '')`
+)
+
+// Notify emits one coalesced wake-up on the drover channel. Callers that
+// have already committed the insert still keep those rows if this fails.
+func (d *Driver) Notify(ctx context.Context) error {
+	if _, err := d.pool.Exec(ctx, droverNotifySQL); err != nil {
+		return fmt.Errorf("notify drover: %w", err)
+	}
+	return nil
+}
+
+// NotifyTx emits the wake-up inside the caller's transaction, so
+// listeners fire only if that transaction commits.
+func (d *Driver) NotifyTx(ctx context.Context, tx any) error {
+	pgxTx, ok := tx.(pgx.Tx)
+	if !ok {
+		return fmt.Errorf("pgdriver: tx is %T, want pgx.Tx: %w", tx, driver.ErrTxUnsupported)
+	}
+	if _, err := pgxTx.Exec(ctx, droverNotifySQL); err != nil {
+		return fmt.Errorf("notify drover in tx: %w", err)
+	}
+	return nil
+}
+
+// ListenWakeups acquires a dedicated connection, LISTENs on drover, and
+// signals wake (non-blocking, cap-1) for each notification. It returns
+// when ctx is done (nil) or the session drops (error); the caller logs
+// and retries. The acquired connection is always released.
+func (d *Driver) ListenWakeups(ctx context.Context, wake chan struct{}) error {
+	conn, err := d.pool.Acquire(ctx)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
+		return fmt.Errorf("acquire listen connection: %w", err)
+	}
+	defer conn.Release()
+
+	if _, err := conn.Exec(ctx, droverListenSQL); err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
+		return fmt.Errorf("listen drover: %w", err)
+	}
+	defer func() {
+		unlistenCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_, _ = conn.Exec(unlistenCtx, droverUnlistenSQL)
+	}()
+
+	for {
+		if _, err := conn.Conn().WaitForNotification(ctx); err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return fmt.Errorf("wait for drover notification: %w", err)
+		}
+		select {
+		case wake <- struct{}{}:
+		default:
+		}
+	}
+}
+
 const insertBatchDDL = `
 CREATE TEMP TABLE IF NOT EXISTS drover_insert_batch (
 	ord int NOT NULL,

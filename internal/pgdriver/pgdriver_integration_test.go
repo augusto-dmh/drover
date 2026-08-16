@@ -1798,3 +1798,107 @@ func newTracedDriver(t *testing.T) (*pgdriver.Driver, *pgxpool.Pool, *insertTrac
 	}
 	return d, pool, trace
 }
+
+func TestNotifyTxDeliversOnlyOnCommit(t *testing.T) {
+	t.Parallel()
+	d, pool := newDriver(t)
+	ctx := context.Background()
+
+	listener, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	defer listener.Release()
+	if _, err := listener.Exec(ctx, "LISTEN drover"); err != nil {
+		t.Fatalf("LISTEN: %v", err)
+	}
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // commit path succeeds; rollback after commit is a no-op
+
+	if err := d.NotifyTx(ctx, tx); err != nil {
+		t.Fatalf("NotifyTx: %v", err)
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, 150*time.Millisecond)
+	n, err := listener.Conn().WaitForNotification(waitCtx)
+	cancel()
+	if err == nil {
+		t.Fatalf("received NOTIFY on %q before commit", n.Channel)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
+	waitCtx, cancel = context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	n, err = listener.Conn().WaitForNotification(waitCtx)
+	if err != nil {
+		t.Fatalf("expected NOTIFY after commit: %v", err)
+	}
+	if n.Channel != "drover" {
+		t.Errorf("channel = %q, want drover", n.Channel)
+	}
+}
+
+func TestListenWakeupsExitsWhenContextCancelled(t *testing.T) {
+	t.Parallel()
+	d, _ := newDriver(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	wake := make(chan struct{}, 1)
+	done := make(chan error, 1)
+	go func() { done <- d.ListenWakeups(ctx, wake) }()
+
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("ListenWakeups = %v, want nil after cancel", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ListenWakeups did not return after cancel")
+	}
+}
+
+func TestListenWakeupsNudgesOnNotify(t *testing.T) {
+	t.Parallel()
+	d, _ := newDriver(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	wake := make(chan struct{}, 1)
+	done := make(chan error, 1)
+	go func() { done <- d.ListenWakeups(ctx, wake) }()
+
+	time.Sleep(100 * time.Millisecond)
+	deadline := time.Now().Add(time.Second)
+	for {
+		if err := d.Notify(ctx); err != nil {
+			t.Fatalf("Notify: %v", err)
+		}
+		select {
+		case <-wake:
+			cancel()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Errorf("ListenWakeups = %v, want nil after cancel", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("ListenWakeups did not return after cancel")
+			}
+			return
+		case err := <-done:
+			t.Fatalf("ListenWakeups returned early: %v", err)
+		case <-time.After(20 * time.Millisecond):
+			if time.Now().After(deadline) {
+				t.Fatal("ListenWakeups did not signal wake after Notify")
+			}
+		}
+	}
+}

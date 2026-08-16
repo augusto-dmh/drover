@@ -1023,6 +1023,65 @@ func TestStopDoesNotWaitOutThePollIntervalWithNotifyWakeup(t *testing.T) {
 	}
 }
 
+type listenFailDriver struct {
+	*memdriver.Driver
+}
+
+func (d *listenFailDriver) ListenWakeups(context.Context, chan struct{}) error {
+	return errors.New("listen refused")
+}
+
+// LISTEN is an optimization: a driver that cannot establish it must not
+// fail Start, and the pool must keep polling.
+func TestStartSucceedsWhenListenFails(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	logs := &syncWriter{}
+	mem := memdriver.New()
+	drv := &listenFailDriver{Driver: mem}
+	entered := make(chan int64, 1)
+	ws := NewWorkers()
+	Register(ws, &funcWorker{fn: func(_ context.Context, job *Job[greetArgs]) error {
+		entered <- job.ID
+		return nil
+	}})
+
+	worker := newPoolClient(drv, ws, 1, func(cfg *Config) {
+		cfg.NotifyWakeup = true
+		cfg.PollInterval = 20 * time.Millisecond
+		cfg.Logger = newTestLogger(logs)
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := worker.Start(ctx); err != nil {
+		t.Fatalf("Start: %v, want nil when LISTEN cannot be established", err)
+	}
+
+	waitFor(t, func() bool {
+		return strings.Contains(logs.String(), `msg="drover: listen for job notifications"`)
+	}, "LISTEN failure to be logged")
+
+	// Insert through a client that does not nudge the worker, so the job
+	// is claimed by poll — proof the pool kept running.
+	producer := newClient(mem, Config{})
+	row, err := producer.Insert(context.Background(), greetArgs{Name: "ada"}, nil)
+	if err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	select {
+	case id := <-entered:
+		if id != row.ID {
+			t.Errorf("ran job %d, want %d", id, row.ID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("job was not claimed after LISTEN failed — the pool stopped polling")
+	}
+
+	if err := worker.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop returned %v, want nil", err)
+	}
+}
+
 // The spec's ordering is that claiming ceases before shutdown begins
 // waiting, not merely by the time it returns. Sampling twice while a
 // blocked handler holds the drain open is what tells those apart.

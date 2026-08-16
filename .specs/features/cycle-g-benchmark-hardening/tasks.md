@@ -258,11 +258,11 @@ client; do not add them to `driver.Driver`.
 
 **Done when**:
 
-- [ ] Two-client integration: producer `Insert` with flag, worker `Start`
+- [x] Two-client integration: producer `Insert` with flag, worker `Start`
       with flag and a long poll interval, job runs well under the interval
-- [ ] `InsertTx` does not wake listeners until commit
-- [ ] Listen goroutine is joined (goleak clean on Stop)
-- [ ] Full gate green
+- [x] `InsertTx` does not wake listeners until commit
+- [x] Listen goroutine is joined (goleak clean on Stop)
+- [x] Full gate green
 
 **Tests**: integration
 **Gate**: full

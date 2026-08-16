@@ -452,6 +452,12 @@ type notifier interface {
 	NotifyTx(ctx context.Context, tx any) error
 }
 
+// wakeupListener is the optional pgdriver surface that waits on Postgres
+// LISTEN. It is not on driver.Driver: the unit suite stays on memdriver.
+type wakeupListener interface {
+	ListenWakeups(ctx context.Context, wake chan struct{}) error
+}
+
 func (c *Client) wakeAfterInsert(ctx context.Context) {
 	if !c.notifyWakeup {
 		return
