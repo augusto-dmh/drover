@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -41,7 +42,7 @@ func (d *Driver) Migrate(ctx context.Context) error {
 func (d *Driver) Insert(ctx context.Context, params driver.InsertParams) (*driver.JobRow, error) {
 	job, err := d.queries.InsertJob(ctx, insertParams(params))
 	if err != nil {
-		return nil, fmt.Errorf("insert job kind %q: %w", params.Kind, err)
+		return nil, wrapInsertErr(err, fmt.Sprintf("insert job kind %q", params.Kind))
 	}
 	return rowFromDB(job), nil
 }
@@ -55,7 +56,7 @@ func (d *Driver) InsertTx(ctx context.Context, tx any, params driver.InsertParam
 	}
 	job, err := d.queries.WithTx(pgxTx).InsertJob(ctx, insertParams(params))
 	if err != nil {
-		return nil, fmt.Errorf("insert job kind %q in tx: %w", params.Kind, err)
+		return nil, wrapInsertErr(err, fmt.Sprintf("insert job kind %q in tx", params.Kind))
 	}
 	return rowFromDB(job), nil
 }
@@ -215,7 +216,7 @@ func (d *Driver) insertMany(ctx context.Context, tx pgx.Tx, batch []driver.Inser
 
 	jobs, err := d.queries.WithTx(tx).InsertJobsFromStaging(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("insert many jobs from staging: %w", err)
+		return nil, wrapInsertErr(err, "insert many jobs from staging")
 	}
 	out := make([]*driver.JobRow, len(jobs))
 	for i, job := range jobs {
@@ -566,6 +567,23 @@ func attemptArg(attempt int) int32 {
 	default:
 		return int32(attempt)
 	}
+}
+
+const (
+	pgUniqueViolation  = "23505"
+	uniqueActiveIndex  = "drover_jobs_unique_active_idx"
+)
+
+func wrapInsertErr(err error, op string) error {
+	if isUniqueActiveViolation(err) {
+		return fmt.Errorf("%s: %w", op, driver.ErrDuplicateJob)
+	}
+	return fmt.Errorf("%s: %w", op, err)
+}
+
+func isUniqueActiveViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == pgUniqueViolation && pgErr.ConstraintName == uniqueActiveIndex
 }
 
 func insertParams(params driver.InsertParams) dbsqlc.InsertJobParams {

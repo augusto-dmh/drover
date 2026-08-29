@@ -164,8 +164,8 @@ error. Concurrent inserts: at most one row.
 
 **Done when**:
 
-- [ ] Integration: persist key, duplicate → duplicate error, terminal frees key, concurrent pair, InsertMany collision rolls back all, COPY still used for N>1
-- [ ] Full gate green (Docker required)
+- [x] Integration: persist key, duplicate → duplicate error, terminal frees key, concurrent pair, InsertMany collision rolls back all, COPY still used for N>1
+- [x] Full gate green (Docker required)
 
 **Tests**: integration
 **Gate**: full
@@ -182,8 +182,8 @@ equivalent) so T7 can wrap it with `drover.ErrDuplicateJob` via
 
 **Done when**:
 
-- [ ] Both adapters return an error that `errors.Is` recognizes as the driver duplicate sentinel
-- [ ] Build green
+- [x] Both adapters return an error that `errors.Is` recognizes as the driver duplicate sentinel
+- [x] Build green
 
 **Tests**: covered by T2/T3
 **Gate**: build
@@ -219,10 +219,10 @@ specs error without panic. `FuzzParse` with seed corpus.
 
 **Done when**:
 
-- [ ] Table tests: hourly `0 * * * *`, `*/5`, `@every 30s` alignment, Sunday 0/7, bad arity, non-positive duration
-- [ ] Next is strictly after t (never equal)
-- [ ] FuzzParse exists
-- [ ] Quick gate green for the package
+- [x] Table tests: hourly `0 * * * *`, `*/5`, `@every 30s` alignment, Sunday 0/7, bad arity, non-positive duration
+- [x] Next is strictly after t (never equal)
+- [x] FuzzParse exists
+- [x] Quick gate green for the package
 
 **Tests**: unit + fuzz (fuzz need not run to completion in the gate;
 `go test` compile is enough, CI may skip long fuzz)

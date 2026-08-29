@@ -1981,3 +1981,356 @@ func TestListenWakeupsNudgesOnNotify(t *testing.T) {
 		}
 	}
 }
+
+func countJobs(t *testing.T, pool *pgxpool.Pool) int {
+	t.Helper()
+	var n int
+	if err := pool.QueryRow(context.Background(), `SELECT COUNT(*) FROM drover_jobs`).Scan(&n); err != nil {
+		t.Fatalf("count jobs: %v", err)
+	}
+	return n
+}
+
+func storedUniqueKey(t *testing.T, pool *pgxpool.Pool, id int64) *string {
+	t.Helper()
+	var key *string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT unique_key FROM drover_jobs WHERE id = $1`, id).Scan(&key); err != nil {
+		t.Fatalf("read unique_key: %v", err)
+	}
+	return key
+}
+
+func TestInsertPersistsUniqueKey(t *testing.T) {
+	t.Parallel()
+	d, pool := newDriver(t)
+
+	row, err := d.Insert(context.Background(), driver.InsertParams{
+		Kind: "send", Queue: "default", Args: []byte(`{}`), UniqueKey: "invoice-1",
+	})
+	if err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	if row.UniqueKey != "invoice-1" {
+		t.Errorf("UniqueKey = %q, want invoice-1", row.UniqueKey)
+	}
+	got := storedUniqueKey(t, pool, row.ID)
+	if got == nil || *got != "invoice-1" {
+		t.Errorf("stored unique_key = %v, want invoice-1", got)
+	}
+}
+
+func TestInsertEmptyUniqueKeyStoresNull(t *testing.T) {
+	t.Parallel()
+	d, pool := newDriver(t)
+	ctx := context.Background()
+
+	first, err := d.Insert(ctx, driver.InsertParams{
+		Kind: "k", Queue: "default", Args: []byte(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("first Insert: %v", err)
+	}
+	second, err := d.Insert(ctx, driver.InsertParams{
+		Kind: "k", Queue: "default", Args: []byte(`{}`), UniqueKey: "",
+	})
+	if err != nil {
+		t.Fatalf("second Insert: %v", err)
+	}
+	if first.UniqueKey != "" || second.UniqueKey != "" {
+		t.Errorf("UniqueKey = %q and %q, want both empty", first.UniqueKey, second.UniqueKey)
+	}
+	if storedUniqueKey(t, pool, first.ID) != nil || storedUniqueKey(t, pool, second.ID) != nil {
+		t.Error("empty UniqueKey must be stored as NULL")
+	}
+	if countJobs(t, pool) != 2 {
+		t.Errorf("store has %d jobs, want 2 — empty keys must not collide", countJobs(t, pool))
+	}
+}
+
+func TestInsertDuplicateUniqueKeyFailsWhileNonTerminal(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	future := time.Now().Add(time.Hour)
+
+	tests := []struct {
+		name  string
+		setup func(*testing.T, *pgdriver.Driver)
+	}{
+		{
+			name: "available",
+			setup: func(t *testing.T, d *pgdriver.Driver) {
+				if _, err := d.Insert(ctx, driver.InsertParams{
+					Kind: "k", Queue: "default", Args: []byte(`{}`), UniqueKey: "u",
+				}); err != nil {
+					t.Fatalf("seed: %v", err)
+				}
+			},
+		},
+		{
+			name: "scheduled",
+			setup: func(t *testing.T, d *pgdriver.Driver) {
+				if _, err := d.Insert(ctx, driver.InsertParams{
+					Kind: "k", Queue: "default", Args: []byte(`{}`), UniqueKey: "u", ScheduledAt: future,
+				}); err != nil {
+					t.Fatalf("seed: %v", err)
+				}
+			},
+		},
+		{
+			name: "retryable",
+			setup: func(t *testing.T, d *pgdriver.Driver) {
+				row, err := d.Insert(ctx, driver.InsertParams{
+					Kind: "k", Queue: "default", Args: []byte(`{}`), UniqueKey: "u",
+				})
+				if err != nil {
+					t.Fatalf("seed: %v", err)
+				}
+				claimOne(t, d)
+				if err := d.MarkRetryable(ctx, held(row.ID), future, []byte(`{"error":"boom"}`)); err != nil {
+					t.Fatalf("MarkRetryable: %v", err)
+				}
+			},
+		},
+		{
+			name: "running",
+			setup: func(t *testing.T, d *pgdriver.Driver) {
+				if _, err := d.Insert(ctx, driver.InsertParams{
+					Kind: "k", Queue: "default", Args: []byte(`{}`), UniqueKey: "u",
+				}); err != nil {
+					t.Fatalf("seed: %v", err)
+				}
+				claimOne(t, d)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			d, pool := newDriver(t)
+			tt.setup(t, d)
+			before := countJobs(t, pool)
+
+			_, err := d.Insert(ctx, driver.InsertParams{
+				Kind: "k", Queue: "default", Args: []byte(`{}`), UniqueKey: "u",
+			})
+			if !errors.Is(err, driver.ErrDuplicateJob) {
+				t.Fatalf("Insert error = %v, want ErrDuplicateJob", err)
+			}
+			if got := countJobs(t, pool); got != before {
+				t.Errorf("store has %d jobs after duplicate, want %d", got, before)
+			}
+		})
+	}
+}
+
+func TestInsertReusesUniqueKeyAfterTerminal(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	tests := []struct {
+		name   string
+		finish func(*testing.T, *pgdriver.Driver, int64)
+	}{
+		{
+			name: "completed",
+			finish: func(t *testing.T, d *pgdriver.Driver, id int64) {
+				claimOne(t, d)
+				if err := d.MarkCompleted(ctx, held(id)); err != nil {
+					t.Fatalf("MarkCompleted: %v", err)
+				}
+			},
+		},
+		{
+			name: "cancelled",
+			finish: func(t *testing.T, d *pgdriver.Driver, id int64) {
+				claimOne(t, d)
+				if err := d.MarkCancelled(ctx, held(id), []byte(`{"error":"nope"}`)); err != nil {
+					t.Fatalf("MarkCancelled: %v", err)
+				}
+			},
+		},
+		{
+			name: "dead",
+			finish: func(t *testing.T, d *pgdriver.Driver, id int64) {
+				claimOne(t, d)
+				if err := d.MarkDead(ctx, held(id), []byte(`{"error":"boom"}`)); err != nil {
+					t.Fatalf("MarkDead: %v", err)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			d, pool := newDriver(t)
+			first, err := d.Insert(ctx, driver.InsertParams{
+				Kind: "k", Queue: "default", Args: []byte(`{}`), UniqueKey: "u",
+			})
+			if err != nil {
+				t.Fatalf("first Insert: %v", err)
+			}
+			tt.finish(t, d, first.ID)
+
+			second, err := d.Insert(ctx, driver.InsertParams{
+				Kind: "k", Queue: "default", Args: []byte(`{}`), UniqueKey: "u",
+			})
+			if err != nil {
+				t.Fatalf("Insert after %s: %v", tt.name, err)
+			}
+			if second.ID == first.ID {
+				t.Errorf("second Insert reused id %d; want a new row", second.ID)
+			}
+			if second.UniqueKey != "u" {
+				t.Errorf("UniqueKey = %q, want u", second.UniqueKey)
+			}
+			if countJobs(t, pool) != 2 {
+				t.Errorf("store has %d jobs, want 2", countJobs(t, pool))
+			}
+		})
+	}
+}
+
+func TestInsertUniqueKeyStillUsesDatabaseClockForState(t *testing.T) {
+	t.Parallel()
+	d, _ := newDriver(t)
+	ctx := context.Background()
+	future := time.Now().Add(time.Hour)
+
+	due, err := d.Insert(ctx, driver.InsertParams{
+		Kind: "k", Queue: "default", Args: []byte(`{}`), UniqueKey: "due",
+	})
+	if err != nil {
+		t.Fatalf("Insert due: %v", err)
+	}
+	if due.State != "available" {
+		t.Errorf("due State = %q, want available", due.State)
+	}
+
+	wait, err := d.Insert(ctx, driver.InsertParams{
+		Kind: "k", Queue: "default", Args: []byte(`{}`), UniqueKey: "later", ScheduledAt: future,
+	})
+	if err != nil {
+		t.Fatalf("Insert later: %v", err)
+	}
+	if wait.State != "scheduled" {
+		t.Errorf("later State = %q, want scheduled", wait.State)
+	}
+}
+
+func TestInsertConcurrentUniqueKeyCreatesAtMostOneRow(t *testing.T) {
+	t.Parallel()
+	d, pool := newDriver(t)
+	ctx := context.Background()
+
+	const writers = 2
+	var wg sync.WaitGroup
+	errs := make(chan error, writers)
+	for range writers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := d.Insert(ctx, driver.InsertParams{
+				Kind: "k", Queue: "default", Args: []byte(`{}`), UniqueKey: "u",
+			})
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+
+	var ok, dup int
+	for err := range errs {
+		switch {
+		case err == nil:
+			ok++
+		case errors.Is(err, driver.ErrDuplicateJob):
+			dup++
+		default:
+			t.Errorf("unexpected error: %v", err)
+		}
+	}
+	if ok != 1 || dup != 1 {
+		t.Errorf("success=%d duplicate=%d, want 1 and 1", ok, dup)
+	}
+	if got := countJobs(t, pool); got != 1 {
+		t.Errorf("store has %d rows, want 1", got)
+	}
+}
+
+func TestInsertManyInBatchDuplicateInsertsNothing(t *testing.T) {
+	t.Parallel()
+	d, pool := newDriver(t)
+	ctx := context.Background()
+	existing := mustInsert(t, d, "keep", "default")
+
+	_, err := d.InsertMany(ctx, []driver.InsertParams{
+		{Kind: "k", Queue: "default", Args: []byte(`{}`), UniqueKey: "u"},
+		{Kind: "k", Queue: "default", Args: []byte(`{}`), UniqueKey: "u"},
+	})
+	if !errors.Is(err, driver.ErrDuplicateJob) {
+		t.Fatalf("InsertMany error = %v, want ErrDuplicateJob", err)
+	}
+	if got := countJobs(t, pool); got != 1 {
+		t.Fatalf("store has %d jobs, want 1 — the batch must insert zero rows", got)
+	}
+	if readJob(t, pool, existing.ID).State != "available" {
+		t.Error("existing job was disturbed")
+	}
+}
+
+func TestInsertManyConflictWithExistingInsertsNothing(t *testing.T) {
+	t.Parallel()
+	d, pool := newDriver(t)
+	ctx := context.Background()
+	first, err := d.Insert(ctx, driver.InsertParams{
+		Kind: "k", Queue: "default", Args: []byte(`{}`), UniqueKey: "u",
+	})
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	_, err = d.InsertMany(ctx, []driver.InsertParams{
+		{Kind: "k", Queue: "default", Args: []byte(`{}`), UniqueKey: "other"},
+		{Kind: "k", Queue: "default", Args: []byte(`{}`), UniqueKey: "u"},
+	})
+	if !errors.Is(err, driver.ErrDuplicateJob) {
+		t.Fatalf("InsertMany error = %v, want ErrDuplicateJob", err)
+	}
+	if got := countJobs(t, pool); got != 1 {
+		t.Fatalf("store has %d jobs, want 1 — the colliding batch must insert zero rows", got)
+	}
+	if storedUniqueKey(t, pool, first.ID) == nil {
+		t.Fatal("existing unique job was removed")
+	}
+}
+
+func TestInsertManyUniqueKeysUsesCopyFrom(t *testing.T) {
+	d, _, trace := newTracedDriver(t)
+
+	rows, err := d.InsertMany(context.Background(), []driver.InsertParams{
+		{Kind: "a", Queue: "default", Args: []byte(`{}`), UniqueKey: "one"},
+		{Kind: "b", Queue: "default", Args: []byte(`{}`), UniqueKey: "two"},
+		{Kind: "c", Queue: "default", Args: []byte(`{}`), UniqueKey: "three"},
+	})
+	if err != nil {
+		t.Fatalf("InsertMany: %v", err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("InsertMany returned %d rows, want 3", len(rows))
+	}
+	if rows[0].UniqueKey != "one" || rows[1].UniqueKey != "two" || rows[2].UniqueKey != "three" {
+		t.Errorf("UniqueKeys = %q,%q,%q, want one,two,three", rows[0].UniqueKey, rows[1].UniqueKey, rows[2].UniqueKey)
+	}
+
+	trace.mu.Lock()
+	defer trace.mu.Unlock()
+	if trace.copyFrom != 1 {
+		t.Errorf("CopyFrom called %d times, want 1", trace.copyFrom)
+	}
+	if trace.insertJob != 0 {
+		t.Errorf("InsertJob VALUES ran %d times, want 0 — the batch must not loop single-row inserts", trace.insertJob)
+	}
+}
