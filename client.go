@@ -188,6 +188,15 @@ type Config struct {
 	// Bind failure fails Start and starts nothing: a worker that is
 	// running but unreachable is the state this surface exists to remove.
 	OpsAddr string
+
+	// PeriodicJobs are cron and @every schedules this process may
+	// enqueue when it holds the scheduler lock. An empty or nil slice
+	// starts no scheduler and takes no lock.
+	//
+	// An empty or duplicate ID, nil Args, an empty kind, or an
+	// unparseable Cron panics at construction: those are programmer
+	// errors, like a nil middleware.
+	PeriodicJobs []PeriodicJob
 }
 
 // Client enqueues jobs and runs the worker loop.
@@ -209,6 +218,10 @@ type Client struct {
 	inflight          *inflightSet
 	metrics           *metricSet
 	registry          *prometheus.Registry
+
+	// periodic is the construction-time schedule list, already parsed.
+	// Empty means this client never runs a scheduler.
+	periodic []periodicEntry
 
 	// chain is the composed middleware stack with dispatch at its
 	// centre. It is built once at construction and never rebuilt: every
@@ -325,6 +338,7 @@ func newClient(drv driver.Driver, cfg Config) *Client {
 		[]Middleware{Logging(c.logger), metricsMiddleware(c.metrics)},
 		checkedMiddleware(cfg.Middleware)...,
 	))
+	c.periodic = checkedPeriodicJobs(cfg.PeriodicJobs)
 	return c
 }
 

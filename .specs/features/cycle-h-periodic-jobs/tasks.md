@@ -283,8 +283,8 @@ task if T10 is the loop; the client must still compile.
 
 **Done when**:
 
-- [ ] Tests: panics on bad ID/cron/args; accepts valid slice; empty slice does not panic
-- [ ] Quick gate green
+- [x] Tests: panics on bad ID/cron/args; accepts valid slice; empty slice does not panic
+- [x] Quick gate green
 
 **Tests**: unit
 **Gate**: quick
