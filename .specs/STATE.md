@@ -72,6 +72,16 @@ Durable, cross-cycle. Architecture-level decisions live in `docs/adr/`; entries 
 | AD-064 | Claim batch size stays idle-worker count (AD-022). Cycle G does not add a prefetch or FetchBatchSize knob | cycle-g D-7 |
 | AD-065 | `cmd/drover-bench` measures enqueue throughput and drain latency percentiles and prints methodology; it is not a GoReleaser artifact | cycle-g D-8 |
 | AD-066 | Empty InsertMany is success with no write; `memdriver.InsertManyTx` returns `ErrTxUnsupported` | cycle-g D-9 |
+| AD-067 | Unique jobs: `InsertOpts.UniqueKey` (empty = not unique, stored NULL). Partial unique index on `(queue, kind, unique_key)` WHERE `unique_key IS NOT NULL` AND `state IN (available, scheduled, retryable, running)` | cycle-h `context.md` D-1, D-2 |
+| AD-068 | Duplicate unique insert returns `ErrDuplicateJob` and inserts no row; `InsertMany` fails the whole batch | cycle-h D-3 |
+| AD-069 | Cron parser is stdlib-owned 5-field + `@every <duration>` in `internal/cron` (or equivalent); no third-party cron module; fuzz the parser | cycle-h D-4 |
+| AD-070 | Periodic jobs are `Config.PeriodicJobs []PeriodicJob` at construction; empty/duplicate ID, nil Args, or bad cron panics; a process with an empty slice does not take the lock | cycle-h D-5 |
+| AD-071 | Leadership is session `pg_try_advisory_lock` on a dedicated connection and a documented int64 key, off `driver.Driver` (optional interface). memdriver is always leader. Lock failure logs and retries; `Start` still succeeds | cycle-h D-6, D-7 |
+| AD-072 | Periodic enqueue UniqueKey is `id + "/" + fireTime.UTC().Format(time.RFC3339)`; `ErrDuplicateJob` is tick success | cycle-h D-8 |
+| AD-073 | First periodic fire is strictly after Start; `@every` is Unix-epoch aligned | cycle-h D-8 |
+| AD-074 | Leader computes next run with `time.Now()` in the job location; Insert still uses the database clock for available vs scheduled (AD-035) | cycle-h D-9 |
+| AD-075 | Scheduler shares `fetchCtx` with the rescuer: it stops when claiming stops; Stop must not wait out the next fire | cycle-h D-10 |
+| AD-076 | `JobRow.UniqueKey` is exported (empty when unset) so handlers can use it downstream | cycle-h ASM-14 |
 
 **Amended by cycle C:** AD-018 is generalised, not superseded — the heartbeat now stops after the last *pool worker* drains rather than after the fetch loop returns. Same principle, wider scope.
 
@@ -92,14 +102,14 @@ Durable, cross-cycle. Architecture-level decisions live in `docs/adr/`; entries 
 
 ## Handoff
 
-- **Feature**: next is `cycle-h-periodic-jobs` (not started)
-- **Phase / Task**: —
+- **Feature**: `cycle-h-periodic-jobs`
+- **Phase / Task**: Specify+context done (auto-decided); Design next
 - **Last shipped**: Cycle G (#13)
-- **Completed this cycle**: —
-- **Next step**: start Cycle H — periodic jobs: cron scheduler with advisory-lock leader election; unique jobs via partial unique index
+- **Completed this cycle**: spec.md, context.md, AD-067–AD-076
+- **Next step**: write design.md and tasks.md, then Execute
 - **Blockers**: none
-- **Branch**: `main`
-- **What review should look at**: —
+- **Branch**: `main` (Execute will branch)
+- **What review should look at**: unique index predicate; advisory lock not on pool connections; scheduler stop vs next-fire
 - **Known weak sensors** (carried forward): neither database-clock property — lease deadlines, nor a delayed job's dueness — can be falsified while the test container and the client share a host clock
-- **Follow-up work carried forward** (recorded, not scheduled): terminal-state retention/pruning; list-query index-friendly variants; `testing/synctest` where viable; constructor panic-vs-error consistency before 1.0; deferred observability niceties from cycle E; batch completer; `go test -bench` CI job
+- **Follow-up work carried forward** (recorded, not scheduled): terminal-state retention/pruning; list-query index-friendly variants; `testing/synctest` where viable; constructor panic-vs-error consistency before 1.0; deferred observability niceties from cycle E; batch completer; `go test -bench` CI job; UniqueOpts.ByArgs/Period; RunOnStart; CLI `--unique-key`
 - **Next after this cycle**: Cycle I — optional status page (`drover web`, server-rendered)
