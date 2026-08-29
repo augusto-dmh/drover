@@ -305,11 +305,11 @@ with UniqueKey `id/RFC3339UTC`, ScheduledAt = fire, overwrite
 
 **Done when**:
 
-- [ ] Empty PeriodicJobs: no extra goroutine (goleak vs baseline)
-- [ ] `@every` or a 5-field spec with synctest/fake time: exactly one insert per tick
-- [ ] Duplicate Insert is not logged as a handler failure
-- [ ] Stop with a far-future next fire returns well under that interval
-- [ ] Quick gate green
+- [x] Empty PeriodicJobs: no extra goroutine (goleak vs baseline)
+- [x] `@every` or a 5-field spec with synctest/fake time: exactly one insert per tick
+- [x] Duplicate Insert is not logged as a handler failure
+- [x] Stop with a far-future next fire returns well under that interval
+- [x] Quick gate green
 
 **Tests**: unit
 **Gate**: quick

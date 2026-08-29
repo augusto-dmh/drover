@@ -478,6 +478,13 @@ type wakeupListener interface {
 	ListenWakeups(ctx context.Context, wake chan struct{}) error
 }
 
+// leaderLocker is the optional pgdriver surface for periodic-scheduler
+// leadership. It is not on driver.Driver: memdriver is always leader.
+type leaderLocker interface {
+	TryBecomeLeader(ctx context.Context) (bool, error)
+	ReleaseLeader()
+}
+
 func (c *Client) wakeAfterInsert(ctx context.Context) {
 	if !c.notifyWakeup {
 		return
