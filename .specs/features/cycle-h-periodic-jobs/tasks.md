@@ -196,7 +196,7 @@ empty commit. Note the skip in the phase summary.)
 
 **What**: Full lint; fix issues from T1–T4.
 **Depends on**: T2, T3, T4
-**Done when**: lint clean; `go build ./... && go vet ./...`
+**Done when**: lint clean; `go build ./... && go vet ./...` ✅
 **Tests**: none
 **Gate**: build
 **Commit**: `fix(pgdriver): satisfy lint on unique insert`

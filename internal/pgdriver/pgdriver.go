@@ -570,8 +570,8 @@ func attemptArg(attempt int) int32 {
 }
 
 const (
-	pgUniqueViolation  = "23505"
-	uniqueActiveIndex  = "drover_jobs_unique_active_idx"
+	pgUniqueViolation = "23505"
+	uniqueActiveIndex = "drover_jobs_unique_active_idx"
 )
 
 func wrapInsertErr(err error, op string) error {
