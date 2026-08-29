@@ -39,11 +39,54 @@ func (d *Driver) Insert(_ context.Context, params driver.InsertParams) (*driver.
 	defer d.mu.Unlock()
 
 	d.nextID++
-	now := time.Now()
+	row := jobFromParams(d.nextID, params, time.Now())
+	d.jobs[row.ID] = row
+	return copyRow(row), nil
+}
 
-	// The same rule the SQL driver applies, against this store's clock:
-	// the zero time means now, and a job due later waits in scheduled
-	// rather than claiming to be available for a run it cannot have yet.
+// InsertTx always fails: there is no transaction to join in memory.
+func (d *Driver) InsertTx(context.Context, any, driver.InsertParams) (*driver.JobRow, error) {
+	return nil, driver.ErrTxUnsupported
+}
+
+// InsertMany persists every job in batch in one atomic write and
+// returns a row per item, in input order. An empty or nil batch is
+// success with no write.
+func (d *Driver) InsertMany(_ context.Context, batch []driver.InsertParams) ([]*driver.JobRow, error) {
+	if len(batch) == 0 {
+		return []*driver.JobRow{}, nil
+	}
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	now := time.Now()
+	pending := make([]*driver.JobRow, len(batch))
+	for i, params := range batch {
+		pending[i] = jobFromParams(d.nextID+int64(i)+1, params, now)
+	}
+	for _, row := range pending {
+		d.jobs[row.ID] = row
+	}
+	d.nextID += int64(len(batch))
+
+	out := make([]*driver.JobRow, len(pending))
+	for i, row := range pending {
+		out[i] = copyRow(row)
+	}
+	return out, nil
+}
+
+// InsertManyTx always fails: there is no transaction to join in memory.
+func (d *Driver) InsertManyTx(context.Context, any, []driver.InsertParams) ([]*driver.JobRow, error) {
+	return nil, driver.ErrTxUnsupported
+}
+
+// jobFromParams builds a stored row the way Insert does, against this
+// store's clock: the zero time means now, and a job due later waits in
+// scheduled rather than claiming to be available for a run it cannot
+// have yet.
+func jobFromParams(id int64, params driver.InsertParams, now time.Time) *driver.JobRow {
 	scheduledAt := params.ScheduledAt
 	if scheduledAt.IsZero() {
 		scheduledAt = now
@@ -52,9 +95,8 @@ func (d *Driver) Insert(_ context.Context, params driver.InsertParams) (*driver.
 	if scheduledAt.After(now) {
 		state = "scheduled"
 	}
-
-	row := &driver.JobRow{
-		ID:          d.nextID,
+	return &driver.JobRow{
+		ID:          id,
 		Kind:        params.Kind,
 		Queue:       params.Queue,
 		Args:        params.Args,
@@ -64,13 +106,6 @@ func (d *Driver) Insert(_ context.Context, params driver.InsertParams) (*driver.
 		ScheduledAt: scheduledAt,
 		CreatedAt:   now,
 	}
-	d.jobs[row.ID] = row
-	return copyRow(row), nil
-}
-
-// InsertTx always fails: there is no transaction to join in memory.
-func (d *Driver) InsertTx(context.Context, any, driver.InsertParams) (*driver.JobRow, error) {
-	return nil, driver.ErrTxUnsupported
 }
 
 // waiting reports whether a job in this state is queued for execution:

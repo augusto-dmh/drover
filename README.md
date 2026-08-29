@@ -24,9 +24,9 @@ flowchart LR
     W1 -->|complete / retry / dead| PG
 ```
 
-- **Transactional enqueue** — jobs insert inside your own transaction; no ghost jobs, no outbox needed ([ADR-0002](docs/adr/0002-postgres-only-backend-behind-narrow-storage-interface.md)).
+- **Transactional enqueue** — jobs insert inside your own transaction; no ghost jobs, no outbox needed ([ADR-0002](docs/adr/0002-postgres-only-backend-behind-narrow-storage-interface.md)). `InsertMany` / `InsertManyTx` flush a batch in one write (Postgres via `COPY FROM`).
 - **At-least-once, stated plainly** — lease + heartbeat + rescuer; every duplicate source is named and bounded; handlers are idempotent by contract ([ADR-0003](docs/adr/0003-at-least-once-delivery-lease-heartbeat-rescuer.md)).
-- **A real worker pool** — a fixed, configurable number of goroutines claim and run jobs concurrently over a channel, and `Stop` drains in-flight work within a caller-supplied budget instead of leaving shutdown to lease expiry.
+- **A real worker pool** — a fixed, configurable number of goroutines claim and run jobs concurrently over a channel, and `Stop` drains in-flight work within a caller-supplied budget instead of leaving shutdown to lease expiry. Each fetch round claims at most as many jobs as there are idle workers — never a prefetch buffer of leased rows nobody is running. `Config.NotifyWakeup` (off by default) can interrupt the poll wait via `LISTEN`/`NOTIFY`; polling stays the source of truth, and the flag needs session pooling (not PgBouncer transaction pooling).
 - **Composable middleware** — a `func(Handler) Handler` chain wraps every job, whatever its kind; the built-in `Timeout` bounds a handler's context and `Logging` reports each execution, and both compose with middleware you write yourself ([ADR-0004](docs/adr/0004-single-module-root-package-layout-and-toolchain.md)).
 - **Scheduled, prioritized queues** — `InsertOpts` delays a job to a future time and routes it to a named queue; queues are served from one shared worker pool by configurable weight, so a low-priority queue is slower, never starved ([ADR-0003](docs/adr/0003-at-least-once-delivery-lease-heartbeat-rescuer.md)).
 - **Typed jobs** — `JobArgs` + `Worker[T]` generics, no `[]byte` payloads, no reflection.
@@ -49,10 +49,11 @@ drover.Register(workers, &EmailWorker{}) // implements drover.Worker[SendEmail]
 // Queues share that one pool by weight; Middleware wraps every job,
 // Logging installed outermost ahead of whatever you add.
 client, err := drover.NewClient(pool, drover.Config{
-    Workers:     workers,
-    Concurrency: 8,
-    Queues:      map[string]int{"default": 1, "bulk": 9},
-    Middleware:  []drover.Middleware{drover.Timeout(30 * time.Second)},
+    Workers:      workers,
+    Concurrency:  8,
+    Queues:       map[string]int{"default": 1, "bulk": 9},
+    Middleware:   []drover.Middleware{drover.Timeout(30 * time.Second)},
+    NotifyWakeup: false, // opt-in LISTEN/NOTIFY; needs session pooling
 })
 
 // Enqueue atomically with your own writes
@@ -63,6 +64,13 @@ _, err = client.InsertTx(ctx, tx, SendEmail{To: user.Email, Template: "welcome"}
 _, err = client.Insert(ctx, SendEmail{To: user.Email, Template: "reminder"}, &drover.InsertOpts{
     Queue:       "bulk",
     ScheduledAt: time.Now().Add(24 * time.Hour),
+})
+
+// Flush many jobs in one write. Postgres uses COPY FROM; each item may
+// name its own queue and schedule.
+_, err = client.InsertMany(ctx, []drover.InsertItem{
+    {Args: SendEmail{To: user.Email, Template: "welcome"}},
+    {Args: SendEmail{To: user.Email, Template: "digest"}, Opts: &drover.InsertOpts{Queue: "bulk"}},
 })
 
 // Start returns once the pool is running. Stop stops claiming, drains
@@ -155,9 +163,43 @@ goreleaser release --clean
 
 Validate the config locally with `goreleaser check`. Snapshot builds without publishing: `goreleaser release --snapshot --clean`.
 
+## Benchmarks
+
+Numbers from one run of `cmd/drover-bench` on 2026-08-15. They are not a promise: they describe no-op handlers on a single node. Re-run the harness on your hardware before comparing.
+
+**Machine**: WSL2, Linux 6.6 (`GOOS=linux`, `GOARCH=amd64`), Intel Core 7 240H (16 logical CPUs), Go 1.26.2. **Postgres**: 16.14 in Docker (`postgres:16-alpine`) on the same host. **Workload**: 10,000 no-op jobs, `InsertMany` batch 256, drain concurrency 10, `NotifyWakeup` off, queue `default`.
+
+| Mode | jobs/sec | p50 | p95 | p99 |
+| --- | ---: | ---: | ---: | ---: |
+| enqueue (`InsertMany` only) | 16,230 | — | — | — |
+| drain (Start until last completion) | 704 | 8.19s | 13.74s | 14.14s |
+
+Drain percentiles are **enqueue-to-completion**, including time spent waiting for one of 10 workers — not handler runtime. Enqueue jobs/sec is the COPY FROM insert path alone. Drain jobs/sec starts after insert has finished.
+
+Reproduce:
+
+```
+go run ./cmd/drover-bench --database "$DATABASE_URL" --mode enqueue --jobs 10000 --batch 256
+go run ./cmd/drover-bench --database "$DATABASE_URL" --mode drain --jobs 10000 --batch 256 --concurrency 10
+```
+
+Raw harness output from the published run:
+
+```
+# enqueue
+jobs/sec=16229.96
+# drain
+jobs/sec=703.66
+p50=8.194814695s
+p95=13.744624029s
+p99=14.144354657s
+```
+
+`drover-bench` is a measurement harness, not a released operator tool — it is not part of the GoReleaser artifacts.
+
 ## Roadmap
 
-v0.1.0 = cycles A–F of [RFC-0001](docs/rfc/0001-drover-roadmap.md): walking skeleton → retries/DLQ/rescue → worker pools + graceful shutdown → middleware + scheduled jobs → Prometheus observability → **CLI + introspection**. Then: benchmarks with published methodology, periodic jobs via advisory-lock leader election, and an optional server-rendered status page.
+v0.1.0 = cycles A–G of [RFC-0001](docs/rfc/0001-drover-roadmap.md): walking skeleton → retries/DLQ/rescue → worker pools + graceful shutdown → middleware + scheduled jobs → Prometheus observability → CLI + introspection → **benchmarks with published methodology**. Then: periodic jobs via advisory-lock leader election, and an optional server-rendered status page.
 
 ## Documentation
 

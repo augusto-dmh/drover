@@ -59,6 +59,165 @@ func (d *Driver) InsertTx(ctx context.Context, tx any, params driver.InsertParam
 	return rowFromDB(job), nil
 }
 
+// InsertMany persists every job in batch in one transaction, loading
+// rows through COPY FROM a session-temp staging table. An empty or nil
+// batch is success with no write.
+func (d *Driver) InsertMany(ctx context.Context, batch []driver.InsertParams) ([]*driver.JobRow, error) {
+	if len(batch) == 0 {
+		return []*driver.JobRow{}, nil
+	}
+	tx, err := d.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin insert many: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+
+	rows, err := d.insertMany(ctx, tx, batch)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit insert many: %w", err)
+	}
+	return rows, nil
+}
+
+// InsertManyTx is InsertMany inside the caller's pgx.Tx, so the jobs
+// exist if and only if that transaction commits.
+func (d *Driver) InsertManyTx(ctx context.Context, tx any, batch []driver.InsertParams) ([]*driver.JobRow, error) {
+	pgxTx, ok := tx.(pgx.Tx)
+	if !ok {
+		return nil, fmt.Errorf("pgdriver: tx is %T, want pgx.Tx: %w", tx, driver.ErrTxUnsupported)
+	}
+	if len(batch) == 0 {
+		return []*driver.JobRow{}, nil
+	}
+	return d.insertMany(ctx, pgxTx, batch)
+}
+
+const (
+	droverListenSQL          = `LISTEN drover`
+	droverUnlistenSQL        = `UNLISTEN drover`
+	droverNotifySQL          = `SELECT pg_notify('drover', '')`
+	droverNotifySavepointSQL = `SAVEPOINT drover_notify`
+	droverNotifyRollbackSQL  = `ROLLBACK TO SAVEPOINT drover_notify`
+	droverNotifyReleaseSQL   = `RELEASE SAVEPOINT drover_notify`
+)
+
+// Notify emits one coalesced wake-up on the drover channel. Callers that
+// have already committed the insert still keep those rows if this fails.
+func (d *Driver) Notify(ctx context.Context) error {
+	if _, err := d.pool.Exec(ctx, droverNotifySQL); err != nil {
+		return fmt.Errorf("notify drover: %w", err)
+	}
+	return nil
+}
+
+// NotifyTx emits the wake-up inside the caller's transaction, so
+// listeners fire only if that transaction commits. The notify runs
+// under a savepoint: a statement error must not abort the caller's
+// insert.
+func (d *Driver) NotifyTx(ctx context.Context, tx pgx.Tx) error {
+	if _, err := tx.Exec(ctx, droverNotifySavepointSQL); err != nil {
+		return fmt.Errorf("notify drover savepoint: %w", err)
+	}
+	if _, err := tx.Exec(ctx, droverNotifySQL); err != nil {
+		rollbackCtx := context.WithoutCancel(ctx)
+		if _, rbErr := tx.Exec(rollbackCtx, droverNotifyRollbackSQL); rbErr != nil {
+			return fmt.Errorf("notify drover in tx: %w (rollback savepoint: %w)", err, rbErr)
+		}
+		return fmt.Errorf("notify drover in tx: %w", err)
+	}
+	if _, err := tx.Exec(ctx, droverNotifyReleaseSQL); err != nil {
+		return fmt.Errorf("notify drover release savepoint: %w", err)
+	}
+	return nil
+}
+
+// ListenWakeups acquires a dedicated connection, LISTENs on drover, and
+// signals wake (non-blocking, cap-1) for each notification. It returns
+// when ctx is done (nil) or the session drops (error); the caller logs
+// and retries. The acquired connection is always released.
+func (d *Driver) ListenWakeups(ctx context.Context, wake chan struct{}) error {
+	conn, err := d.pool.Acquire(ctx)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
+		return fmt.Errorf("acquire listen connection: %w", err)
+	}
+	defer conn.Release()
+
+	if _, err := conn.Exec(ctx, droverListenSQL); err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
+		return fmt.Errorf("listen drover: %w", err)
+	}
+	defer func() {
+		unlistenCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_, _ = conn.Exec(unlistenCtx, droverUnlistenSQL)
+	}()
+
+	for {
+		if _, err := conn.Conn().WaitForNotification(ctx); err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return fmt.Errorf("wait for drover notification: %w", err)
+		}
+		select {
+		case wake <- struct{}{}:
+		default:
+		}
+	}
+}
+
+const insertBatchDDL = `
+CREATE TEMP TABLE IF NOT EXISTS drover_insert_batch (
+	ord int NOT NULL,
+	kind text NOT NULL,
+	queue text NOT NULL,
+	args jsonb NOT NULL,
+	scheduled_at timestamptz
+) ON COMMIT DROP`
+
+func (d *Driver) insertMany(ctx context.Context, tx pgx.Tx, batch []driver.InsertParams) ([]*driver.JobRow, error) {
+	if _, err := tx.Exec(ctx, insertBatchDDL); err != nil {
+		return nil, fmt.Errorf("create insert-many staging table: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `TRUNCATE drover_insert_batch`); err != nil {
+		return nil, fmt.Errorf("truncate insert-many staging table: %w", err)
+	}
+
+	rows := make([][]any, len(batch))
+	for i, params := range batch {
+		var scheduledAt any
+		if !params.ScheduledAt.IsZero() {
+			scheduledAt = params.ScheduledAt
+		}
+		rows[i] = []any{i, params.Kind, params.Queue, params.Args, scheduledAt}
+	}
+	if _, err := tx.CopyFrom(ctx,
+		pgx.Identifier{"drover_insert_batch"},
+		[]string{"ord", "kind", "queue", "args", "scheduled_at"},
+		pgx.CopyFromRows(rows),
+	); err != nil {
+		return nil, fmt.Errorf("copy insert-many batch: %w", err)
+	}
+
+	jobs, err := d.queries.WithTx(tx).InsertJobsFromStaging(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("insert many jobs from staging: %w", err)
+	}
+	out := make([]*driver.JobRow, len(jobs))
+	for i, job := range jobs {
+		out[i] = rowFromDB(job)
+	}
+	return out, nil
+}
+
 // FetchAvailable claims up to limit due jobs with FOR UPDATE SKIP
 // LOCKED, returning them in id order as running with a lease lasting
 // leaseFor, measured by the database clock.

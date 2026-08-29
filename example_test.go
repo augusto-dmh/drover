@@ -106,6 +106,30 @@ func ExampleConfig_observability() {
 	}
 }
 
+// ExampleConfig_notifyWakeup mirrors the README Planned API Config snippet.
+func ExampleConfig_notifyWakeup() {
+	workers := drover.NewWorkers()
+	_ = drover.Config{
+		Workers:      workers,
+		Concurrency:  8,
+		Queues:       map[string]int{"default": 1, "bulk": 9},
+		Middleware:   []drover.Middleware{drover.Timeout(30 * time.Second)},
+		NotifyWakeup: false, // opt-in LISTEN/NOTIFY; needs session pooling
+	}
+}
+
+// ExampleClient_InsertMany mirrors the README Planned API batch-enqueue snippet.
+func ExampleClient_InsertMany() {
+	ctx := context.Background()
+	var client *drover.Client
+	var user struct{ Email string }
+	user.Email = "ada@example.com"
+	_, _ = client.InsertMany(ctx, []drover.InsertItem{
+		{Args: SendEmail{To: user.Email, Template: "welcome"}},
+		{Args: SendEmail{To: user.Email, Template: "digest"}, Opts: &drover.InsertOpts{Queue: "bulk"}},
+	})
+}
+
 // ExampleMiddleware builds a chain by hand, the same way a Client
 // builds Config.Middleware around its dispatch: the first middleware
 // applied is outermost, so it sees the job first and its result last.

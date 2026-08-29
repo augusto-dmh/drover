@@ -26,6 +26,24 @@ VALUES (
 )
 RETURNING *;
 
+-- Same CASE as InsertJob: dueness is the database clock's, not the
+-- client's. Rows are taken from the session-temp staging table in the
+-- order CopyFrom loaded them.
+-- name: InsertJobsFromStaging :many
+INSERT INTO drover_jobs (kind, queue, args, scheduled_at, state)
+SELECT
+    kind,
+    queue,
+    args,
+    coalesce(scheduled_at, now()),
+    CASE WHEN coalesce(scheduled_at, now()) > now()
+         THEN 'scheduled'::drover_job_state
+         ELSE 'available'::drover_job_state
+    END
+FROM drover_insert_batch
+ORDER BY ord
+RETURNING *;
+
 -- Lease deadlines are computed here, from the database clock, because
 -- that is the clock the sweep compares them against. Deriving them on
 -- the client would make every lease depend on two machines agreeing.

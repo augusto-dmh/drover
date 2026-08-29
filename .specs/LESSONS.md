@@ -86,6 +86,36 @@ Seen once or not yet corroborated. Tracked, not trusted.
 - evidence: sensor M8 inspector.go Stats Oldest mapping dropped (inspector)
 - last seen: 2026-08-08T18:03:27Z
 
+### L-013 — Assert LISTEN reconnect after a session drop, not only that Start succeeds when listen fails once
+- signal: `ac_gap` · recurrence: 1 feature(s) · scope: `wakeup` · harmful: 0
+- features: cycle-g-benchmark-hardening
+- evidence: WAKE AC6; validation.md Discrimination Sensor mutant 7 (wakeup)
+- last seen: 2026-08-16T02:34:40Z
+
+### L-014 — Assert InsertTx does not enqueue a local wake before the caller transaction commits
+- signal: `surviving_mutant` · recurrence: 1 feature(s) · scope: `client` · harmful: 0
+- features: cycle-g-benchmark-hardening
+- evidence: mutant 3 client.go:407 InsertTx nudge (client)
+- last seen: 2026-08-16T02:34:40Z
+
+### L-015 — A reconnect loop is untested if removing it still leaves Start-succeeds-on-listen-error green
+- signal: `surviving_mutant` · recurrence: 1 feature(s) · scope: `wakeup` · harmful: 0
+- features: cycle-g-benchmark-hardening
+- evidence: mutant 7 pool.go:579 listenForWakeups retry removed (wakeup)
+- last seen: 2026-08-16T02:34:40Z
+
+### L-016 — Publish GOARCH beside GOOS in benchmark methodology, not OS and CPU prose alone
+- signal: `spec_precision_gap` · recurrence: 1 feature(s) · scope: `readme` · harmful: 0
+- features: cycle-g-benchmark-hardening
+- evidence: DOC AC1 README.md:166-176 GOARCH omitted (readme)
+- last seen: 2026-08-16T02:34:40Z
+
+### L-017 — When a batch write fails after validation, assert a wrapped error and zero persisted rows, not only the invalid-item path
+- signal: `ac_gap` · recurrence: 1 feature(s) · scope: `insert` · harmful: 0
+- features: cycle-g-benchmark-hardening
+- evidence: edge: InsertMany fails after validation (COPY or INSERT error) (insert)
+- last seen: 2026-08-16T02:34:40Z
+
 ## Quarantined (failed when applied — ignore)
 
 A confirmed lesson that recurred alongside failure. Kept for the maintainer to review.

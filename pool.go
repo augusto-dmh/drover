@@ -67,7 +67,7 @@ type runner struct {
 	stopHeartbeat chan struct{}
 
 	goroutines sync.WaitGroup // fetch loop and workers
-	background sync.WaitGroup // heartbeat, rescuer, and stats refresher
+	background sync.WaitGroup // heartbeat, rescuer, stats refresher, optional LISTEN
 
 	shutdown sync.Once
 	done     chan struct{} // closed once the shutdown has finished
@@ -126,9 +126,16 @@ func newRunner(ctx context.Context, c *Client, ln net.Listener) *runner {
 // start launches the pool: the heartbeat, rescuer, and stats refresher
 // that support it, the fetch loop that feeds it, and one goroutine per
 // worker. The ops server, when configured, is launched here too and is
-// joined at the end of drain rather than under background.
+// joined at the end of drain rather than under background. LISTEN, when
+// opted in, shares fetchCtx with the rescuer so it stops when claiming
+// stops, not after drain.
 func (r *runner) start(ctx context.Context) {
-	r.background.Add(3)
+	n := 3
+	listener, listen := r.client.drv.(wakeupListener)
+	if r.client.notifyWakeup && listen {
+		n++
+	}
+	r.background.Add(n)
 	go func() {
 		defer r.background.Done()
 		r.client.heartbeat(r.stopHeartbeat)
@@ -141,6 +148,12 @@ func (r *runner) start(ctx context.Context) {
 		defer r.background.Done()
 		r.refresher.run(r.fetchCtx)
 	}()
+	if r.client.notifyWakeup && listen {
+		go func() {
+			defer r.background.Done()
+			r.listenForWakeups(listener)
+		}()
+	}
 
 	if r.ops != nil {
 		go r.ops.serve()
@@ -560,15 +573,41 @@ func (r *runner) stopping() bool {
 	}
 }
 
+// listenForWakeups runs LISTEN until fetchCtx is cancelled. A session
+// error is logged and retried after PollInterval; the worker pool keeps
+// polling in the meantime. Start has already returned.
+func (r *runner) listenForWakeups(l wakeupListener) {
+	c := r.client
+	for {
+		err := l.ListenWakeups(r.fetchCtx, c.wake)
+		if r.fetchCtx.Err() != nil {
+			return
+		}
+		if err != nil {
+			c.logger.Error("drover: listen for job notifications", "error", err)
+		}
+		timer := time.NewTimer(c.pollInterval)
+		select {
+		case <-r.fetchCtx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
+}
+
 // sleep waits one poll interval, reporting false when shutdown began
-// first so a stopping pool never sits out an idle tick.
+// first so a stopping pool never sits out an idle tick. A local insert
+// (or a LISTEN wake) can end the wait early; stop still wins if both
+// are ready, so a flooded wake channel cannot delay shutdown.
 func (r *runner) sleep() bool {
 	timer := time.NewTimer(r.client.pollInterval)
 	defer timer.Stop()
 	select {
 	case <-r.stopFetch:
 		return false
+	case <-r.client.wake:
 	case <-timer.C:
-		return true
 	}
+	return !r.stopping()
 }

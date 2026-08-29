@@ -161,6 +161,15 @@ type Driver interface {
 	Insert(ctx context.Context, params InsertParams) (*JobRow, error)
 	InsertTx(ctx context.Context, tx any, params InsertParams) (*JobRow, error)
 
+	// InsertMany persists every job in batch in one atomic write and
+	// returns a row per item, in input order. An empty or nil batch is
+	// success with no write.
+	InsertMany(ctx context.Context, batch []InsertParams) ([]*JobRow, error)
+
+	// InsertManyTx is InsertMany inside the caller's transaction. Drivers
+	// that cannot join a caller-owned transaction return ErrTxUnsupported.
+	InsertManyTx(ctx context.Context, tx any, batch []InsertParams) ([]*JobRow, error)
+
 	// FetchAvailable claims up to limit due jobs from queue: each waiting
 	// job whose scheduled time has passed becomes running with an
 	// incremented attempt and a lease lasting leaseFor. A job waits in one

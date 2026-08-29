@@ -153,6 +153,207 @@ func TestInsertTxIsUnsupported(t *testing.T) {
 	}
 }
 
+func TestInsertManyReturnsRowsInInputOrder(t *testing.T) {
+	t.Parallel()
+	d := New()
+
+	batch := []driver.InsertParams{
+		{Kind: "first", Queue: "default", Args: []byte(`{"n":1}`)},
+		{Kind: "second", Queue: "default", Args: []byte(`{"n":2}`)},
+		{Kind: "third", Queue: "default", Args: []byte(`{"n":3}`)},
+	}
+	rows, err := d.InsertMany(context.Background(), batch)
+	if err != nil {
+		t.Fatalf("InsertMany: %v", err)
+	}
+	if len(rows) != len(batch) {
+		t.Fatalf("InsertMany returned %d rows, want %d", len(rows), len(batch))
+	}
+
+	seen := make(map[int64]struct{}, len(rows))
+	for i, row := range rows {
+		if row.Kind != batch[i].Kind {
+			t.Errorf("row %d Kind = %q, want %q", i, row.Kind, batch[i].Kind)
+		}
+		if row.ID <= 0 {
+			t.Errorf("row %d ID = %d, want a positive id", i, row.ID)
+		}
+		if _, dup := seen[row.ID]; dup {
+			t.Errorf("row %d ID %d is not distinct", i, row.ID)
+		}
+		seen[row.ID] = struct{}{}
+		stored, ok := d.Row(row.ID)
+		if !ok {
+			t.Fatalf("job %d missing from store", row.ID)
+		}
+		if stored.Kind != row.Kind {
+			t.Errorf("stored job %d Kind = %q, want %q", row.ID, stored.Kind, row.Kind)
+		}
+	}
+}
+
+func TestInsertManyEmptyBatchWritesNothing(t *testing.T) {
+	t.Parallel()
+	d := New()
+	existing := mustInsert(t, d, "keep", "default")
+
+	for _, batch := range [][]driver.InsertParams{nil, {}} {
+		rows, err := d.InsertMany(context.Background(), batch)
+		if err != nil {
+			t.Fatalf("InsertMany(%v): %v", batch, err)
+		}
+		if len(rows) != 0 {
+			t.Fatalf("InsertMany(%v) returned %d rows, want 0", batch, len(rows))
+		}
+	}
+
+	if _, ok := d.Row(existing.ID); !ok {
+		t.Fatal("empty batch removed the existing job")
+	}
+	next := mustInsert(t, d, "after", "default")
+	if next.ID != existing.ID+1 {
+		t.Fatalf("next ID = %d, want %d — empty batch consumed an id", next.ID, existing.ID+1)
+	}
+}
+
+func TestInsertManyMixedQueuesAndSchedules(t *testing.T) {
+	t.Parallel()
+	d := New()
+	now := time.Now()
+	future := now.Add(time.Hour)
+
+	batch := []driver.InsertParams{
+		{Kind: "due-alpha", Queue: "alpha", Args: []byte(`{"n":1}`)},
+		{Kind: "wait-beta", Queue: "beta", Args: []byte(`{"n":2}`), ScheduledAt: future},
+		{Kind: "due-beta", Queue: "beta", Args: []byte(`{"n":3}`), ScheduledAt: now.Add(-time.Minute)},
+	}
+	rows, err := d.InsertMany(context.Background(), batch)
+	if err != nil {
+		t.Fatalf("InsertMany: %v", err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("InsertMany returned %d rows, want 3", len(rows))
+	}
+
+	if rows[0].Queue != "alpha" || rows[0].State != "available" {
+		t.Errorf("row 0 queue/state = %q/%q, want alpha/available", rows[0].Queue, rows[0].State)
+	}
+	if rows[1].Queue != "beta" || rows[1].State != "scheduled" {
+		t.Errorf("row 1 queue/state = %q/%q, want beta/scheduled", rows[1].Queue, rows[1].State)
+	}
+	if !rows[1].ScheduledAt.Equal(future) {
+		t.Errorf("row 1 ScheduledAt = %v, want %v", rows[1].ScheduledAt, future)
+	}
+	if rows[2].Queue != "beta" || rows[2].State != "available" {
+		t.Errorf("row 2 queue/state = %q/%q, want beta/available", rows[2].Queue, rows[2].State)
+	}
+
+	alpha, err := d.FetchAvailable(context.Background(), "alpha", time.Minute, 10)
+	if err != nil {
+		t.Fatalf("FetchAvailable alpha: %v", err)
+	}
+	if len(alpha) != 1 || alpha[0].ID != rows[0].ID {
+		t.Fatalf("alpha claimed %+v, want job %d", idsOf(alpha), rows[0].ID)
+	}
+
+	beta, err := d.FetchAvailable(context.Background(), "beta", time.Minute, 10)
+	if err != nil {
+		t.Fatalf("FetchAvailable beta: %v", err)
+	}
+	if len(beta) != 1 || beta[0].ID != rows[2].ID {
+		t.Fatalf("beta claimed %+v, want due job %d (scheduled job excluded)", idsOf(beta), rows[2].ID)
+	}
+}
+
+func TestInsertManyZeroScheduledAtIsDue(t *testing.T) {
+	t.Parallel()
+	d := New()
+
+	rows, err := d.InsertMany(context.Background(), []driver.InsertParams{
+		{Kind: "now", Queue: "default", Args: []byte(`{}`)},
+	})
+	if err != nil {
+		t.Fatalf("InsertMany: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("InsertMany returned %d rows, want 1", len(rows))
+	}
+	if rows[0].State != "available" {
+		t.Errorf("State = %q, want available", rows[0].State)
+	}
+	if rows[0].ScheduledAt.IsZero() {
+		t.Fatal("ScheduledAt is zero; zero input must become now")
+	}
+
+	claimed, err := d.FetchAvailable(context.Background(), "default", time.Minute, 10)
+	if err != nil {
+		t.Fatalf("FetchAvailable: %v", err)
+	}
+	if len(claimed) != 1 || claimed[0].ID != rows[0].ID {
+		t.Fatalf("claimed %+v, want job %d", idsOf(claimed), rows[0].ID)
+	}
+}
+
+func TestConcurrentInsertManyAssignsUniqueIDs(t *testing.T) {
+	t.Parallel()
+	d := New()
+	const writers = 10
+	const per = 20
+	var wg sync.WaitGroup
+	ids := make(chan int64, writers*per)
+	for range writers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			batch := make([]driver.InsertParams, per)
+			for i := range batch {
+				batch[i] = driver.InsertParams{Kind: "k", Queue: "default", Args: []byte(`{}`)}
+			}
+			rows, err := d.InsertMany(context.Background(), batch)
+			if err != nil {
+				t.Errorf("InsertMany: %v", err)
+				return
+			}
+			for _, row := range rows {
+				ids <- row.ID
+			}
+		}()
+	}
+	wg.Wait()
+	close(ids)
+
+	seen := make(map[int64]struct{}, writers*per)
+	for id := range ids {
+		if _, dup := seen[id]; dup {
+			t.Fatalf("duplicate id %d from concurrent InsertMany", id)
+		}
+		seen[id] = struct{}{}
+	}
+	if len(seen) != writers*per {
+		t.Fatalf("got %d unique ids, want %d", len(seen), writers*per)
+	}
+}
+
+func TestInsertManyTxIsUnsupported(t *testing.T) {
+	t.Parallel()
+	d := New()
+
+	_, err := d.InsertManyTx(context.Background(), nil, []driver.InsertParams{
+		{Kind: "k", Queue: "default"},
+	})
+	if !errors.Is(err, driver.ErrTxUnsupported) {
+		t.Fatalf("InsertManyTx error = %v, want ErrTxUnsupported", err)
+	}
+}
+
+func idsOf(rows []*driver.JobRow) []int64 {
+	ids := make([]int64, len(rows))
+	for i, row := range rows {
+		ids[i] = row.ID
+	}
+	return ids
+}
+
 func TestFetchAvailableClaimsInFIFOOrderWithLease(t *testing.T) {
 	t.Parallel()
 	d := New()

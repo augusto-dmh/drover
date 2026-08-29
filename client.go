@@ -54,16 +54,28 @@ type JobRow struct {
 }
 
 // Config configures a Client. Zero values get defaults: slog.Default()
-// for Logger, one second for PollInterval, an empty registry for
-// Workers, ExponentialRetryPolicy for RetryPolicy, one minute for
-// LeaseDuration, a third of the lease for HeartbeatInterval, the lease
-// duration itself for RescueInterval, fifteen seconds for StatsInterval,
-// and a registry of the client's own for MetricsRegistry.
+// for Logger, one second for PollInterval, NotifyWakeup off, an empty
+// registry for Workers, ExponentialRetryPolicy for RetryPolicy, one
+// minute for LeaseDuration, a third of the lease for HeartbeatInterval,
+// the lease duration itself for RescueInterval, fifteen seconds for
+// StatsInterval, and a registry of the client's own for MetricsRegistry.
 type Config struct {
 	Workers      *Workers
 	Logger       *slog.Logger
 	PollInterval time.Duration
-	RetryPolicy  RetryPolicy
+
+	// NotifyWakeup, when true, interrupts an idle fetch wait as soon as
+	// a job is committed rather than when PollInterval elapses. Polling
+	// remains the source of truth: a missed notification only delays a
+	// claim until the next tick.
+	//
+	// Default false. The flag is opt-in because LISTEN/NOTIFY serializes
+	// commits and is incompatible with PgBouncer transaction pooling
+	// (session pooling or a direct connection is required). Set it on
+	// both producers and workers.
+	NotifyWakeup bool
+
+	RetryPolicy RetryPolicy
 
 	// Middleware wraps every job this client executes, whatever its
 	// kind. The first element is outermost: it sees a job before the
@@ -183,6 +195,8 @@ type Client struct {
 	workers           *Workers
 	logger            *slog.Logger
 	pollInterval      time.Duration
+	notifyWakeup      bool
+	wake              chan struct{}
 	retryPolicy       RetryPolicy
 	leaseDuration     time.Duration
 	heartbeatInterval time.Duration
@@ -225,6 +239,8 @@ func newClient(drv driver.Driver, cfg Config) *Client {
 		workers:           cfg.Workers,
 		logger:            cfg.Logger,
 		pollInterval:      cfg.PollInterval,
+		notifyWakeup:      cfg.NotifyWakeup,
+		wake:              make(chan struct{}, 1),
 		retryPolicy:       cfg.RetryPolicy,
 		leaseDuration:     cfg.LeaseDuration,
 		heartbeatInterval: cfg.HeartbeatInterval,
@@ -332,6 +348,13 @@ func checkedMiddleware(mws []Middleware) []Middleware {
 	return mws
 }
 
+// InsertItem is one job in an InsertMany batch: the args to persist and
+// optional enqueue choices. A nil Opts means the same defaults as Insert.
+type InsertItem struct {
+	Args JobArgs
+	Opts *InsertOpts
+}
+
 // InsertOpts are the per-job choices made at enqueue time. A nil
 // *InsertOpts, or a zero value, means the defaults: the "default" queue,
 // runnable immediately.
@@ -365,6 +388,7 @@ func (c *Client) Insert(ctx context.Context, args JobArgs, opts *InsertOpts) (*J
 	if err != nil {
 		return nil, fmt.Errorf("drover: insert job kind %q: %w", params.Kind, err)
 	}
+	c.wakeAfterInsert(ctx)
 	return rowFromDriver(row), nil
 }
 
@@ -380,10 +404,122 @@ func (c *Client) InsertTx(ctx context.Context, tx pgx.Tx, args JobArgs, opts *In
 	if err != nil {
 		return nil, fmt.Errorf("drover: insert job kind %q in tx: %w", params.Kind, err)
 	}
+	c.notifyTx(ctx, tx)
 	return rowFromDriver(row), nil
 }
 
+// InsertMany enqueues every item in one atomic write. The returned rows
+// match the input order. An empty or nil slice succeeds without writing.
+func (c *Client) InsertMany(ctx context.Context, items []InsertItem) ([]*JobRow, error) {
+	batch, err := insertParamsForMany(items)
+	if err != nil {
+		return nil, err
+	}
+	if len(batch) == 0 {
+		return []*JobRow{}, nil
+	}
+	rows, err := c.drv.InsertMany(ctx, batch)
+	if err != nil {
+		return nil, fmt.Errorf("drover: insert jobs: %w", err)
+	}
+	c.wakeAfterInsert(ctx)
+	return rowsFromDriver(rows), nil
+}
+
+// InsertManyTx enqueues every item inside the caller's transaction: the
+// jobs exist if and only if tx commits, so a domain write and its jobs
+// are atomic.
+func (c *Client) InsertManyTx(ctx context.Context, tx pgx.Tx, items []InsertItem) ([]*JobRow, error) {
+	batch, err := insertParamsForMany(items)
+	if err != nil {
+		return nil, err
+	}
+	if len(batch) == 0 {
+		return []*JobRow{}, nil
+	}
+	rows, err := c.drv.InsertManyTx(ctx, tx, batch)
+	if err != nil {
+		return nil, fmt.Errorf("drover: insert jobs in tx: %w", err)
+	}
+	c.notifyTx(ctx, tx)
+	return rowsFromDriver(rows), nil
+}
+
+// notifier is the optional pgdriver surface for coalesced LISTEN/NOTIFY.
+// It is not on driver.Driver: memdriver has no session to listen on.
+type notifier interface {
+	Notify(ctx context.Context) error
+	NotifyTx(ctx context.Context, tx pgx.Tx) error
+}
+
+// wakeupListener is the optional pgdriver surface that waits on Postgres
+// LISTEN. It is not on driver.Driver: the unit suite stays on memdriver.
+type wakeupListener interface {
+	ListenWakeups(ctx context.Context, wake chan struct{}) error
+}
+
+func (c *Client) wakeAfterInsert(ctx context.Context) {
+	if !c.notifyWakeup {
+		return
+	}
+	c.nudge()
+	c.notify(ctx)
+}
+
+func (c *Client) nudge() {
+	select {
+	case c.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (c *Client) notify(ctx context.Context) {
+	n, ok := c.drv.(notifier)
+	if !ok {
+		return
+	}
+	if err := n.Notify(ctx); err != nil {
+		c.logger.Error("drover: notify listeners of insert", "error", err)
+	}
+}
+
+func (c *Client) notifyTx(ctx context.Context, tx pgx.Tx) {
+	if !c.notifyWakeup {
+		return
+	}
+	n, ok := c.drv.(notifier)
+	if !ok {
+		return
+	}
+	if err := n.NotifyTx(ctx, tx); err != nil {
+		c.logger.Error("drover: notify listeners of insert", "error", err)
+	}
+}
+
+func insertParamsForMany(items []InsertItem) ([]driver.InsertParams, error) {
+	batch := make([]driver.InsertParams, len(items))
+	for i, item := range items {
+		params, err := insertParamsFor(item.Args, item.Opts)
+		if err != nil {
+			return nil, fmt.Errorf("item %d: %w", i, err)
+		}
+		batch[i] = params
+	}
+	return batch, nil
+}
+
+func rowsFromDriver(rows []*driver.JobRow) []*JobRow {
+	out := make([]*JobRow, len(rows))
+	for i, row := range rows {
+		out[i] = rowFromDriver(row)
+	}
+	return out
+}
+
 func insertParamsFor(args JobArgs, opts *InsertOpts) (driver.InsertParams, error) {
+	if args == nil {
+		return driver.InsertParams{}, ErrInvalidKind
+	}
 	kind := args.Kind()
 	if kind == "" {
 		return driver.InsertParams{}, ErrInvalidKind

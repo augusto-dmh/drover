@@ -3,7 +3,7 @@
   "promote_threshold": 2,
   "window_days": 45,
   "quarantine_threshold": 2,
-  "next_id": 13,
+  "next_id": 18,
   "lessons": [
     {
       "id": "L-001",
@@ -220,6 +220,96 @@
       ],
       "created": "2026-08-08T18:03:27Z",
       "last_seen": "2026-08-08T18:03:27Z"
+    },
+    {
+      "id": "L-013",
+      "key": "ac_gap::assert listen reconnect after a session drop not only that start succeeds when listen fails once",
+      "text": "Assert LISTEN reconnect after a session drop, not only that Start succeeds when listen fails once",
+      "signal": "ac_gap",
+      "scope": "wakeup",
+      "status": "candidate",
+      "features": [
+        "cycle-g-benchmark-hardening"
+      ],
+      "recurrence": 1,
+      "harmful": 0,
+      "evidence": [
+        "WAKE AC6; validation.md Discrimination Sensor mutant 7 (wakeup)"
+      ],
+      "created": "2026-08-16T02:34:40Z",
+      "last_seen": "2026-08-16T02:34:40Z"
+    },
+    {
+      "id": "L-014",
+      "key": "surviving_mutant::assert inserttx does not enqueue a local wake before the caller transaction commits",
+      "text": "Assert InsertTx does not enqueue a local wake before the caller transaction commits",
+      "signal": "surviving_mutant",
+      "scope": "client",
+      "status": "candidate",
+      "features": [
+        "cycle-g-benchmark-hardening"
+      ],
+      "recurrence": 1,
+      "harmful": 0,
+      "evidence": [
+        "mutant 3 client.go:407 InsertTx nudge (client)"
+      ],
+      "created": "2026-08-16T02:34:40Z",
+      "last_seen": "2026-08-16T02:34:40Z"
+    },
+    {
+      "id": "L-015",
+      "key": "surviving_mutant::a reconnect loop is untested if removing it still leaves start succeeds on listen error green",
+      "text": "A reconnect loop is untested if removing it still leaves Start-succeeds-on-listen-error green",
+      "signal": "surviving_mutant",
+      "scope": "wakeup",
+      "status": "candidate",
+      "features": [
+        "cycle-g-benchmark-hardening"
+      ],
+      "recurrence": 1,
+      "harmful": 0,
+      "evidence": [
+        "mutant 7 pool.go:579 listenForWakeups retry removed (wakeup)"
+      ],
+      "created": "2026-08-16T02:34:40Z",
+      "last_seen": "2026-08-16T02:34:40Z"
+    },
+    {
+      "id": "L-016",
+      "key": "spec_precision_gap::publish goarch beside goos in benchmark methodology not os and cpu prose alone",
+      "text": "Publish GOARCH beside GOOS in benchmark methodology, not OS and CPU prose alone",
+      "signal": "spec_precision_gap",
+      "scope": "readme",
+      "status": "candidate",
+      "features": [
+        "cycle-g-benchmark-hardening"
+      ],
+      "recurrence": 1,
+      "harmful": 0,
+      "evidence": [
+        "DOC AC1 README.md:166-176 GOARCH omitted (readme)"
+      ],
+      "created": "2026-08-16T02:34:40Z",
+      "last_seen": "2026-08-16T02:34:40Z"
+    },
+    {
+      "id": "L-017",
+      "key": "ac_gap::when a batch write fails after validation assert a wrapped error and zero persisted rows not only the invalid item path",
+      "text": "When a batch write fails after validation, assert a wrapped error and zero persisted rows, not only the invalid-item path",
+      "signal": "ac_gap",
+      "scope": "insert",
+      "status": "candidate",
+      "features": [
+        "cycle-g-benchmark-hardening"
+      ],
+      "recurrence": 1,
+      "harmful": 0,
+      "evidence": [
+        "edge: InsertMany fails after validation (COPY or INSERT error) (insert)"
+      ],
+      "created": "2026-08-16T02:34:40Z",
+      "last_seen": "2026-08-16T02:34:40Z"
     }
   ]
 }

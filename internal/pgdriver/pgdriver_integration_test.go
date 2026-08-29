@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/augusto-dmh/drover/internal/driver"
@@ -1495,5 +1497,487 @@ func TestOperatorCancelRaceReportsInvalidTransition(t *testing.T) {
 	}
 	if got := readJob(t, pool, id); got.State != "cancelled" {
 		t.Errorf("state = %s, want cancelled", got.State)
+	}
+}
+
+func TestInsertManyReturnsRowsInInputOrder(t *testing.T) {
+	d, _ := newDriver(t)
+
+	batch := []driver.InsertParams{
+		{Kind: "first", Queue: "default", Args: []byte(`{"n":1}`)},
+		{Kind: "second", Queue: "default", Args: []byte(`{"n":2}`)},
+		{Kind: "third", Queue: "default", Args: []byte(`{"n":3}`)},
+	}
+	rows, err := d.InsertMany(context.Background(), batch)
+	if err != nil {
+		t.Fatalf("InsertMany: %v", err)
+	}
+	if len(rows) != len(batch) {
+		t.Fatalf("InsertMany returned %d rows, want %d", len(rows), len(batch))
+	}
+
+	seen := make(map[int64]struct{}, len(rows))
+	for i, row := range rows {
+		if row.Kind != batch[i].Kind {
+			t.Errorf("row %d Kind = %q, want %q", i, row.Kind, batch[i].Kind)
+		}
+		if row.ID <= 0 {
+			t.Errorf("row %d ID = %d, want a positive id", i, row.ID)
+		}
+		if _, dup := seen[row.ID]; dup {
+			t.Errorf("row %d ID %d is not distinct", i, row.ID)
+		}
+		seen[row.ID] = struct{}{}
+	}
+}
+
+func TestInsertManyEmptyBatchWritesNothing(t *testing.T) {
+	d, pool := newDriver(t)
+	ctx := context.Background()
+	existing := mustInsert(t, d, "keep", "default")
+
+	for _, batch := range [][]driver.InsertParams{nil, {}} {
+		rows, err := d.InsertMany(ctx, batch)
+		if err != nil {
+			t.Fatalf("InsertMany(%v): %v", batch, err)
+		}
+		if len(rows) != 0 {
+			t.Fatalf("InsertMany(%v) returned %d rows, want 0", batch, len(rows))
+		}
+	}
+
+	var n int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM drover_jobs`).Scan(&n); err != nil {
+		t.Fatalf("count jobs: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("store has %d jobs, want 1", n)
+	}
+	if got := readJob(t, pool, existing.ID); got.State != "available" {
+		t.Errorf("existing job state = %s, want available", got.State)
+	}
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	empty, err := d.InsertManyTx(ctx, tx, nil)
+	if err != nil {
+		t.Fatalf("InsertManyTx(nil): %v", err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("InsertManyTx(nil) returned %d rows, want 0", len(empty))
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM drover_jobs`).Scan(&n); err != nil {
+		t.Fatalf("count jobs after empty InsertManyTx: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("after empty InsertManyTx: %d jobs, want 1", n)
+	}
+}
+
+func TestInsertManyHonoursScheduledAtAndQueues(t *testing.T) {
+	d, _ := newDriver(t)
+	ctx := context.Background()
+	now := time.Now()
+	future := now.Add(time.Hour)
+
+	rows, err := d.InsertMany(ctx, []driver.InsertParams{
+		{Kind: "due-alpha", Queue: "alpha", Args: []byte(`{"n":1}`)},
+		{Kind: "wait-beta", Queue: "beta", Args: []byte(`{"n":2}`), ScheduledAt: future},
+		{Kind: "due-beta", Queue: "beta", Args: []byte(`{"n":3}`), ScheduledAt: now.Add(-time.Minute)},
+	})
+	if err != nil {
+		t.Fatalf("InsertMany: %v", err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("InsertMany returned %d rows, want 3", len(rows))
+	}
+
+	if rows[0].Queue != "alpha" || rows[0].State != "available" {
+		t.Errorf("row 0 queue/state = %q/%q, want alpha/available", rows[0].Queue, rows[0].State)
+	}
+	if rows[0].ScheduledAt.IsZero() {
+		t.Error("row 0 ScheduledAt is zero; zero input must become now")
+	}
+	if rows[1].Queue != "beta" || rows[1].State != "scheduled" {
+		t.Errorf("row 1 queue/state = %q/%q, want beta/scheduled", rows[1].Queue, rows[1].State)
+	}
+	if want := future.Truncate(time.Microsecond); !rows[1].ScheduledAt.Equal(want) {
+		t.Errorf("row 1 ScheduledAt = %v, want %v", rows[1].ScheduledAt.UTC(), want.UTC())
+	}
+	if rows[2].Queue != "beta" || rows[2].State != "available" {
+		t.Errorf("row 2 queue/state = %q/%q, want beta/available", rows[2].Queue, rows[2].State)
+	}
+
+	alpha, err := d.FetchAvailable(ctx, "alpha", time.Minute, 10)
+	if err != nil {
+		t.Fatalf("FetchAvailable alpha: %v", err)
+	}
+	if len(alpha) != 1 || alpha[0].ID != rows[0].ID {
+		t.Fatalf("alpha claimed %d job(s), want job %d", len(alpha), rows[0].ID)
+	}
+
+	beta, err := d.FetchAvailable(ctx, "beta", time.Minute, 10)
+	if err != nil {
+		t.Fatalf("FetchAvailable beta: %v", err)
+	}
+	if len(beta) != 1 || beta[0].ID != rows[2].ID {
+		t.Fatalf("beta claimed %d job(s), want due job %d", len(beta), rows[2].ID)
+	}
+}
+
+func TestInsertManyTxVisibilityFollowsTransaction(t *testing.T) {
+	d, pool := newDriver(t)
+	ctx := context.Background()
+	batch := []driver.InsertParams{
+		{Kind: "k", Queue: "default", Args: []byte(`{}`)},
+		{Kind: "k2", Queue: "default", Args: []byte(`{}`)},
+	}
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if _, err := d.InsertManyTx(ctx, tx, batch); err != nil {
+		t.Fatalf("InsertManyTx: %v", err)
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+	claimed, err := d.FetchAvailable(ctx, "default", time.Minute, 10)
+	if err != nil {
+		t.Fatalf("FetchAvailable after rollback: %v", err)
+	}
+	if len(claimed) != 0 {
+		t.Fatalf("after rollback FetchAvailable claimed %d jobs, want 0", len(claimed))
+	}
+
+	tx, err = pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	inserted, err := d.InsertManyTx(ctx, tx, batch)
+	if err != nil {
+		t.Fatalf("InsertManyTx: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	claimed, err = d.FetchAvailable(ctx, "default", time.Minute, 10)
+	if err != nil {
+		t.Fatalf("FetchAvailable after commit: %v", err)
+	}
+	if len(claimed) != 2 {
+		t.Fatalf("after commit FetchAvailable claimed %d jobs, want 2", len(claimed))
+	}
+	if claimed[0].ID != inserted[0].ID || claimed[1].ID != inserted[1].ID {
+		t.Errorf("claimed ids %d,%d, want %d,%d", claimed[0].ID, claimed[1].ID, inserted[0].ID, inserted[1].ID)
+	}
+}
+
+func TestInsertManyTxOnRolledBackTransactionPersistsNothing(t *testing.T) {
+	d, pool := newDriver(t)
+	ctx := context.Background()
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+
+	_, err = d.InsertManyTx(ctx, tx, []driver.InsertParams{
+		{Kind: "k", Queue: "default", Args: []byte(`{}`)},
+	})
+	if err == nil {
+		t.Fatal("InsertManyTx error = nil, want a failure after the transaction was rolled back")
+	}
+
+	var n int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM drover_jobs`).Scan(&n); err != nil {
+		t.Fatalf("count jobs: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("drover_jobs has %d rows after a failed InsertManyTx, want 0", n)
+	}
+}
+
+func TestInsertManyTxTwiceInOneTransaction(t *testing.T) {
+	d, pool := newDriver(t)
+	ctx := context.Background()
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	first, err := d.InsertManyTx(ctx, tx, []driver.InsertParams{
+		{Kind: "a", Queue: "default", Args: []byte(`{}`)},
+		{Kind: "b", Queue: "default", Args: []byte(`{}`)},
+	})
+	if err != nil {
+		t.Fatalf("first InsertManyTx: %v", err)
+	}
+	second, err := d.InsertManyTx(ctx, tx, []driver.InsertParams{
+		{Kind: "c", Queue: "default", Args: []byte(`{}`)},
+	})
+	if err != nil {
+		t.Fatalf("second InsertManyTx: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	claimed, err := d.FetchAvailable(ctx, "default", time.Minute, 10)
+	if err != nil {
+		t.Fatalf("FetchAvailable: %v", err)
+	}
+	if len(claimed) != 3 {
+		t.Fatalf("claimed %d jobs, want 3", len(claimed))
+	}
+	want := []string{"a", "b", "c"}
+	got := []string{claimed[0].Kind, claimed[1].Kind, claimed[2].Kind}
+	if !slices.Equal(got, want) {
+		t.Errorf("claimed kinds %v, want %v (ids %d,%d then %d)", got, want, first[0].ID, first[1].ID, second[0].ID)
+	}
+}
+
+func TestInsertManyTxRejectsNonPgxTransaction(t *testing.T) {
+	d, _ := newDriver(t)
+
+	_, err := d.InsertManyTx(context.Background(), "not a tx", []driver.InsertParams{
+		{Kind: "k", Queue: "default"},
+	})
+	if !errors.Is(err, driver.ErrTxUnsupported) {
+		t.Fatalf("error = %v, want ErrTxUnsupported", err)
+	}
+}
+
+func TestInsertManyUsesCopyFrom(t *testing.T) {
+	d, _, trace := newTracedDriver(t)
+
+	const n = 5
+	batch := make([]driver.InsertParams, n)
+	for i := range batch {
+		batch[i] = driver.InsertParams{Kind: "k", Queue: "default", Args: []byte(`{}`)}
+	}
+	rows, err := d.InsertMany(context.Background(), batch)
+	if err != nil {
+		t.Fatalf("InsertMany: %v", err)
+	}
+	if len(rows) != n {
+		t.Fatalf("InsertMany returned %d rows, want %d", len(rows), n)
+	}
+
+	trace.mu.Lock()
+	defer trace.mu.Unlock()
+	if trace.copyFrom != 1 {
+		t.Errorf("CopyFrom called %d times, want 1", trace.copyFrom)
+	}
+	if trace.insertJob != 0 {
+		t.Errorf("InsertJob VALUES ran %d times, want 0 — the batch must not loop single-row inserts", trace.insertJob)
+	}
+}
+
+type insertTrace struct {
+	mu        sync.Mutex
+	copyFrom  int
+	insertJob int
+}
+
+func (t *insertTrace) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	if strings.Contains(data.SQL, "INSERT INTO drover_jobs") && strings.Contains(data.SQL, "VALUES") {
+		t.mu.Lock()
+		t.insertJob++
+		t.mu.Unlock()
+	}
+	return ctx
+}
+
+func (t *insertTrace) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
+
+func (t *insertTrace) TraceCopyFromStart(ctx context.Context, _ *pgx.Conn, _ pgx.TraceCopyFromStartData) context.Context {
+	t.mu.Lock()
+	t.copyFrom++
+	t.mu.Unlock()
+	return ctx
+}
+
+func (t *insertTrace) TraceCopyFromEnd(context.Context, *pgx.Conn, pgx.TraceCopyFromEndData) {}
+
+func newTracedDriver(t *testing.T) (*pgdriver.Driver, *pgxpool.Pool, *insertTrace) {
+	t.Helper()
+	base := testdb.NewDB(t)
+	trace := &insertTrace{}
+	cfg := base.Config()
+	cfg.ConnConfig.Tracer = trace
+	ctx := context.Background()
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatalf("traced pool: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	d := pgdriver.New(pool)
+	if err := d.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	return d, pool, trace
+}
+
+func TestNotifyTxDeliversOnlyOnCommit(t *testing.T) {
+	t.Parallel()
+	d, pool := newDriver(t)
+	ctx := context.Background()
+
+	listener, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	defer listener.Release()
+	if _, err := listener.Exec(ctx, "LISTEN drover"); err != nil {
+		t.Fatalf("LISTEN: %v", err)
+	}
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // commit path succeeds; rollback after commit is a no-op
+
+	if err := d.NotifyTx(ctx, tx); err != nil {
+		t.Fatalf("NotifyTx: %v", err)
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, 150*time.Millisecond)
+	n, err := listener.Conn().WaitForNotification(waitCtx)
+	cancel()
+	if err == nil {
+		t.Fatalf("received NOTIFY on %q before commit", n.Channel)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
+	waitCtx, cancel = context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	n, err = listener.Conn().WaitForNotification(waitCtx)
+	if err != nil {
+		t.Fatalf("expected NOTIFY after commit: %v", err)
+	}
+	if n.Channel != "drover" {
+		t.Errorf("channel = %q, want drover", n.Channel)
+	}
+}
+
+// notifyFailTx lets SAVEPOINT/ROLLBACK reach Postgres but replaces
+// pg_notify with a statement error so the savepoint must absorb it.
+type notifyFailTx struct {
+	pgx.Tx
+}
+
+func (t notifyFailTx) Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error) {
+	if strings.Contains(sql, "pg_notify") {
+		return t.Tx.Exec(ctx, "SELECT 1/0")
+	}
+	return t.Tx.Exec(ctx, sql, arguments...)
+}
+
+func TestNotifyTxFailureDoesNotAbortCallerTransaction(t *testing.T) {
+	t.Parallel()
+	d, pool := newDriver(t)
+	ctx := context.Background()
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // commit path succeeds; rollback after commit is a no-op
+
+	row, err := d.InsertTx(ctx, tx, driver.InsertParams{
+		Kind:  "k",
+		Queue: "default",
+		Args:  []byte(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("InsertTx: %v", err)
+	}
+
+	if err := d.NotifyTx(ctx, notifyFailTx{Tx: tx}); err == nil {
+		t.Fatal("NotifyTx error = nil, want the injected statement failure")
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("Commit after notify failure: %v — notify must not abort the caller transaction", err)
+	}
+
+	got, err := d.GetJob(ctx, row.ID)
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if got == nil || got.ID != row.ID {
+		t.Fatalf("job %d missing after commit; notify failure rolled back the insert", row.ID)
+	}
+}
+
+func TestListenWakeupsExitsWhenContextCancelled(t *testing.T) {
+	t.Parallel()
+	d, _ := newDriver(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	wake := make(chan struct{}, 1)
+	done := make(chan error, 1)
+	go func() { done <- d.ListenWakeups(ctx, wake) }()
+
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("ListenWakeups = %v, want nil after cancel", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ListenWakeups did not return after cancel")
+	}
+}
+
+func TestListenWakeupsNudgesOnNotify(t *testing.T) {
+	t.Parallel()
+	d, _ := newDriver(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	wake := make(chan struct{}, 1)
+	done := make(chan error, 1)
+	go func() { done <- d.ListenWakeups(ctx, wake) }()
+
+	time.Sleep(100 * time.Millisecond)
+	deadline := time.Now().Add(time.Second)
+	for {
+		if err := d.Notify(ctx); err != nil {
+			t.Fatalf("Notify: %v", err)
+		}
+		select {
+		case <-wake:
+			cancel()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Errorf("ListenWakeups = %v, want nil after cancel", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("ListenWakeups did not return after cancel")
+			}
+			return
+		case err := <-done:
+			t.Fatalf("ListenWakeups returned early: %v", err)
+		case <-time.After(20 * time.Millisecond):
+			if time.Now().After(deadline) {
+				t.Fatal("ListenWakeups did not signal wake after Notify")
+			}
+		}
 	}
 }
