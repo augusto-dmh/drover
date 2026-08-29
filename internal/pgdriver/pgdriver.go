@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"math"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -22,10 +23,17 @@ import (
 	"github.com/augusto-dmh/drover/internal/migrate"
 )
 
+// AdvisoryLockPeriodic is the session advisory-lock key for the
+// periodic scheduler. "drover" in ASCII, shifted left 8, plus 1.
+const AdvisoryLockPeriodic int64 = 0x64726f7665720001
+
 // Driver implements driver.Driver on a pgx connection pool.
 type Driver struct {
 	pool    *pgxpool.Pool
 	queries *dbsqlc.Queries
+
+	leaderMu   sync.Mutex
+	leaderConn *pgxpool.Conn
 }
 
 // New returns a Driver backed by pool.
@@ -174,6 +182,68 @@ func (d *Driver) ListenWakeups(ctx context.Context, wake chan struct{}) error {
 		default:
 		}
 	}
+}
+
+// TryBecomeLeader acquires a dedicated pool connection and takes the
+// periodic-scheduler session lock. The connection stays checked out
+// until ReleaseLeader — returning it while the lock is held would
+// leak session state onto the next checkout.
+func (d *Driver) TryBecomeLeader(ctx context.Context) (bool, error) {
+	d.leaderMu.Lock()
+	defer d.leaderMu.Unlock()
+
+	if d.leaderConn != nil {
+		if err := d.leaderConn.Ping(ctx); err == nil {
+			return true, nil
+		}
+		d.closeLeaderConnLocked()
+	}
+
+	conn, err := d.pool.Acquire(ctx)
+	if err != nil {
+		if ctx.Err() != nil {
+			return false, nil
+		}
+		return false, fmt.Errorf("acquire leader connection: %w", err)
+	}
+
+	var held bool
+	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, AdvisoryLockPeriodic).Scan(&held); err != nil {
+		closeAcquiredConn(conn)
+		if ctx.Err() != nil {
+			return false, nil
+		}
+		return false, fmt.Errorf("try advisory lock: %w", err)
+	}
+	if !held {
+		conn.Release()
+		return false, nil
+	}
+	d.leaderConn = conn
+	return true, nil
+}
+
+// ReleaseLeader drops the scheduler lock by closing the dedicated
+// connection. The session lock dies with the session.
+func (d *Driver) ReleaseLeader() {
+	d.leaderMu.Lock()
+	defer d.leaderMu.Unlock()
+	d.closeLeaderConnLocked()
+}
+
+func (d *Driver) closeLeaderConnLocked() {
+	if d.leaderConn == nil {
+		return
+	}
+	closeAcquiredConn(d.leaderConn)
+	d.leaderConn = nil
+}
+
+func closeAcquiredConn(conn *pgxpool.Conn) {
+	raw := conn.Hijack()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_ = raw.Close(ctx)
 }
 
 const insertBatchDDL = `

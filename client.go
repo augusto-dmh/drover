@@ -485,6 +485,8 @@ type leaderLocker interface {
 	ReleaseLeader()
 }
 
+var _ leaderLocker = (*pgdriver.Driver)(nil)
+
 func (c *Client) wakeAfterInsert(ctx context.Context) {
 	if !c.notifyWakeup {
 		return

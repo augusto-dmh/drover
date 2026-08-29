@@ -2334,3 +2334,64 @@ func TestInsertManyUniqueKeysUsesCopyFrom(t *testing.T) {
 		t.Errorf("InsertJob VALUES ran %d times, want 0 — the batch must not loop single-row inserts", trace.insertJob)
 	}
 }
+
+func TestPeriodicLeaderHoldsDedicatedConnection(t *testing.T) {
+	d, pool := newDriver(t)
+	ctx := context.Background()
+
+	baseline := pool.Stat().AcquiredConns()
+	ok, err := d.TryBecomeLeader(ctx)
+	if err != nil {
+		t.Fatalf("TryBecomeLeader: %v", err)
+	}
+	if !ok {
+		t.Fatal("TryBecomeLeader = false, want the first caller to hold the lock")
+	}
+	if got := pool.Stat().AcquiredConns(); got <= baseline {
+		t.Fatalf("acquired conns = %d, want > %d (lock conn must stay checked out)", got, baseline)
+	}
+	if holders := advisoryLockHolders(t, pool); holders != 1 {
+		t.Fatalf("lock holders = %d, want 1", holders)
+	}
+
+	other := pgdriver.New(pool)
+	ok, err = other.TryBecomeLeader(ctx)
+	if err != nil {
+		t.Fatalf("second TryBecomeLeader: %v", err)
+	}
+	if ok {
+		t.Fatal("second client took the lock while the first still holds it")
+	}
+
+	d.ReleaseLeader()
+	if got := pool.Stat().AcquiredConns(); got != baseline {
+		t.Fatalf("acquired conns after ReleaseLeader = %d, want %d", got, baseline)
+	}
+	if holders := advisoryLockHolders(t, pool); holders != 0 {
+		t.Fatalf("lock holders after ReleaseLeader = %d, want 0", holders)
+	}
+
+	ok, err = other.TryBecomeLeader(ctx)
+	if err != nil {
+		t.Fatalf("failover TryBecomeLeader: %v", err)
+	}
+	if !ok {
+		t.Fatal("second client could not take the lock after the first released it")
+	}
+	other.ReleaseLeader()
+}
+
+func advisoryLockHolders(t *testing.T, pool *pgxpool.Pool) int {
+	t.Helper()
+	key := uint64(pgdriver.AdvisoryLockPeriodic)
+	var n int
+	err := pool.QueryRow(context.Background(), `
+		SELECT COUNT(*) FROM pg_locks
+		WHERE locktype = 'advisory' AND granted AND objsubid = 1
+		  AND classid = $1 AND objid = $2
+	`, uint32(key>>32), uint32(key)).Scan(&n)
+	if err != nil {
+		t.Fatalf("count advisory locks: %v", err)
+	}
+	return n
+}

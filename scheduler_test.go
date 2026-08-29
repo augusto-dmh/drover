@@ -2,6 +2,7 @@ package drover
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -26,6 +27,16 @@ func (l *recordingLocker) TryBecomeLeader(context.Context) (bool, error) {
 }
 
 func (l *recordingLocker) ReleaseLeader() {}
+
+type failingLocker struct {
+	driver.Driver
+}
+
+func (failingLocker) TryBecomeLeader(context.Context) (bool, error) {
+	return false, errors.New("lock unavailable")
+}
+
+func (failingLocker) ReleaseLeader() {}
 
 func quietPeriodicConfig(jobs []PeriodicJob) Config {
 	return Config{
@@ -168,6 +179,28 @@ func TestPeriodicDuplicateTickIsNotAHandlerFailure(t *testing.T) {
 			t.Fatalf("Stop: %v", err)
 		}
 	})
+}
+
+func TestPeriodicLockFailureDoesNotFailStart(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	logs := &syncWriter{}
+	cfg := quietPeriodicConfig([]PeriodicJob{{
+		ID:   "tick",
+		Cron: "@every 1h",
+		Args: pingArgs{},
+	}})
+	cfg.Logger = newTestLogger(logs)
+	c := newClient(&failingLocker{Driver: memdriver.New()}, cfg)
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v, want nil when the lock cannot be acquired", err)
+	}
+	waitFor(t, func() bool {
+		return strings.Contains(logs.String(), "acquire periodic scheduler lock")
+	}, "the lock acquire failure to be logged")
+	if err := c.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
 }
 
 func TestPeriodicStopDoesNotWaitForNextFire(t *testing.T) {

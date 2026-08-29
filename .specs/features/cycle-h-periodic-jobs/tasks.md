@@ -330,10 +330,10 @@ lets the other continue. Lock acquire failure does not fail Start.
 
 **Done when**:
 
-- [ ] Two-client test: at most one holder; failover enqueue
-- [ ] Lock is not taken from the pool (session lock would otherwise leak)
-- [ ] Full gate green
-- [ ] Phase lint clean
+- [x] Two-client test: at most one holder; failover enqueue
+- [x] Lock is not taken from the pool (session lock would otherwise leak)
+- [x] Full gate green
+- [x] Phase lint clean
 
 **Tests**: integration
 **Gate**: full
@@ -376,8 +376,8 @@ status as needed (planning files may be in this commit).
 | UNIQ-03 | Unique AC5, AC6 | T2–T3, T7 | In Tasks |
 | CRON-01 | Cron AC1, AC4 | T6 | In Tasks |
 | CRON-02 | Cron AC2, AC3, AC5 | T6 | In Tasks |
-| PER-01 | Leader AC1, AC7 | T9 | In Tasks |
-| PER-02 | Leader AC2, AC5, AC6 | T10 | In Tasks |
-| PER-03 | Leader AC3, AC4, AC8 | T11 | In Tasks |
-| PER-04 | Leader AC9 | T10 | In Tasks |
+| PER-01 | Leader AC1, AC7 | T9 | Done |
+| PER-02 | Leader AC2, AC5, AC6 | T10 | Done |
+| PER-03 | Leader AC3, AC4, AC8 | T11 | Done |
+| PER-04 | Leader AC9 | T10 | Done |
 | DOC-01 | Docs AC1–4 | T12 | In Tasks |

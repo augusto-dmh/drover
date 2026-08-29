@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/goleak"
 
+	"github.com/augusto-dmh/drover/internal/pgdriver"
 	"github.com/augusto-dmh/drover/internal/testdb"
 )
 
@@ -463,4 +464,106 @@ func TestInsertConcurrentUniqueKeyCreatesAtMostOneRow(t *testing.T) {
 	if n != 1 {
 		t.Errorf("store has %d rows, want 1", n)
 	}
+}
+
+func TestPeriodicTwoClientsElectOneLeaderAndFailover(t *testing.T) {
+	pool := testdb.NewDB(t)
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	ctx := context.Background()
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+
+	jobs := []PeriodicJob{{
+		ID:   "tick",
+		Cron: "@every 250ms",
+		Args: pingArgs{},
+	}}
+	cfg := Config{
+		Logger:         quietLogger(),
+		PollInterval:   50 * time.Millisecond,
+		StatsInterval:  time.Hour,
+		RescueInterval: time.Hour,
+		LeaseDuration:  time.Hour,
+		PeriodicJobs:   jobs,
+	}
+
+	leader, err := NewClient(pool, cfg)
+	if err != nil {
+		t.Fatalf("NewClient leader: %v", err)
+	}
+	follower, err := NewClient(pool, cfg)
+	if err != nil {
+		t.Fatalf("NewClient follower: %v", err)
+	}
+
+	if err := leader.Start(ctx); err != nil {
+		t.Fatalf("leader Start: %v", err)
+	}
+	waitForJobCount(t, pool, 1)
+	if n := countDroverJobs(t, pool); n != 1 {
+		t.Fatalf("after first tick: %d jobs, want 1", n)
+	}
+	if holders := advisoryLockHolders(t, pool); holders != 1 {
+		t.Fatalf("lock holders after first tick = %d, want 1", holders)
+	}
+
+	if err := follower.Start(ctx); err != nil {
+		t.Fatalf("follower Start: %v", err)
+	}
+	if holders := advisoryLockHolders(t, pool); holders != 1 {
+		t.Fatalf("lock holders with two clients = %d, want 1", holders)
+	}
+
+	if err := leader.Stop(ctx); err != nil {
+		t.Fatalf("leader Stop: %v", err)
+	}
+	waitForJobCount(t, pool, 2)
+	if holders := advisoryLockHolders(t, pool); holders != 1 {
+		t.Fatalf("lock holders after failover = %d, want 1", holders)
+	}
+
+	if err := follower.Stop(ctx); err != nil {
+		t.Fatalf("follower Stop: %v", err)
+	}
+	if holders := advisoryLockHolders(t, pool); holders != 0 {
+		t.Fatalf("lock holders after both stopped = %d, want 0", holders)
+	}
+}
+
+func countDroverJobs(t *testing.T, pool *pgxpool.Pool) int {
+	t.Helper()
+	var n int
+	if err := pool.QueryRow(context.Background(), `SELECT COUNT(*) FROM drover_jobs`).Scan(&n); err != nil {
+		t.Fatalf("count jobs: %v", err)
+	}
+	return n
+}
+
+func waitForJobCount(t *testing.T, pool *pgxpool.Pool, n int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if countDroverJobs(t, pool) >= n {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %d jobs, have %d", n, countDroverJobs(t, pool))
+}
+
+func advisoryLockHolders(t *testing.T, pool *pgxpool.Pool) int {
+	t.Helper()
+	key := uint64(pgdriver.AdvisoryLockPeriodic)
+	var n int
+	err := pool.QueryRow(context.Background(), `
+		SELECT COUNT(*) FROM pg_locks
+		WHERE locktype = 'advisory' AND granted AND objsubid = 1
+		  AND classid = $1 AND objid = $2
+	`, uint32(key>>32), uint32(key)).Scan(&n)
+	if err != nil {
+		t.Fatalf("count advisory locks: %v", err)
+	}
+	return n
 }
