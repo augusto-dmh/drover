@@ -88,17 +88,18 @@ Durable, cross-cycle. Architecture-level decisions live in `docs/adr/`; entries 
 | D — Middleware + scheduling | `cycle-d-middleware-scheduling` | #8 | 2026-08-02 |
 | E — Observability | `cycle-e-observability` | #9 | 2026-08-08 |
 | F — CLI + introspection | `cycle-f-cli-introspection` | #11 | 2026-08-08 |
+| G — Benchmark + hardening | `cycle-g-benchmark-hardening` | #13 | 2026-08-28 |
 
 ## Handoff
 
-- **Feature**: `cycle-g-benchmark-hardening`
-- **Phase / Task**: Execute complete (T1–T11); Verifier next
-- **Last shipped**: Cycle F (#11)
-- **Completed this cycle**: `InsertMany`/`InsertManyTx` (COPY FROM), `Config.NotifyWakeup`, `cmd/drover-bench`, README benchmark table
-- **Next step**: fresh Verifier on the feature branch, then Stage 2 publish
+- **Feature**: next is `cycle-h-periodic-jobs` (not started)
+- **Phase / Task**: —
+- **Last shipped**: Cycle G (#13)
+- **Completed this cycle**: —
+- **Next step**: start Cycle H — periodic jobs: cron scheduler with advisory-lock leader election; unique jobs via partial unique index
 - **Blockers**: none
-- **Branch**: `feat/batch-insert-notify-bench`
-- **What review should look at**: COPY+staging all-or-nothing and two-`InsertManyTx`-one-tx; no prefetch (AD-022/AD-064); NOTIFY coalesced and flag-gated; LISTEN failure must not fail `Start`; Tx notify only on commit; README numbers from a real harness run (WSL2 / PG 16.14 Docker, 2026-08-15)
+- **Branch**: `main`
+- **What review should look at**: —
 - **Known weak sensors** (carried forward): neither database-clock property — lease deadlines, nor a delayed job's dueness — can be falsified while the test container and the client share a host clock
 - **Follow-up work carried forward** (recorded, not scheduled): terminal-state retention/pruning; list-query index-friendly variants; `testing/synctest` where viable; constructor panic-vs-error consistency before 1.0; deferred observability niceties from cycle E; batch completer; `go test -bench` CI job
-- **Next after this cycle**: Cycle H — Periodic jobs: cron scheduler with advisory-lock leader election; unique jobs via partial unique index. Then I (optional status page).
+- **Next after this cycle**: Cycle I — optional status page (`drover web`, server-rendered)
