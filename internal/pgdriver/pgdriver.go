@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/augusto-dmh/drover/internal/dbsqlc"
@@ -180,7 +181,8 @@ CREATE TEMP TABLE IF NOT EXISTS drover_insert_batch (
 	kind text NOT NULL,
 	queue text NOT NULL,
 	args jsonb NOT NULL,
-	scheduled_at timestamptz
+	scheduled_at timestamptz,
+	unique_key text
 ) ON COMMIT DROP`
 
 func (d *Driver) insertMany(ctx context.Context, tx pgx.Tx, batch []driver.InsertParams) ([]*driver.JobRow, error) {
@@ -197,11 +199,15 @@ func (d *Driver) insertMany(ctx context.Context, tx pgx.Tx, batch []driver.Inser
 		if !params.ScheduledAt.IsZero() {
 			scheduledAt = params.ScheduledAt
 		}
-		rows[i] = []any{i, params.Kind, params.Queue, params.Args, scheduledAt}
+		var uniqueKey any
+		if params.UniqueKey != "" {
+			uniqueKey = params.UniqueKey
+		}
+		rows[i] = []any{i, params.Kind, params.Queue, params.Args, scheduledAt, uniqueKey}
 	}
 	if _, err := tx.CopyFrom(ctx,
 		pgx.Identifier{"drover_insert_batch"},
-		[]string{"ord", "kind", "queue", "args", "scheduled_at"},
+		[]string{"ord", "kind", "queue", "args", "scheduled_at", "unique_key"},
 		pgx.CopyFromRows(rows),
 	); err != nil {
 		return nil, fmt.Errorf("copy insert-many batch: %w", err)
@@ -570,10 +576,17 @@ func insertParams(params driver.InsertParams) dbsqlc.InsertJobParams {
 		at := params.ScheduledAt
 		out.ScheduledAt = &at
 	}
+	if params.UniqueKey != "" {
+		out.UniqueKey = pgtype.Text{String: params.UniqueKey, Valid: true}
+	}
 	return out
 }
 
 func rowFromDB(job dbsqlc.DroverJob) *driver.JobRow {
+	uniqueKey := ""
+	if job.UniqueKey.Valid {
+		uniqueKey = job.UniqueKey.String
+	}
 	return &driver.JobRow{
 		ID:          job.ID,
 		Kind:        job.Kind,
@@ -587,5 +600,6 @@ func rowFromDB(job dbsqlc.DroverJob) *driver.JobRow {
 		LeasedUntil: job.LeasedUntil,
 		CreatedAt:   job.CreatedAt,
 		FinalizedAt: job.FinalizedAt,
+		UniqueKey:   uniqueKey,
 	}
 }

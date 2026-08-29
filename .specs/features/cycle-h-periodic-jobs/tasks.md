@@ -120,9 +120,9 @@ Regenerate sqlc.
 
 **Done when**:
 
-- [ ] Migration is applied by the existing migrator (next version)
-- [ ] Generated sqlc is committed and `sqlc generate` is drift-free
-- [ ] Staging SELECT/INSERT still uses the database clock for state
+- [x] Migration is applied by the existing migrator (next version)
+- [x] Generated sqlc is committed and `sqlc generate` is drift-free
+- [x] Staging SELECT/INSERT still uses the database clock for state
 
 **Tests**: none (implementations in T2/T3)
 **Gate**: build

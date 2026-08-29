@@ -64,6 +64,11 @@ type InsertParams struct {
 	// letting the caller decide would let a client running fast or slow
 	// record a state its own store disagrees with.
 	ScheduledAt time.Time
+
+	// UniqueKey, when non-empty, occupies a unique slot among
+	// non-terminal jobs of this queue and kind. Empty means the job
+	// does not participate in uniqueness and is stored as NULL.
+	UniqueKey string
 }
 
 // JobRow is the stored representation of a job.
@@ -80,6 +85,7 @@ type JobRow struct {
 	LeasedUntil *time.Time
 	CreatedAt   time.Time
 	FinalizedAt *time.Time
+	UniqueKey   string
 }
 
 // AttemptError is one recorded execution failure, appended to a job's
