@@ -103,12 +103,12 @@ Durable, cross-cycle. Architecture-level decisions live in `docs/adr/`; entries 
 ## Handoff
 
 - **Feature**: `cycle-h-periodic-jobs`
-- **Phase / Task**: Specify+context done (auto-decided); Design next
+- **Phase / Task**: Phase 5 Execute complete (T12 docs); cycle ready for PR
 - **Last shipped**: Cycle G (#13)
-- **Completed this cycle**: spec.md, context.md, AD-067–AD-076
-- **Next step**: write design.md and tasks.md, then Execute
+- **Completed this cycle**: unique jobs + periodic scheduler (T1–T11); README, Example, email example (T12)
+- **Next step**: finalize PR with drover-finalize; review unique index predicate, advisory lock not on pool connections, scheduler stop vs next-fire
 - **Blockers**: none
-- **Branch**: `main` (Execute will branch)
+- **Branch**: `feat/unique-jobs-periodic-scheduler`
 - **What review should look at**: unique index predicate; advisory lock not on pool connections; scheduler stop vs next-fire
 - **Known weak sensors** (carried forward): neither database-clock property — lease deadlines, nor a delayed job's dueness — can be falsified while the test container and the client share a host clock
 - **Follow-up work carried forward** (recorded, not scheduled): terminal-state retention/pruning; list-query index-friendly variants; `testing/synctest` where viable; constructor panic-vs-error consistency before 1.0; deferred observability niceties from cycle E; batch completer; `go test -bench` CI job; UniqueOpts.ByArgs/Period; RunOnStart; CLI `--unique-key`

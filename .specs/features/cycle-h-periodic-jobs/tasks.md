@@ -356,10 +356,10 @@ status as needed (planning files may be in this commit).
 
 **Done when**:
 
-- [ ] Examples compile (`go test`)
-- [ ] email example builds
-- [ ] Quick gate green
-- [ ] Lint clean
+- [x] Examples compile (`go test`)
+- [x] email example builds
+- [x] Quick gate green
+- [x] Lint clean
 
 **Tests**: Example compile
 **Gate**: quick
@@ -380,4 +380,4 @@ status as needed (planning files may be in this commit).
 | PER-02 | Leader AC2, AC5, AC6 | T10 | Done |
 | PER-03 | Leader AC3, AC4, AC8 | T11 | Done |
 | PER-04 | Leader AC9 | T10 | Done |
-| DOC-01 | Docs AC1–4 | T12 | In Tasks |
+| DOC-01 | Docs AC1–4 | T12 | Done |
