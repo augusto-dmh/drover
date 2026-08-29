@@ -103,10 +103,10 @@ Durable, cross-cycle. Architecture-level decisions live in `docs/adr/`; entries 
 ## Handoff
 
 - **Feature**: `cycle-h-periodic-jobs`
-- **Phase / Task**: Phase 5 Execute complete (T12 docs); cycle ready for PR
+- **Phase / Task**: Execute complete; Verifier PASS; publishing
 - **Last shipped**: Cycle G (#13)
-- **Completed this cycle**: unique jobs + periodic scheduler (T1–T11); README, Example, email example (T12)
-- **Next step**: finalize PR with drover-finalize; review unique index predicate, advisory lock not on pool connections, scheduler stop vs next-fire
+- **Completed this cycle**: unique jobs + periodic scheduler; README/Example; validation.md
+- **Next step**: publish PR; independent review
 - **Blockers**: none
 - **Branch**: `feat/unique-jobs-periodic-scheduler`
 - **What review should look at**: unique index predicate; advisory lock not on pool connections; scheduler stop vs next-fire
