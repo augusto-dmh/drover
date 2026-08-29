@@ -605,6 +605,333 @@ func TestInsertManyTxUnsupportedOnMemdriver(t *testing.T) {
 	}
 }
 
+type pingArgs struct{}
+
+func (pingArgs) Kind() string { return "ping" }
+
+func countMemJobs(t *testing.T, mem *memdriver.Driver) int {
+	t.Helper()
+	rows, err := mem.ListJobs(context.Background(), driver.ListJobsParams{Limit: 1000})
+	if err != nil {
+		t.Fatalf("ListJobs: %v", err)
+	}
+	return len(rows)
+}
+
+func assertDuplicateJob(t *testing.T, err error) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("error = nil, want ErrDuplicateJob")
+	}
+	// Wrapping the driver sentinel with %w is not enough: callers use
+	// errors.Is(err, drover.ErrDuplicateJob), not the internal type.
+	if errors.Is(err, driver.ErrDuplicateJob) && !errors.Is(err, ErrDuplicateJob) {
+		t.Fatalf("error = %v matches only the driver sentinel; want errors.Is(err, ErrDuplicateJob)", err)
+	}
+	if !errors.Is(err, ErrDuplicateJob) {
+		t.Fatalf("error = %v, want ErrDuplicateJob", err)
+	}
+}
+
+func TestInsertUniqueKeyPersistsAndReturnsIt(t *testing.T) {
+	t.Parallel()
+	mem := memdriver.New()
+	c := newClient(mem, Config{})
+
+	row, err := c.Insert(context.Background(), greetArgs{Name: "ada"}, &InsertOpts{UniqueKey: "invoice-1"})
+	if err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	if row.UniqueKey != "invoice-1" {
+		t.Errorf("UniqueKey = %q, want invoice-1", row.UniqueKey)
+	}
+	stored, ok := mem.Row(row.ID)
+	if !ok {
+		t.Fatal("job missing from store")
+	}
+	if stored.UniqueKey != "invoice-1" {
+		t.Errorf("stored UniqueKey = %q, want invoice-1", stored.UniqueKey)
+	}
+	if row.UniqueKey != stored.UniqueKey {
+		t.Errorf("returned UniqueKey %q != stored %q", row.UniqueKey, stored.UniqueKey)
+	}
+}
+
+func TestInsertDuplicateUniqueKeyFailsWhileNonTerminal(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	future := time.Now().Add(time.Hour)
+
+	tests := []struct {
+		name  string
+		setup func(*testing.T, *memdriver.Driver, *Client)
+	}{
+		{
+			name: "available",
+			setup: func(t *testing.T, _ *memdriver.Driver, c *Client) {
+				if _, err := c.Insert(ctx, greetArgs{Name: "ada"}, &InsertOpts{UniqueKey: "u"}); err != nil {
+					t.Fatalf("seed: %v", err)
+				}
+			},
+		},
+		{
+			name: "scheduled",
+			setup: func(t *testing.T, _ *memdriver.Driver, c *Client) {
+				if _, err := c.Insert(ctx, greetArgs{Name: "ada"}, &InsertOpts{UniqueKey: "u", ScheduledAt: future}); err != nil {
+					t.Fatalf("seed: %v", err)
+				}
+			},
+		},
+		{
+			name: "retryable",
+			setup: func(t *testing.T, mem *memdriver.Driver, c *Client) {
+				if _, err := c.Insert(ctx, greetArgs{Name: "ada"}, &InsertOpts{UniqueKey: "u"}); err != nil {
+					t.Fatalf("seed: %v", err)
+				}
+				claimed := claimOne(t, mem, "default")
+				if err := mem.MarkRetryable(ctx, driver.Lease{ID: claimed.ID, Attempt: claimed.Attempt}, future, []byte(`{"error":"boom"}`)); err != nil {
+					t.Fatalf("MarkRetryable: %v", err)
+				}
+			},
+		},
+		{
+			name: "running",
+			setup: func(t *testing.T, mem *memdriver.Driver, c *Client) {
+				if _, err := c.Insert(ctx, greetArgs{Name: "ada"}, &InsertOpts{UniqueKey: "u"}); err != nil {
+					t.Fatalf("seed: %v", err)
+				}
+				claimOne(t, mem, "default")
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			mem := memdriver.New()
+			c := newClient(mem, Config{})
+			tt.setup(t, mem, c)
+			before := countMemJobs(t, mem)
+
+			_, err := c.Insert(ctx, greetArgs{Name: "ada"}, &InsertOpts{UniqueKey: "u"})
+			assertDuplicateJob(t, err)
+			if got := countMemJobs(t, mem); got != before {
+				t.Errorf("store has %d jobs after duplicate, want %d", got, before)
+			}
+		})
+	}
+}
+
+func TestInsertReusesUniqueKeyAfterTerminal(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	tests := []struct {
+		name   string
+		finish func(*testing.T, *memdriver.Driver, int64)
+	}{
+		{
+			name: "completed",
+			finish: func(t *testing.T, mem *memdriver.Driver, id int64) {
+				claimed := claimOne(t, mem, "default")
+				if err := mem.MarkCompleted(ctx, driver.Lease{ID: claimed.ID, Attempt: claimed.Attempt}); err != nil {
+					t.Fatalf("MarkCompleted: %v", err)
+				}
+				if claimed.ID != id {
+					t.Fatalf("claimed id %d, want %d", claimed.ID, id)
+				}
+			},
+		},
+		{
+			name: "cancelled",
+			finish: func(t *testing.T, mem *memdriver.Driver, id int64) {
+				if _, err := newInspector(mem).CancelJob(ctx, id); err != nil {
+					t.Fatalf("CancelJob: %v", err)
+				}
+			},
+		},
+		{
+			name: "dead",
+			finish: func(t *testing.T, mem *memdriver.Driver, id int64) {
+				claimed := claimOne(t, mem, "default")
+				if err := mem.MarkDead(ctx, driver.Lease{ID: claimed.ID, Attempt: claimed.Attempt}, []byte(`{"error":"boom"}`)); err != nil {
+					t.Fatalf("MarkDead: %v", err)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			mem := memdriver.New()
+			c := newClient(mem, Config{})
+			first, err := c.Insert(ctx, greetArgs{Name: "ada"}, &InsertOpts{UniqueKey: "u"})
+			if err != nil {
+				t.Fatalf("first Insert: %v", err)
+			}
+			tt.finish(t, mem, first.ID)
+
+			second, err := c.Insert(ctx, greetArgs{Name: "ada"}, &InsertOpts{UniqueKey: "u"})
+			if err != nil {
+				t.Fatalf("Insert after %s: %v", tt.name, err)
+			}
+			if second.ID == first.ID {
+				t.Errorf("second Insert reused id %d; want a new row", second.ID)
+			}
+			if second.UniqueKey != "u" {
+				t.Errorf("UniqueKey = %q, want u", second.UniqueKey)
+			}
+			if got := countMemJobs(t, mem); got != 2 {
+				t.Errorf("store has %d jobs, want 2", got)
+			}
+		})
+	}
+}
+
+func TestInsertEmptyUniqueKeyDoesNotParticipate(t *testing.T) {
+	t.Parallel()
+	mem := memdriver.New()
+	c := newClient(mem, Config{})
+	ctx := context.Background()
+
+	first, err := c.Insert(ctx, greetArgs{Name: "ada"}, nil)
+	if err != nil {
+		t.Fatalf("first Insert: %v", err)
+	}
+	second, err := c.Insert(ctx, greetArgs{Name: "grace"}, &InsertOpts{UniqueKey: ""})
+	if err != nil {
+		t.Fatalf("second Insert: %v", err)
+	}
+	if first.UniqueKey != "" || second.UniqueKey != "" {
+		t.Errorf("UniqueKey = %q and %q, want both empty", first.UniqueKey, second.UniqueKey)
+	}
+	if got := countMemJobs(t, mem); got != 2 {
+		t.Errorf("store has %d jobs, want 2 — empty keys must not collide", got)
+	}
+}
+
+func TestInsertSameUniqueKeyDifferentQueueOrKindSucceeds(t *testing.T) {
+	t.Parallel()
+	mem := memdriver.New()
+	c := newClient(mem, Config{})
+	ctx := context.Background()
+	if _, err := c.Insert(ctx, greetArgs{Name: "ada"}, &InsertOpts{UniqueKey: "u"}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	otherQueue, err := c.Insert(ctx, greetArgs{Name: "ada"}, &InsertOpts{Queue: "other", UniqueKey: "u"})
+	if err != nil {
+		t.Fatalf("Insert other queue: %v", err)
+	}
+	otherKind, err := c.Insert(ctx, pingArgs{}, &InsertOpts{UniqueKey: "u"})
+	if err != nil {
+		t.Fatalf("Insert other kind: %v", err)
+	}
+	if otherQueue.UniqueKey != "u" || otherKind.UniqueKey != "u" {
+		t.Errorf("UniqueKey = %q and %q, want u", otherQueue.UniqueKey, otherKind.UniqueKey)
+	}
+	if got := countMemJobs(t, mem); got != 3 {
+		t.Errorf("store has %d jobs, want 3", got)
+	}
+}
+
+func TestInsertManyUniqueCollisionInsertsNothing(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	t.Run("in-batch duplicate", func(t *testing.T) {
+		t.Parallel()
+		mem := memdriver.New()
+		c := newClient(mem, Config{})
+		existing, err := c.Insert(ctx, greetArgs{Name: "keep"}, nil)
+		if err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+
+		rows, err := c.InsertMany(ctx, []InsertItem{
+			{Args: greetArgs{Name: "a"}, Opts: &InsertOpts{UniqueKey: "u"}},
+			{Args: greetArgs{Name: "b"}, Opts: &InsertOpts{UniqueKey: "u"}},
+		})
+		assertDuplicateJob(t, err)
+		if rows != nil {
+			t.Errorf("rows = %v, want nil", rows)
+		}
+		if _, ok := mem.Row(existing.ID); !ok {
+			t.Fatal("existing job was removed")
+		}
+		if got := countMemJobs(t, mem); got != 1 {
+			t.Fatalf("store has %d jobs, want 1 — the batch must insert zero rows", got)
+		}
+	})
+
+	t.Run("conflict with existing", func(t *testing.T) {
+		t.Parallel()
+		mem := memdriver.New()
+		c := newClient(mem, Config{})
+		first, err := c.Insert(ctx, greetArgs{Name: "ada"}, &InsertOpts{UniqueKey: "u"})
+		if err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+
+		rows, err := c.InsertMany(ctx, []InsertItem{
+			{Args: greetArgs{Name: "other"}, Opts: &InsertOpts{UniqueKey: "other"}},
+			{Args: greetArgs{Name: "dup"}, Opts: &InsertOpts{UniqueKey: "u"}},
+		})
+		assertDuplicateJob(t, err)
+		if rows != nil {
+			t.Errorf("rows = %v, want nil", rows)
+		}
+		if got := countMemJobs(t, mem); got != 1 {
+			t.Fatalf("store has %d jobs, want 1 — the colliding batch must insert zero rows", got)
+		}
+		if _, ok := mem.Row(first.ID); !ok {
+			t.Fatal("existing unique job was removed")
+		}
+	})
+}
+
+func TestInsertTxDuplicateUniqueKeyIsErrDuplicateJob(t *testing.T) {
+	t.Parallel()
+	c := newClient(&memTxDriver{Driver: memdriver.New()}, Config{})
+	ctx := context.Background()
+	var tx pgx.Tx
+
+	if _, err := c.InsertTx(ctx, tx, greetArgs{Name: "ada"}, &InsertOpts{UniqueKey: "u"}); err != nil {
+		t.Fatalf("first InsertTx: %v", err)
+	}
+	_, err := c.InsertTx(ctx, tx, greetArgs{Name: "ada"}, &InsertOpts{UniqueKey: "u"})
+	assertDuplicateJob(t, err)
+}
+
+func TestInsertManyTxDuplicateUniqueKeyIsErrDuplicateJob(t *testing.T) {
+	t.Parallel()
+	mem := memdriver.New()
+	c := newClient(&memTxDriver{Driver: mem}, Config{})
+	ctx := context.Background()
+	var tx pgx.Tx
+
+	existing, err := c.Insert(ctx, greetArgs{Name: "keep"}, nil)
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	rows, err := c.InsertManyTx(ctx, tx, []InsertItem{
+		{Args: greetArgs{Name: "a"}, Opts: &InsertOpts{UniqueKey: "u"}},
+		{Args: greetArgs{Name: "b"}, Opts: &InsertOpts{UniqueKey: "u"}},
+	})
+	assertDuplicateJob(t, err)
+	if rows != nil {
+		t.Errorf("rows = %v, want nil", rows)
+	}
+	if got := countMemJobs(t, mem); got != 1 {
+		t.Fatalf("store has %d jobs, want 1 — InsertManyTx must insert zero rows", got)
+	}
+	if _, ok := mem.Row(existing.ID); !ok {
+		t.Fatal("existing job was removed")
+	}
+}
+
 // A delayed job must not be handed to a worker before its time, and must
 // be once it passes — with nothing having to promote it in between.
 func TestScheduledJobRunsOnlyOnceItIsDue(t *testing.T) {

@@ -247,9 +247,9 @@ InsertMany / Tx variants wrap driver duplicate as
 
 **Done when**:
 
-- [ ] Unit tests through `newClient`+memdriver for every unique AC except concurrency
-- [ ] Integration: concurrent Insert unique key
-- [ ] Full gate if integration added; else quick
+- [x] Unit tests through `newClient`+memdriver for every unique AC except concurrency
+- [x] Integration: concurrent Insert unique key
+- [x] Full gate if integration added; else quick
 
 **Tests**: unit + integration
 **Gate**: full

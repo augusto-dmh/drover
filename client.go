@@ -51,6 +51,7 @@ type JobRow struct {
 	LeasedUntil *time.Time
 	CreatedAt   time.Time
 	FinalizedAt *time.Time
+	UniqueKey   string
 }
 
 // Config configures a Client. Zero values get defaults: slog.Default()
@@ -375,6 +376,11 @@ type InsertOpts struct {
 	// treated as now rather than rejected, so a caller computing a delay
 	// from a stale clock still enqueues a runnable job.
 	ScheduledAt time.Time
+
+	// UniqueKey, when non-empty, occupies a unique slot among
+	// non-terminal jobs of this queue and kind. Empty means the job
+	// does not participate in uniqueness.
+	UniqueKey string
 }
 
 // Insert enqueues a job in its own transaction. The job is available to
@@ -386,7 +392,7 @@ func (c *Client) Insert(ctx context.Context, args JobArgs, opts *InsertOpts) (*J
 	}
 	row, err := c.drv.Insert(ctx, params)
 	if err != nil {
-		return nil, fmt.Errorf("drover: insert job kind %q: %w", params.Kind, err)
+		return nil, fmt.Errorf("drover: insert job kind %q: %w", params.Kind, publicInsertErr(err))
 	}
 	c.wakeAfterInsert(ctx)
 	return rowFromDriver(row), nil
@@ -402,7 +408,7 @@ func (c *Client) InsertTx(ctx context.Context, tx pgx.Tx, args JobArgs, opts *In
 	}
 	row, err := c.drv.InsertTx(ctx, tx, params)
 	if err != nil {
-		return nil, fmt.Errorf("drover: insert job kind %q in tx: %w", params.Kind, err)
+		return nil, fmt.Errorf("drover: insert job kind %q in tx: %w", params.Kind, publicInsertErr(err))
 	}
 	c.notifyTx(ctx, tx)
 	return rowFromDriver(row), nil
@@ -420,7 +426,7 @@ func (c *Client) InsertMany(ctx context.Context, items []InsertItem) ([]*JobRow,
 	}
 	rows, err := c.drv.InsertMany(ctx, batch)
 	if err != nil {
-		return nil, fmt.Errorf("drover: insert jobs: %w", err)
+		return nil, fmt.Errorf("drover: insert jobs: %w", publicInsertErr(err))
 	}
 	c.wakeAfterInsert(ctx)
 	return rowsFromDriver(rows), nil
@@ -439,7 +445,7 @@ func (c *Client) InsertManyTx(ctx context.Context, tx pgx.Tx, items []InsertItem
 	}
 	rows, err := c.drv.InsertManyTx(ctx, tx, batch)
 	if err != nil {
-		return nil, fmt.Errorf("drover: insert jobs in tx: %w", err)
+		return nil, fmt.Errorf("drover: insert jobs in tx: %w", publicInsertErr(err))
 	}
 	c.notifyTx(ctx, tx)
 	return rowsFromDriver(rows), nil
@@ -537,8 +543,16 @@ func insertParamsFor(args JobArgs, opts *InsertOpts) (driver.InsertParams, error
 		// Passed through as the zero time when unset, which the driver
 		// reads as "now" and resolves against the store's own clock.
 		params.ScheduledAt = opts.ScheduledAt
+		params.UniqueKey = opts.UniqueKey
 	}
 	return params, nil
+}
+
+func publicInsertErr(err error) error {
+	if errors.Is(err, driver.ErrDuplicateJob) {
+		return ErrDuplicateJob
+	}
+	return err
 }
 
 func rowFromDriver(row *driver.JobRow) *JobRow {
@@ -555,5 +569,6 @@ func rowFromDriver(row *driver.JobRow) *JobRow {
 		LeasedUntil: row.LeasedUntil,
 		CreatedAt:   row.CreatedAt,
 		FinalizedAt: row.FinalizedAt,
+		UniqueKey:   row.UniqueKey,
 	}
 }

@@ -4,9 +4,11 @@ package drover
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -410,5 +412,55 @@ func TestEmptyInsertManyDoesNotNotifyWhenWakeupEnabled(t *testing.T) {
 	n, err := conn.Conn().WaitForNotification(waitCtx)
 	if err == nil {
 		t.Fatalf("received NOTIFY on %q after an empty InsertMany", n.Channel)
+	}
+}
+
+func TestInsertConcurrentUniqueKeyCreatesAtMostOneRow(t *testing.T) {
+	t.Parallel()
+	pool := testdb.NewDB(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	c, err := NewClient(pool, Config{})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	const writers = 2
+	var wg sync.WaitGroup
+	errs := make(chan error, writers)
+	for range writers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := c.Insert(ctx, greetArgs{Name: "ada"}, &InsertOpts{UniqueKey: "u"})
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+
+	var ok, dup int
+	for err := range errs {
+		switch {
+		case err == nil:
+			ok++
+		case errors.Is(err, ErrDuplicateJob):
+			dup++
+		default:
+			t.Errorf("unexpected error: %v", err)
+		}
+	}
+	if ok != 1 || dup != 1 {
+		t.Errorf("success=%d duplicate=%d, want 1 and 1", ok, dup)
+	}
+
+	var n int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM drover_jobs`).Scan(&n); err != nil {
+		t.Fatalf("count jobs: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("store has %d rows, want 1", n)
 	}
 }
