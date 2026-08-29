@@ -38,6 +38,10 @@ func (d *Driver) Insert(_ context.Context, params driver.InsertParams) (*driver.
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
+	if d.uniqueConflict(params.Queue, params.Kind, params.UniqueKey, nil) {
+		return nil, driver.ErrDuplicateJob
+	}
+
 	d.nextID++
 	row := jobFromParams(d.nextID, params, time.Now())
 	d.jobs[row.ID] = row
@@ -63,6 +67,9 @@ func (d *Driver) InsertMany(_ context.Context, batch []driver.InsertParams) ([]*
 	now := time.Now()
 	pending := make([]*driver.JobRow, len(batch))
 	for i, params := range batch {
+		if d.uniqueConflict(params.Queue, params.Kind, params.UniqueKey, pending[:i]) {
+			return nil, driver.ErrDuplicateJob
+		}
 		pending[i] = jobFromParams(d.nextID+int64(i)+1, params, now)
 	}
 	for _, row := range pending {
@@ -105,7 +112,37 @@ func jobFromParams(id int64, params driver.InsertParams, now time.Time) *driver.
 		Errors:      json.RawMessage("[]"),
 		ScheduledAt: scheduledAt,
 		CreatedAt:   now,
+		UniqueKey:   params.UniqueKey,
 	}
+}
+
+func uniqueActive(state string) bool {
+	switch state {
+	case "available", "scheduled", "retryable", "running":
+		return true
+	default:
+		return false
+	}
+}
+
+// uniqueConflict reports whether a non-empty key already occupies a
+// non-terminal row of this queue and kind, including any rows already
+// accepted earlier in the same batch.
+func (d *Driver) uniqueConflict(queue, kind, key string, extra []*driver.JobRow) bool {
+	if key == "" {
+		return false
+	}
+	for _, row := range d.jobs {
+		if row.UniqueKey == key && row.Queue == queue && row.Kind == kind && uniqueActive(row.State) {
+			return true
+		}
+	}
+	for _, row := range extra {
+		if row != nil && row.UniqueKey == key && row.Queue == queue && row.Kind == kind {
+			return true
+		}
+	}
+	return false
 }
 
 // waiting reports whether a job in this state is queued for execution:

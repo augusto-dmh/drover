@@ -34,6 +34,10 @@ var (
 	// been done twice, which at-least-once delivery permits, but only the
 	// current holder may record what happened.
 	ErrLeaseLost = errors.New("driver: job reclaimed by another worker")
+
+	// ErrDuplicateJob reports that a non-terminal job with the same
+	// queue, kind, and unique key already exists. No row is inserted.
+	ErrDuplicateJob = errors.New("driver: job with this unique key already exists")
 )
 
 // Lease identifies one claim on a job: the row, and the attempt the

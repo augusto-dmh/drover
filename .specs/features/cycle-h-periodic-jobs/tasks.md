@@ -143,9 +143,9 @@ error the client will map (use `driver` sentinel or a new
 
 **Done when**:
 
-- [ ] Tests: first insert ok; duplicate while available/scheduled/retryable/running fails; completed/cancelled/dead frees the key; empty key allows many rows; InsertMany in-batch duplicate inserts zero
-- [ ] JobRow.UniqueKey is populated
-- [ ] Quick gate green
+- [x] Tests: first insert ok; duplicate while available/scheduled/retryable/running fails; completed/cancelled/dead frees the key; empty key allows many rows; InsertMany in-batch duplicate inserts zero
+- [x] JobRow.UniqueKey is populated
+- [x] Quick gate green
 
 **Tests**: unit
 **Gate**: quick
