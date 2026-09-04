@@ -1,0 +1,21 @@
+# PR #15 review triage
+
+Judged against the code as it exists, not the reviewer's authority.
+Comments will be deleted in Stage 6; this file is the surviving record.
+
+| # | Source | file:line | Verdict | Action | Rationale |
+| --- | --- | --- | --- | --- | --- |
+| 1 | inline `3930329723` concurrency; `3930331969` sql | `scheduler.go:8` | real | fix | `time.RFC3339` is second precision. `@every` accepts sub-second durations (the two-client test uses 250ms). Fires in the same UTC second share a UniqueKey, so later ticks are `ErrDuplicateJob` and never run. AD-072's RFC3339 formula is too coarse for the grammar we shipped. Switch to `RFC3339Nano`. |
+| 2 | inline `3930329816` concurrency | `scheduler.go:61` | real | fix | `startedAt` is process start, not leadership gain. `lastFire` is zero on a follower, so failover walks every tick since deploy. Unique keys only occupy the partial index while non-terminal, so completed ticks insert again — a stampede ASM-09 / D-8 rejected `RunOnStart` to avoid. On becoming leader, set each watermark to now so the first fire is strictly after leadership. Late ticks *while already leader* still catch up. Missed ticks during a lock-retry gap are skipped (same trade-off as a deploy). |
+| 3 | inline `3930329819` concurrency; `3930331973` sql; `3930335743` architecture | `scheduler.go:82` | real | fix | Inner loop never consults `fetchCtx`. `Next` returning zero (`0 0 31 2 *`) makes `!fire.After(now)` true forever, so Stop waits on `background.Wait()` and the advisory lock is not released. `lastFire` advances even when Insert fails, skipping that fire forever. Break on `fire.IsZero()` and `fetchCtx.Err()`; advance the watermark only after a successful insert or `ErrDuplicateJob`. Unbounded InsertMany batching of catch-up is won't-fix (scope). |
+| 4 | inline `3930330078` tests | `scheduler.go:76` | real | fix | Every scheduler test registers one job. A loop that only served `periodic[0]` would still pass. Add a two-job synctest with distinct `@every` and exact row counts. |
+| 5 | inline `3930330167` tests | `scheduler.go:82` | real | fix | Recast: after finding 2, the sensor is “leadership gain does not replay ticks from before the lock was held,” not “replay every missed fire since Start.” Add that test. |
+| 6 | inline `3930330224` tests | `scheduler_test.go:103` | real | fix | `wantKey` is derived from the stored `ScheduledAt`, so an insert that used `time.Now()` for both fields would pass. Compute `Next(started)` independently. |
+| 7 | inline `3930330296` tests | `scheduler_test.go:174` | real | fix | Scheduler never logs `"job failed"`. Assert `"skipped duplicate periodic tick"` and not `"enqueue periodic job"`. |
+| 8 | inline `3930330299` tests | `client_integration_test.go:522` | real | fix | `waitForJobCount` is `>= n`. After failover the test never pins an exact count. Wait, then `count == 2`. While both clients run, pin `count == 1`. |
+| 9 | inline `3930335740` architecture; `3930343200` regression | `internal/cron/cron.go:184` | real | fix | `Next` may return zero after the 5-year scan. Do not change the `Next` signature this PR. Construction already panics only on parse errors; `0 0 31 2 *` parses. Scheduler (finding 3) treats zero as “never fires.” Add a cron unit test that `Next` is zero for that spec, and a Stop test that an unsatisfiable periodic job does not hang. Rejecting every unsatisfiable DOM/month in `Parse` is won't-fix (Feb 29 is valid some years; a complete static check is a new product). |
+| 10 | inline `3930343090` regression | `internal/pgdriver/pgdriver.go:246` | real | fix | `Close` errors are discarded; a timed-out Close can leave the session (and lock) alive. Log at error. Keeping `leaderConn` set on failure is won't-fix (`ReleaseLeader` has no error return by design; retry-without-timeout on shutdown is a larger change). |
+| 11 | issue `5534717838` | — | n/a | — | Requirements summary, not a finding. |
+| 12 | issue `5534791477` | — | n/a | — | Consolidation summary of the rows above. |
+
+**Counts:** real 10, false 0, n/a 2. **fix** 10, **won't-fix** (partial, inside a fix row): InsertMany catch-up batching; Parse-time unsatisfiable-cron rejection; keep-conn-on-Close-failure.
