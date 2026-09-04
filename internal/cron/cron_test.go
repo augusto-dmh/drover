@@ -332,6 +332,16 @@ func TestSpringForwardYieldsLaterInstant(t *testing.T) {
 	}
 }
 
+func TestNextUnsatisfiableDOMReturnsZero(t *testing.T) {
+	t.Parallel()
+	s := mustParse(t, "0 0 31 2 *")
+	from := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	got := s.Next(from)
+	if !got.IsZero() {
+		t.Errorf("Next(%v) = %v, want zero", from, got)
+	}
+}
+
 func FuzzParse(f *testing.F) {
 	for _, spec := range []string{
 		"0 * * * *",
