@@ -195,6 +195,26 @@ func TestGETStatusPageFilters(t *testing.T) {
 	}
 }
 
+func TestGETStatusPageFilterForm(t *testing.T) {
+	t.Parallel()
+	fake := &fakeInspector{stats: &drover.QueueStats{}}
+	rec := httptest.NewRecorder()
+	newStatusHandler(fake, 0).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `method="get"`) {
+		t.Fatalf("missing GET filter form: %s", body)
+	}
+	if !strings.Contains(body, `name="queue"`) || !strings.Contains(body, `name="state"`) || !strings.Contains(body, `name="limit"`) {
+		t.Fatalf("filter form missing queue/state/limit fields: %s", body)
+	}
+	if !strings.Contains(body, `<select name="state"`) {
+		t.Fatalf("state field is not a GET select: %s", body)
+	}
+}
+
 func TestGETStatusPageFilterValidation400(t *testing.T) {
 	t.Parallel()
 	tests := []string{
