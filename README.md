@@ -146,7 +146,7 @@ Secondary signals: `drover_queue_depth{state="dead"}` for permanent failure accu
 
 ## CLI
 
-The `drover` binary is the operator surface for a live queue. Point it at Postgres with `--database` or `$DATABASE_URL` (the flag wins). The schema must already exist — the CLI does not run migrations. Add `--json` for machine-readable output on any command.
+The `drover` binary is the operator surface for a live queue. Point it at Postgres with `--database` or `$DATABASE_URL` (the flag wins). The schema must already exist — the CLI does not run migrations. Add `--json` for machine-readable output on any command except `web`.
 
 ```
 drover [--database URL] [--json] <command>
@@ -159,7 +159,10 @@ drover [--database URL] [--json] <command>
 | `retry <id>` | Redrive a `dead` job to `available` (attempt reset; prior errors kept) |
 | `cancel <id>` | Cancel a waiting or dead job (`running` / terminal states are refused) |
 | `enqueue` | Insert a job: `--kind` required; optional `--queue`, `--args` (JSON, default `{}`) |
+| `web` | Serve one HTML status page (`--listen`, `--refresh`) |
 | `version` / `--version` | Print the embedded version (`dev` for local builds) |
+
+`drover web` binds `127.0.0.1:7180` by default, prints the URL, and serves a single server-rendered page (queue depths, oldest-claimable age, jobs defaulting to `dead`, retry/cancel). It is not a dashboard: no JavaScript app, no second page, no enqueue form. `--refresh` defaults to 5s (`0` disables). `--json` is refused. Binding a non-loopback address exposes operator mutations to anyone who can reach the port ([ADR-0006](docs/adr/0006-cli-first-server-rendered-status-page.md)).
 
 Library callers that need the same reads and operator writes without spawning the binary use `drover.NewInspector(pool)` — `Stats`, `ListJobs`, `GetJob`, `Enqueue`, `CancelJob`, and `RetryJob` on an `Inspector`. It is not a `Client`: there is no worker pool and no `Start`/`Stop`.
 
@@ -211,11 +214,11 @@ p99=14.144354657s
 
 ## Roadmap
 
-v0.1.0 = cycles A–H of [RFC-0001](docs/rfc/0001-drover-roadmap.md): walking skeleton → retries/DLQ/rescue → worker pools + graceful shutdown → middleware + scheduled jobs → Prometheus observability → CLI + introspection → **benchmarks with published methodology** → **periodic jobs via advisory-lock leader election**. Then: an optional server-rendered status page.
+v0.1.0 = cycles A–H of [RFC-0001](docs/rfc/0001-drover-roadmap.md): walking skeleton → retries/DLQ/rescue → worker pools + graceful shutdown → middleware + scheduled jobs → Prometheus observability → CLI + introspection → **benchmarks with published methodology** → **periodic jobs via advisory-lock leader election**. The optional server-rendered status page is `drover web` ([ADR-0006](docs/adr/0006-cli-first-server-rendered-status-page.md)).
 
 ## Documentation
 
-- [Architecture Decision Records](docs/adr/) — what was decided and why, including [observability (ADR-0005)](docs/adr/0005-prometheus-observability-via-ops-port-and-background-gauge-refresh.md)
+- [Architecture Decision Records](docs/adr/) — what was decided and why, including [observability (ADR-0005)](docs/adr/0005-prometheus-observability-via-ops-port-and-background-gauge-refresh.md) and [the status page (ADR-0006)](docs/adr/0006-cli-first-server-rendered-status-page.md)
 - [RFC-0001 roadmap](docs/rfc/0001-drover-roadmap.md) — what ships when
 - [Research](docs/research/) — the evidence behind the decisions (existing-system survey, storage mechanics, delivery semantics, conventions, scope)
 

@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>drover</title>
+{{if gt .RefreshSeconds 0}}
+<meta http-equiv="refresh" content="{{.RefreshSeconds}};url={{.RefreshURL}}">
+{{end}}
+<style>
+  :root {
+    --paper: #f3eee4;
+    --ink: #1c1814;
+    --rule: #c9bfae;
+    --muted: #6a6156;
+    --dead: #9c2f1a;
+    --ok: #2c5a3c;
+    --flash-err: #9c2f1a;
+    --flash-ok: #2c5a3c;
+  }
+  * { box-sizing: border-box; }
+  html { background: var(--paper); color: var(--ink); }
+  body {
+    margin: 0 auto;
+    max-width: 72rem;
+    padding: 1.5rem 1.25rem 3rem;
+    font-family: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+    line-height: 1.45;
+  }
+  h1 {
+    font-size: 1.75rem;
+    letter-spacing: 0.04em;
+    margin: 0 0 0.25rem;
+    font-weight: 600;
+  }
+  .lede { color: var(--muted); margin: 0 0 1.25rem; font-size: 0.95rem; }
+  h2 {
+    font-size: 1.05rem;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    margin: 1.75rem 0 0.6rem;
+    border-bottom: 1px solid var(--rule);
+    padding-bottom: 0.25rem;
+  }
+  table { width: 100%; border-collapse: collapse; font-size: 0.92rem; }
+  th, td { text-align: left; padding: 0.35rem 0.5rem; vertical-align: top; border-bottom: 1px solid var(--rule); }
+  th { font-weight: 600; color: var(--muted); font-size: 0.75rem; letter-spacing: 0.08em; text-transform: uppercase; }
+  td.num { font-variant-numeric: tabular-nums; font-family: ui-monospace, "Cascadia Code", Consolas, monospace; }
+  .state-dead { color: var(--dead); font-weight: 600; }
+  .empty { color: var(--muted); font-style: italic; margin: 0.5rem 0 0; }
+  form.inline { display: inline; margin-right: 0.35rem; }
+  button {
+    font: inherit;
+    font-size: 0.8rem;
+    background: var(--ink);
+    color: var(--paper);
+    border: 0;
+    padding: 0.2rem 0.55rem;
+    cursor: pointer;
+  }
+  button.cancel { background: transparent; color: var(--ink); border: 1px solid var(--ink); }
+  .filters { display: flex; flex-wrap: wrap; gap: 0.75rem 1rem; align-items: end; margin: 0.5rem 0 1rem; }
+  .filters label { display: flex; flex-direction: column; font-size: 0.75rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+  .filters input, .filters select { font: inherit; padding: 0.25rem 0.4rem; border: 1px solid var(--rule); background: #fffdf8; color: var(--ink); min-width: 8rem; }
+  .banner { padding: 0.5rem 0.75rem; margin: 0 0 1rem; border-left: 3px solid var(--flash-ok); background: #e7efe8; }
+  .banner.error { border-color: var(--flash-err); background: #f6e6e1; }
+  .payload { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 0.78rem; word-break: break-all; color: var(--muted); }
+</style>
+</head>
+<body>
+  <h1>drover</h1>
+  <p class="lede">Queue status. Retry and cancel are the same operator actions as the CLI.</p>
+  {{if .Flash}}
+  <div class="banner{{if eq .FlashKind "error"}} error{{end}}" role="status">{{.Flash}}</div>
+  {{end}}
+
+  <h2>Queues</h2>
+  {{if .Depths}}
+  <table>
+    <thead><tr><th>Queue</th><th>State</th><th>Count</th></tr></thead>
+    <tbody>
+      {{range .Depths}}
+      <tr>
+        <td>{{.Queue}}</td>
+        <td>{{.State}}</td>
+        <td class="num">{{.Count}}</td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+  {{else}}
+  <p class="empty">No queue depths.</p>
+  {{end}}
+
+  <h2>Oldest claimable</h2>
+  {{if .Oldest}}
+  <table>
+    <thead><tr><th>Queue</th><th>Age (seconds)</th></tr></thead>
+    <tbody>
+      {{range .Oldest}}
+      <tr>
+        <td>{{.Queue}}</td>
+        <td class="num">{{printf "%.3f" .AgeSeconds}}</td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+  {{else}}
+  <p class="empty">No oldest-claimable ages.</p>
+  {{end}}
+
+  <h2>Jobs</h2>
+  <form class="filters" method="get" action="/">
+    <label>Queue <input type="text" name="queue" value="{{.Filters.Queue}}"></label>
+    <label>State
+      <select name="state">
+        <option value="dead"{{if eq .Filters.State "dead"}} selected{{end}}>dead</option>
+        <option value="all"{{if eq .Filters.State "all"}} selected{{end}}>all</option>
+        <option value="available"{{if eq .Filters.State "available"}} selected{{end}}>available</option>
+        <option value="scheduled"{{if eq .Filters.State "scheduled"}} selected{{end}}>scheduled</option>
+        <option value="retryable"{{if eq .Filters.State "retryable"}} selected{{end}}>retryable</option>
+        <option value="running"{{if eq .Filters.State "running"}} selected{{end}}>running</option>
+        <option value="completed"{{if eq .Filters.State "completed"}} selected{{end}}>completed</option>
+        <option value="cancelled"{{if eq .Filters.State "cancelled"}} selected{{end}}>cancelled</option>
+      </select>
+    </label>
+    <label>Limit <input type="number" name="limit" min="1" max="1000" value="{{.Filters.Limit}}"></label>
+    <button type="submit">Apply</button>
+  </form>
+  {{if .Jobs}}
+  <table>
+    <thead>
+      <tr>
+        <th>ID</th><th>Kind</th><th>Queue</th><th>State</th><th>Attempt</th><th>Args</th><th>Errors</th><th>Actions</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{range .Jobs}}
+      <tr>
+        <td class="num">{{.Row.ID}}</td>
+        <td>{{.Row.Kind}}</td>
+        <td>{{.Row.Queue}}</td>
+        <td{{if eq .Row.State "dead"}} class="state-dead"{{end}}>{{.Row.State}}</td>
+        <td class="num">{{.Row.Attempt}}/{{.Row.MaxAttempts}}</td>
+        <td class="payload">{{printf "%s" .Row.Args}}</td>
+        <td class="payload">{{printf "%s" .Row.Errors}}</td>
+        <td>
+          {{if .CanRetry}}
+          <form class="inline" method="post" action="/jobs/{{.Row.ID}}/retry">
+            <input type="hidden" name="queue" value="{{$.Filters.Queue}}">
+            <input type="hidden" name="state" value="{{$.Filters.State}}">
+            <input type="hidden" name="limit" value="{{$.Filters.Limit}}">
+            <button type="submit">Retry</button>
+          </form>
+          {{end}}
+          {{if .CanCancel}}
+          <form class="inline" method="post" action="/jobs/{{.Row.ID}}/cancel">
+            <input type="hidden" name="queue" value="{{$.Filters.Queue}}">
+            <input type="hidden" name="state" value="{{$.Filters.State}}">
+            <input type="hidden" name="limit" value="{{$.Filters.Limit}}">
+            <button class="cancel" type="submit">Cancel</button>
+          </form>
+          {{end}}
+        </td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+  {{else}}
+  <p class="empty">No jobs match.</p>
+  {{end}}
+</body>
+</html>
