@@ -119,7 +119,7 @@ AD-058 (InsertMany all-or-nothing).
 
 | Option | For | Against |
 | --- | --- | --- |
-| (a) `UniqueKey = id + "/" + fireRFC3339UTC`; first fire strictly after Start; `@every` aligned to Unix epoch | Lock can split-brain briefly; uniqueness makes that harmless. No RunOnStart stampede on failover | A deploy just after a tick waits a full period |
+| (a) `UniqueKey = id + "/" + fireRFC3339NanoUTC`; first fire strictly after leadership; `@every` aligned to Unix epoch | Lock can split-brain briefly; uniqueness makes that harmless. No RunOnStart stampede on failover. Nanosecond keys keep sub-second `@every` ticks distinct | A deploy or lock-retry gap just after a tick waits a full period |
 | (b) RunOnStart plus unique-by-kind (at most one non-terminal instance) | Fast feedback | Skip-next-tick while a long job runs; RFC does not ask for it |
 | (c) Unique by kind only, no fire time in the key | Simpler | A still-running tick blocks the next hour's enqueue |
 

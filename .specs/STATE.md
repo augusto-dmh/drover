@@ -77,8 +77,8 @@ Durable, cross-cycle. Architecture-level decisions live in `docs/adr/`; entries 
 | AD-069 | Cron parser is stdlib-owned 5-field + `@every <duration>` in `internal/cron` (or equivalent); no third-party cron module; fuzz the parser | cycle-h D-4 |
 | AD-070 | Periodic jobs are `Config.PeriodicJobs []PeriodicJob` at construction; empty/duplicate ID, nil Args, or bad cron panics; a process with an empty slice does not take the lock | cycle-h D-5 |
 | AD-071 | Leadership is session `pg_try_advisory_lock` on a dedicated connection and a documented int64 key, off `driver.Driver` (optional interface). memdriver is always leader. Lock failure logs and retries; `Start` still succeeds | cycle-h D-6, D-7 |
-| AD-072 | Periodic enqueue UniqueKey is `id + "/" + fireTime.UTC().Format(time.RFC3339)`; `ErrDuplicateJob` is tick success | cycle-h D-8 |
-| AD-073 | First periodic fire is strictly after Start; `@every` is Unix-epoch aligned | cycle-h D-8 |
+| AD-072 | Periodic enqueue UniqueKey is `id + "/" + fireTime.UTC().Format(time.RFC3339Nano)`; `ErrDuplicateJob` is tick success. RFC3339 (seconds) collapsed sub-second `@every` ticks | cycle-h D-8, amended review of #15 |
+| AD-073 | First periodic fire is strictly after leadership gain; ticks missed while not leader are skipped; `@every` is Unix-epoch aligned | cycle-h D-8, amended on review of unique-key catch-up |
 | AD-074 | Leader computes next run with `time.Now()` in the job location; Insert still uses the database clock for available vs scheduled (AD-035) | cycle-h D-9 |
 | AD-075 | Scheduler shares `fetchCtx` with the rescuer: it stops when claiming stops; Stop must not wait out the next fire | cycle-h D-10 |
 | AD-076 | `JobRow.UniqueKey` is exported (empty when unset) so handlers can use it downstream | cycle-h ASM-14 |
