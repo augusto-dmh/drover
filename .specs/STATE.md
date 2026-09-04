@@ -82,6 +82,13 @@ Durable, cross-cycle. Architecture-level decisions live in `docs/adr/`; entries 
 | AD-074 | Leader computes next run with `time.Now()` in the job location; Insert still uses the database clock for available vs scheduled (AD-035) | cycle-h D-9 |
 | AD-075 | Scheduler shares `fetchCtx` with the rescuer: it stops when claiming stops; Stop must not wait out the next fire | cycle-h D-10 |
 | AD-076 | `JobRow.UniqueKey` is exported (empty when unset) so handlers can use it downstream | cycle-h ASM-14 |
+| AD-077 | Status UI lives in `cmd/drover` via `embed.FS` and talks to `Inspector`, not `Client` or the ops port | cycle-i `context.md` D-1 |
+| AD-078 | `drover web --listen` defaults to `127.0.0.1:7180`; bind failure exits 1 | cycle-i D-2 |
+| AD-079 | No application auth on the status page; POST mutations require Origin (else Referer) same-host as `r.Host` | cycle-i D-3 |
+| AD-080 | Auto-refresh is `<meta http-equiv="refresh">` (`--refresh`, default 5s, 0 disables, non-zero ≥ 1s), not JavaScript | cycle-i D-4 |
+| AD-081 | Retry/cancel are POST + 303 PRG with coded flash; no enqueue from the page | cycle-i D-5 |
+| AD-082 | One GET `/` page; omitted `state` lists `dead`; `state=all` is unfiltered; `queue`/`limit` match the CLI | cycle-i D-6 |
+| AD-083 | `drover web --json` is a usage error | cycle-i D-7 |
 
 **Amended by cycle C:** AD-018 is generalised, not superseded — the heartbeat now stops after the last *pool worker* drains rather than after the fetch loop returns. Same principle, wider scope.
 
@@ -104,14 +111,14 @@ Durable, cross-cycle. Architecture-level decisions live in `docs/adr/`; entries 
 
 ## Handoff
 
-- **Feature**: next is Cycle I — optional status page (`drover web`, server-rendered `html/template`, retry/cancel, no SPA)
-- **Phase / Task**: not started
+- **Feature**: Cycle I — `cycle-i-status-page` (`drover web`)
+- **Phase / Task**: Execute starting at T1
 - **Last shipped**: Cycle H (#15, review follow-up #16)
 - **Completed last cycle**: unique jobs; cron + advisory-lock periodic scheduler; leadership watermark so failover does not replay completed ticks; nanosecond unique keys
-- **Next step**: run the ship cycle for Cycle I
+- **Next step**: implement T1 (GET `/` status page)
 - **Blockers**: none
-- **Branch**: `main`
-- **What review should look at**: n/a (I not started)
+- **Branch**: `feat/status-page` (to be created)
+- **What review should look at**: CSRF Origin/Referer; default-dead vs `state=all`; no JS; Inspector-only mutations
 - **Known weak sensors** (carried forward): neither database-clock property — lease deadlines, nor a delayed job's dueness — can be falsified while the test container and the client share a host clock
 - **Follow-up work carried forward** (recorded, not scheduled): terminal-state retention/pruning; list-query index-friendly variants; `testing/synctest` where viable; constructor panic-vs-error consistency before 1.0; deferred observability niceties from cycle E; batch completer; `go test -bench` CI job; UniqueOpts.ByArgs/Period; RunOnStart; CLI `--unique-key`
-- **Next after this cycle**: Cycle I — optional status page (`drover web`, server-rendered)
+- **Next after this cycle**: (none on the RFC table — I is the last cycle)
