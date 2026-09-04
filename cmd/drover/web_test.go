@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -18,7 +19,7 @@ func TestGETStatusPageRendersStatsAndJobs(t *testing.T) {
 	t.Parallel()
 	fake := &fakeInspector{
 		stats: &drover.QueueStats{
-			Depths: []drover.QueueDepth{{Queue: "default", State: "available", Count: 3}},
+			Depths: []drover.QueueDepth{{Queue: "default", State: "available", Count: 42}},
 			Oldest: []drover.QueueAge{{Queue: "default", AgeSeconds: 1.5}},
 		},
 		jobs: []*drover.JobRow{
@@ -53,14 +54,14 @@ func TestGETStatusPageRendersStatsAndJobs(t *testing.T) {
 		t.Fatalf("ListJobs opts=%+v, want state=dead limit=100", fake.listOpts)
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, "default") || !strings.Contains(body, "available") || !strings.Contains(body, "3") {
+	if !strings.Contains(body, "default") || !strings.Contains(body, "available") || !strings.Contains(body, "42") {
 		t.Fatalf("missing depth row: %s", body)
 	}
 	if !strings.Contains(body, "1.500") {
 		t.Fatalf("missing oldest age: %s", body)
 	}
-	if !strings.Contains(body, "email") || !strings.Contains(body, `action="/jobs/9/retry"`) || !strings.Contains(body, `action="/jobs/9/cancel"`) {
-		t.Fatalf("dead job missing retry/cancel: %s", body)
+	if !strings.Contains(body, "email") || !strings.Contains(body, `method="post" action="/jobs/9/retry"`) || !strings.Contains(body, `method="post" action="/jobs/9/cancel"`) {
+		t.Fatalf("dead job missing retry/cancel POST forms: %s", body)
 	}
 	if strings.Contains(body, `<script>alert(1)</script>`) {
 		t.Fatalf("unescaped script in body")
@@ -101,6 +102,9 @@ func TestGETStatusPageButtonsByState(t *testing.T) {
 	}
 	if !strings.Contains(body, `/jobs/4/retry`) {
 		t.Error("dead job: want retry form")
+	}
+	if strings.Count(body, `method="post"`) < 5 {
+		t.Fatalf("want POST method on retry+cancel forms, got %d: %s", strings.Count(body, `method="post"`), body)
 	}
 	for _, id := range []int{1, 2, 3, 5, 6, 7} {
 		if strings.Contains(body, `/jobs/`+strconv.Itoa(id)+`/retry`) {
@@ -166,16 +170,19 @@ func TestGETStatusPageFilters(t *testing.T) {
 		wantQueue string
 		wantState drover.JobState
 		wantLimit int
+		job       *drover.JobRow
 	}{
-		{name: "defaults", rawQuery: "", wantState: drover.StateDead, wantLimit: 100},
-		{name: "all states", rawQuery: "state=all", wantState: "", wantLimit: 100},
-		{name: "named state", rawQuery: "state=running", wantState: drover.StateRunning, wantLimit: 100},
-		{name: "queue and limit", rawQuery: "queue=bulk&state=available&limit=10", wantQueue: "bulk", wantState: drover.StateAvailable, wantLimit: 10},
+		{name: "defaults", rawQuery: "", wantState: drover.StateDead, wantLimit: 100, job: &drover.JobRow{ID: 11, Kind: "kind-default", Queue: "default", State: drover.StateDead, Args: json.RawMessage(`{}`)}},
+		{name: "all states", rawQuery: "state=all", wantState: "", wantLimit: 100, job: &drover.JobRow{ID: 12, Kind: "kind-all", Queue: "q", State: drover.StateRunning, Args: json.RawMessage(`{}`)}},
+		{name: "named state", rawQuery: "state=running", wantState: drover.StateRunning, wantLimit: 100, job: &drover.JobRow{ID: 13, Kind: "kind-running", Queue: "q", State: drover.StateRunning, Args: json.RawMessage(`{}`)}},
+		{name: "queue and limit", rawQuery: "queue=bulk&state=available&limit=10", wantQueue: "bulk", wantState: drover.StateAvailable, wantLimit: 10, job: &drover.JobRow{ID: 14, Kind: "kind-bulk", Queue: "bulk", State: drover.StateAvailable, Args: json.RawMessage(`{}`)}},
+		{name: "limit one", rawQuery: "state=all&limit=1", wantState: "", wantLimit: 1, job: &drover.JobRow{ID: 15, Kind: "kind-lim1", Queue: "q", State: drover.StateDead, Args: json.RawMessage(`{}`)}},
+		{name: "limit max", rawQuery: "state=all&limit=1000", wantState: "", wantLimit: 1000, job: &drover.JobRow{ID: 16, Kind: "kind-lim1000", Queue: "q", State: drover.StateDead, Args: json.RawMessage(`{}`)}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			fake := &fakeInspector{stats: &drover.QueueStats{}}
+			fake := &fakeInspector{stats: &drover.QueueStats{}, jobs: []*drover.JobRow{tt.job}}
 			u := "/"
 			if tt.rawQuery != "" {
 				u = "/?" + tt.rawQuery
@@ -190,6 +197,13 @@ func TestGETStatusPageFilters(t *testing.T) {
 			}
 			if fake.listOpts.Queue != tt.wantQueue || fake.listOpts.State != tt.wantState || fake.listOpts.Limit != tt.wantLimit {
 				t.Fatalf("opts=%+v", fake.listOpts)
+			}
+			body := rec.Body.String()
+			if !strings.Contains(body, tt.job.Kind) {
+				t.Fatalf("rendered jobs missing %q: %s", tt.job.Kind, body)
+			}
+			if strings.Contains(body, "kind-absent") {
+				t.Fatalf("rendered a job ListJobs did not return")
 			}
 		})
 	}
@@ -236,6 +250,9 @@ func TestGETStatusPageFilterValidation400(t *testing.T) {
 			if fake.listOpts != nil {
 				t.Fatalf("ListJobs called on invalid query: %+v", fake.listOpts)
 			}
+			if u == "/?state=nope" && !strings.Contains(rec.Body.String(), "nope") {
+				t.Fatalf("400 body did not name invalid state: %s", rec.Body.String())
+			}
 		})
 	}
 }
@@ -266,6 +283,26 @@ func TestGETStatusPageMetaRefresh(t *testing.T) {
 		}
 	})
 
+	t.Run("keeps non-default state and limit", func(t *testing.T) {
+		t.Parallel()
+		fake := &fakeInspector{stats: &drover.QueueStats{}}
+		rec := httptest.NewRecorder()
+		newStatusHandler(fake, 5*time.Second).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/?state=running&limit=10", nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status %d", rec.Code)
+		}
+		body := rec.Body.String()
+		if !strings.Contains(body, `content="5;url=`) {
+			t.Fatalf("missing 5s refresh: %s", body)
+		}
+		if !strings.Contains(body, "state=running") || !strings.Contains(body, "limit=10") {
+			t.Fatalf("refresh URL dropped state/limit: %s", body)
+		}
+		if strings.Contains(body, "notice=") || strings.Contains(body, "error=") {
+			t.Fatalf("flash leaked into refresh URL: %s", body)
+		}
+	})
+
 	t.Run("refresh disabled", func(t *testing.T) {
 		t.Parallel()
 		fake := &fakeInspector{stats: &drover.QueueStats{}}
@@ -280,15 +317,17 @@ func TestGETStatusPageMetaRefresh(t *testing.T) {
 func TestGETStatusPageFlash(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
-		query  string
-		want   string
-		unwant string
+		query      string
+		want       string
+		unwant     string
+		omitBanner bool
 	}{
 		{query: "notice=retried&id=9", want: "redrove job 9"},
 		{query: "notice=cancelled&id=4", want: "cancelled job 4"},
 		{query: "error=not_found&id=8", want: "job 8 not found"},
 		{query: "error=invalid_transition&id=2", want: "job 2 refused the transition"},
-		{query: "error=%3Cscript%3E&id=1", unwant: "<script>"},
+		{query: "error=%3Cscript%3E&id=1", unwant: "<script>", omitBanner: true},
+		{query: "error=mystery&id=1", unwant: "mystery", omitBanner: true},
 		{query: "notice=retried", unwant: "redrove job"},
 	}
 	for _, tt := range tests {
@@ -303,6 +342,9 @@ func TestGETStatusPageFlash(t *testing.T) {
 			}
 			if tt.unwant != "" && strings.Contains(body, tt.unwant) {
 				t.Fatalf("did not want %q in %s", tt.unwant, body)
+			}
+			if tt.omitBanner && (strings.Contains(body, `role="status"`) || strings.Contains(body, `class="banner`)) {
+				t.Fatalf("unknown flash still rendered a banner: %s", body)
 			}
 		})
 	}
@@ -348,10 +390,13 @@ func TestPOSTCancelSuccess(t *testing.T) {
 
 func TestPOSTRetryNotFoundFlash(t *testing.T) {
 	t.Parallel()
-	fake := &fakeInspector{retryErr: drover.ErrNotFound}
+	fake := &fakeInspector{retryErr: fmt.Errorf("job: %w", drover.ErrNotFound)}
 	rec := postStatus(newStatusHandler(fake, 0), "/jobs/99/retry", "")
 	if rec.Code != http.StatusSeeOther {
 		t.Fatalf("status %d", rec.Code)
+	}
+	if fake.retryID != 99 {
+		t.Fatalf("retry id=%d", fake.retryID)
 	}
 	got := locationQuery(t, rec)
 	if got.Get("error") != "not_found" || got.Get("id") != "99" || got.Get("notice") != "" {
@@ -361,10 +406,13 @@ func TestPOSTRetryNotFoundFlash(t *testing.T) {
 
 func TestPOSTCancelInvalidTransitionFlash(t *testing.T) {
 	t.Parallel()
-	fake := &fakeInspector{cancelErr: drover.ErrInvalidTransition}
+	fake := &fakeInspector{cancelErr: fmt.Errorf("job: %w", drover.ErrInvalidTransition)}
 	rec := postStatus(newStatusHandler(fake, 0), "/jobs/5/cancel", "")
 	if rec.Code != http.StatusSeeOther {
 		t.Fatalf("status %d", rec.Code)
+	}
+	if fake.cancelID != 5 {
+		t.Fatalf("cancel id=%d", fake.cancelID)
 	}
 	got := locationQuery(t, rec)
 	if got.Get("error") != "invalid_transition" || got.Get("id") != "5" {
@@ -392,7 +440,7 @@ func TestGETPageRetryFormPostsHiddenFilters(t *testing.T) {
 	rec := httptest.NewRecorder()
 	newStatusHandler(fake, 0).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/?queue=mail&state=dead&limit=25", nil))
 	body := rec.Body.String()
-	if !strings.Contains(body, `name="queue" value="mail"`) || !strings.Contains(body, `name="limit" value="25"`) {
+	if !strings.Contains(body, `name="queue" value="mail"`) || !strings.Contains(body, `name="state" value="dead"`) || !strings.Contains(body, `name="limit" value="25"`) {
 		t.Fatalf("hidden filters missing: %s", body)
 	}
 }
@@ -440,6 +488,22 @@ func TestPOSTCSRFRequiresSameOrigin(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPost, "/jobs/1/retry", nil)
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		req.Header.Set("Origin", "http://evil.test")
+		rec := httptest.NewRecorder()
+		newStatusHandler(fake, 0).ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("status %d", rec.Code)
+		}
+		if fake.retryID != 0 {
+			t.Fatalf("Inspector called, id=%d", fake.retryID)
+		}
+	})
+
+	t.Run("referer host mismatch", func(t *testing.T) {
+		t.Parallel()
+		fake := &fakeInspector{retryJob: &drover.JobRow{ID: 1}}
+		req := httptest.NewRequest(http.MethodPost, "/jobs/1/retry", nil)
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("Referer", "http://evil.test/")
 		rec := httptest.NewRecorder()
 		newStatusHandler(fake, 0).ServeHTTP(rec, req)
 		if rec.Code != http.StatusForbidden {
