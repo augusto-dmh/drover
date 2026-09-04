@@ -8,6 +8,8 @@ package dbsqlc
 import (
 	"context"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const extendLeases = `-- name: ExtendLeases :exec
@@ -53,7 +55,7 @@ WHERE id IN (
     LIMIT $3
     FOR UPDATE SKIP LOCKED
 )
-RETURNING id, kind, queue, args, state, attempt, max_attempts, errors, scheduled_at, leased_until, created_at, finalized_at
+RETURNING id, kind, queue, args, state, attempt, max_attempts, errors, scheduled_at, leased_until, created_at, finalized_at, unique_key
 `
 
 type FetchAvailableParams struct {
@@ -87,6 +89,7 @@ func (q *Queries) FetchAvailable(ctx context.Context, arg FetchAvailableParams) 
 			&i.LeasedUntil,
 			&i.CreatedAt,
 			&i.FinalizedAt,
+			&i.UniqueKey,
 		); err != nil {
 			return nil, err
 		}
@@ -112,7 +115,7 @@ WHERE id IN (
     LIMIT $2
     FOR UPDATE SKIP LOCKED
 )
-RETURNING id, kind, queue, args, state, attempt, max_attempts, errors, scheduled_at, leased_until, created_at, finalized_at
+RETURNING id, kind, queue, args, state, attempt, max_attempts, errors, scheduled_at, leased_until, created_at, finalized_at, unique_key
 `
 
 type FetchExpiredParams struct {
@@ -146,6 +149,7 @@ func (q *Queries) FetchExpired(ctx context.Context, arg FetchExpiredParams) ([]D
 			&i.LeasedUntil,
 			&i.CreatedAt,
 			&i.FinalizedAt,
+			&i.UniqueKey,
 		); err != nil {
 			return nil, err
 		}
@@ -158,7 +162,7 @@ func (q *Queries) FetchExpired(ctx context.Context, arg FetchExpiredParams) ([]D
 }
 
 const getJob = `-- name: GetJob :one
-SELECT id, kind, queue, args, state, attempt, max_attempts, errors, scheduled_at, leased_until, created_at, finalized_at FROM drover_jobs WHERE id = $1
+SELECT id, kind, queue, args, state, attempt, max_attempts, errors, scheduled_at, leased_until, created_at, finalized_at, unique_key FROM drover_jobs WHERE id = $1
 `
 
 func (q *Queries) GetJob(ctx context.Context, id int64) (DroverJob, error) {
@@ -177,21 +181,23 @@ func (q *Queries) GetJob(ctx context.Context, id int64) (DroverJob, error) {
 		&i.LeasedUntil,
 		&i.CreatedAt,
 		&i.FinalizedAt,
+		&i.UniqueKey,
 	)
 	return i, err
 }
 
 const insertJob = `-- name: InsertJob :one
-INSERT INTO drover_jobs (kind, queue, args, scheduled_at, state)
+INSERT INTO drover_jobs (kind, queue, args, scheduled_at, state, unique_key)
 VALUES (
     $1, $2, $3,
     coalesce($4::timestamptz, now()),
     CASE WHEN coalesce($4::timestamptz, now()) > now()
          THEN 'scheduled'::drover_job_state
          ELSE 'available'::drover_job_state
-    END
+    END,
+    $5
 )
-RETURNING id, kind, queue, args, state, attempt, max_attempts, errors, scheduled_at, leased_until, created_at, finalized_at
+RETURNING id, kind, queue, args, state, attempt, max_attempts, errors, scheduled_at, leased_until, created_at, finalized_at, unique_key
 `
 
 type InsertJobParams struct {
@@ -199,6 +205,7 @@ type InsertJobParams struct {
 	Queue       string
 	Args        []byte
 	ScheduledAt *time.Time
+	UniqueKey   pgtype.Text
 }
 
 // A null scheduled_at means "now". The state follows from the same
@@ -223,6 +230,7 @@ func (q *Queries) InsertJob(ctx context.Context, arg InsertJobParams) (DroverJob
 		arg.Queue,
 		arg.Args,
 		arg.ScheduledAt,
+		arg.UniqueKey,
 	)
 	var i DroverJob
 	err := row.Scan(
@@ -238,12 +246,13 @@ func (q *Queries) InsertJob(ctx context.Context, arg InsertJobParams) (DroverJob
 		&i.LeasedUntil,
 		&i.CreatedAt,
 		&i.FinalizedAt,
+		&i.UniqueKey,
 	)
 	return i, err
 }
 
 const insertJobsFromStaging = `-- name: InsertJobsFromStaging :many
-INSERT INTO drover_jobs (kind, queue, args, scheduled_at, state)
+INSERT INTO drover_jobs (kind, queue, args, scheduled_at, state, unique_key)
 SELECT
     kind,
     queue,
@@ -252,10 +261,11 @@ SELECT
     CASE WHEN coalesce(scheduled_at, now()) > now()
          THEN 'scheduled'::drover_job_state
          ELSE 'available'::drover_job_state
-    END
+    END,
+    unique_key
 FROM drover_insert_batch
 ORDER BY ord
-RETURNING id, kind, queue, args, state, attempt, max_attempts, errors, scheduled_at, leased_until, created_at, finalized_at
+RETURNING id, kind, queue, args, state, attempt, max_attempts, errors, scheduled_at, leased_until, created_at, finalized_at, unique_key
 `
 
 // Same CASE as InsertJob: dueness is the database clock's, not the
@@ -283,6 +293,7 @@ func (q *Queries) InsertJobsFromStaging(ctx context.Context) ([]DroverJob, error
 			&i.LeasedUntil,
 			&i.CreatedAt,
 			&i.FinalizedAt,
+			&i.UniqueKey,
 		); err != nil {
 			return nil, err
 		}
@@ -295,7 +306,7 @@ func (q *Queries) InsertJobsFromStaging(ctx context.Context) ([]DroverJob, error
 }
 
 const listJobs = `-- name: ListJobs :many
-SELECT id, kind, queue, args, state, attempt, max_attempts, errors, scheduled_at, leased_until, created_at, finalized_at FROM drover_jobs
+SELECT id, kind, queue, args, state, attempt, max_attempts, errors, scheduled_at, leased_until, created_at, finalized_at, unique_key FROM drover_jobs
 WHERE ($1 = '' OR queue = $1)
   AND ($2::text = '' OR state = $2::drover_job_state)
 ORDER BY id DESC
@@ -333,6 +344,7 @@ func (q *Queries) ListJobs(ctx context.Context, arg ListJobsParams) ([]DroverJob
 			&i.LeasedUntil,
 			&i.CreatedAt,
 			&i.FinalizedAt,
+			&i.UniqueKey,
 		); err != nil {
 			return nil, err
 		}
@@ -523,7 +535,7 @@ SET state = 'cancelled',
     leased_until = NULL
 WHERE id = $1
   AND state IN ('available', 'scheduled', 'retryable', 'dead')
-RETURNING id, kind, queue, args, state, attempt, max_attempts, errors, scheduled_at, leased_until, created_at, finalized_at
+RETURNING id, kind, queue, args, state, attempt, max_attempts, errors, scheduled_at, leased_until, created_at, finalized_at, unique_key
 `
 
 // Operator cancel is state-conditioned, not lease-fenced: it must not
@@ -545,6 +557,7 @@ func (q *Queries) OperatorCancel(ctx context.Context, id int64) (DroverJob, erro
 		&i.LeasedUntil,
 		&i.CreatedAt,
 		&i.FinalizedAt,
+		&i.UniqueKey,
 	)
 	return i, err
 }
@@ -602,7 +615,7 @@ SET state = 'available',
     scheduled_at = now()
 WHERE id = $1
   AND state = 'dead'
-RETURNING id, kind, queue, args, state, attempt, max_attempts, errors, scheduled_at, leased_until, created_at, finalized_at
+RETURNING id, kind, queue, args, state, attempt, max_attempts, errors, scheduled_at, leased_until, created_at, finalized_at, unique_key
 `
 
 // Redrive resets attempt and the lease, keeps error history for triage,
@@ -624,6 +637,7 @@ func (q *Queries) RedriveDead(ctx context.Context, id int64) (DroverJob, error) 
 		&i.LeasedUntil,
 		&i.CreatedAt,
 		&i.FinalizedAt,
+		&i.UniqueKey,
 	)
 	return i, err
 }

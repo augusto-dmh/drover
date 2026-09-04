@@ -51,6 +51,7 @@ type JobRow struct {
 	LeasedUntil *time.Time
 	CreatedAt   time.Time
 	FinalizedAt *time.Time
+	UniqueKey   string
 }
 
 // Config configures a Client. Zero values get defaults: slog.Default()
@@ -187,6 +188,15 @@ type Config struct {
 	// Bind failure fails Start and starts nothing: a worker that is
 	// running but unreachable is the state this surface exists to remove.
 	OpsAddr string
+
+	// PeriodicJobs are cron and @every schedules this process may
+	// enqueue when it holds the scheduler lock. An empty or nil slice
+	// starts no scheduler and takes no lock.
+	//
+	// An empty or duplicate ID, nil Args, an empty kind, or an
+	// unparseable Cron panics at construction: those are programmer
+	// errors, like a nil middleware.
+	PeriodicJobs []PeriodicJob
 }
 
 // Client enqueues jobs and runs the worker loop.
@@ -208,6 +218,10 @@ type Client struct {
 	inflight          *inflightSet
 	metrics           *metricSet
 	registry          *prometheus.Registry
+
+	// periodic is the construction-time schedule list, already parsed.
+	// Empty means this client never runs a scheduler.
+	periodic []periodicEntry
 
 	// chain is the composed middleware stack with dispatch at its
 	// centre. It is built once at construction and never rebuilt: every
@@ -324,6 +338,7 @@ func newClient(drv driver.Driver, cfg Config) *Client {
 		[]Middleware{Logging(c.logger), metricsMiddleware(c.metrics)},
 		checkedMiddleware(cfg.Middleware)...,
 	))
+	c.periodic = checkedPeriodicJobs(cfg.PeriodicJobs)
 	return c
 }
 
@@ -375,6 +390,11 @@ type InsertOpts struct {
 	// treated as now rather than rejected, so a caller computing a delay
 	// from a stale clock still enqueues a runnable job.
 	ScheduledAt time.Time
+
+	// UniqueKey, when non-empty, occupies a unique slot among
+	// non-terminal jobs of this queue and kind. Empty means the job
+	// does not participate in uniqueness.
+	UniqueKey string
 }
 
 // Insert enqueues a job in its own transaction. The job is available to
@@ -386,7 +406,7 @@ func (c *Client) Insert(ctx context.Context, args JobArgs, opts *InsertOpts) (*J
 	}
 	row, err := c.drv.Insert(ctx, params)
 	if err != nil {
-		return nil, fmt.Errorf("drover: insert job kind %q: %w", params.Kind, err)
+		return nil, fmt.Errorf("drover: insert job kind %q: %w", params.Kind, publicInsertErr(err))
 	}
 	c.wakeAfterInsert(ctx)
 	return rowFromDriver(row), nil
@@ -402,7 +422,7 @@ func (c *Client) InsertTx(ctx context.Context, tx pgx.Tx, args JobArgs, opts *In
 	}
 	row, err := c.drv.InsertTx(ctx, tx, params)
 	if err != nil {
-		return nil, fmt.Errorf("drover: insert job kind %q in tx: %w", params.Kind, err)
+		return nil, fmt.Errorf("drover: insert job kind %q in tx: %w", params.Kind, publicInsertErr(err))
 	}
 	c.notifyTx(ctx, tx)
 	return rowFromDriver(row), nil
@@ -420,7 +440,7 @@ func (c *Client) InsertMany(ctx context.Context, items []InsertItem) ([]*JobRow,
 	}
 	rows, err := c.drv.InsertMany(ctx, batch)
 	if err != nil {
-		return nil, fmt.Errorf("drover: insert jobs: %w", err)
+		return nil, fmt.Errorf("drover: insert jobs: %w", publicInsertErr(err))
 	}
 	c.wakeAfterInsert(ctx)
 	return rowsFromDriver(rows), nil
@@ -439,7 +459,7 @@ func (c *Client) InsertManyTx(ctx context.Context, tx pgx.Tx, items []InsertItem
 	}
 	rows, err := c.drv.InsertManyTx(ctx, tx, batch)
 	if err != nil {
-		return nil, fmt.Errorf("drover: insert jobs in tx: %w", err)
+		return nil, fmt.Errorf("drover: insert jobs in tx: %w", publicInsertErr(err))
 	}
 	c.notifyTx(ctx, tx)
 	return rowsFromDriver(rows), nil
@@ -457,6 +477,15 @@ type notifier interface {
 type wakeupListener interface {
 	ListenWakeups(ctx context.Context, wake chan struct{}) error
 }
+
+// leaderLocker is the optional pgdriver surface for periodic-scheduler
+// leadership. It is not on driver.Driver: memdriver is always leader.
+type leaderLocker interface {
+	TryBecomeLeader(ctx context.Context) (bool, error)
+	ReleaseLeader()
+}
+
+var _ leaderLocker = (*pgdriver.Driver)(nil)
 
 func (c *Client) wakeAfterInsert(ctx context.Context) {
 	if !c.notifyWakeup {
@@ -537,8 +566,16 @@ func insertParamsFor(args JobArgs, opts *InsertOpts) (driver.InsertParams, error
 		// Passed through as the zero time when unset, which the driver
 		// reads as "now" and resolves against the store's own clock.
 		params.ScheduledAt = opts.ScheduledAt
+		params.UniqueKey = opts.UniqueKey
 	}
 	return params, nil
+}
+
+func publicInsertErr(err error) error {
+	if errors.Is(err, driver.ErrDuplicateJob) {
+		return ErrDuplicateJob
+	}
+	return err
 }
 
 func rowFromDriver(row *driver.JobRow) *JobRow {
@@ -555,5 +592,6 @@ func rowFromDriver(row *driver.JobRow) *JobRow {
 		LeasedUntil: row.LeasedUntil,
 		CreatedAt:   row.CreatedAt,
 		FinalizedAt: row.FinalizedAt,
+		UniqueKey:   row.UniqueKey,
 	}
 }

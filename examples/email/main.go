@@ -1,6 +1,7 @@
 // Command email is a small, runnable drover pipeline: it enqueues a
 // batch of "welcome email" jobs plus one delayed "digest" job on a
-// second, lower-priority queue, works them concurrently on a pool of
+// second, lower-priority queue, registers an hourly digest on that
+// same queue via PeriodicJobs, works them concurrently on a pool of
 // workers wrapped in a small middleware chain, and retries the
 // deliveries that the flaky stub in delivery.go fails on their first
 // attempt. Send SIGINT (Ctrl-C) to see the graceful shutdown drain
@@ -173,6 +174,14 @@ func run() error {
 		// is a custom one. The client always installs Logging outermost
 		// of both, so per-job logging is unaffected by either.
 		Middleware: []drover.Middleware{drover.Timeout(handlerTimeout), perQueueCounts(counts)},
+		// hourly-digest fires on a cron schedule when this process holds
+		// the scheduler lock; the one-off digest below is a delayed Insert.
+		PeriodicJobs: []drover.PeriodicJob{{
+			ID:   "hourly-digest",
+			Cron: "@every 1h",
+			Args: SendWelcomeEmail{To: "digest-subscribers@example.com", Template: "digest"},
+			Opts: &drover.InsertOpts{Queue: digestQueue},
+		}},
 	})
 	if err != nil {
 		return fmt.Errorf("build client: %w", err)

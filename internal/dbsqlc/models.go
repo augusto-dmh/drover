@@ -8,6 +8,8 @@ import (
 	"database/sql/driver"
 	"fmt"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 type DroverJobState string
@@ -63,6 +65,7 @@ type DroverInsertBatch struct {
 	Queue       string
 	Args        []byte
 	ScheduledAt *time.Time
+	UniqueKey   pgtype.Text
 }
 
 type DroverJob struct {
@@ -78,4 +81,5 @@ type DroverJob struct {
 	LeasedUntil *time.Time
 	CreatedAt   time.Time
 	FinalizedAt *time.Time
+	UniqueKey   pgtype.Text
 }

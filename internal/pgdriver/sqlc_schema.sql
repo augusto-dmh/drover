@@ -6,5 +6,6 @@ CREATE TABLE drover_insert_batch (
     kind text NOT NULL,
     queue text NOT NULL,
     args jsonb NOT NULL,
-    scheduled_at timestamptz
+    scheduled_at timestamptz,
+    unique_key text
 );

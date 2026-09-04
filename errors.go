@@ -10,6 +10,12 @@ import (
 // returns an empty string.
 var ErrInvalidKind = errors.New("drover: job kind must be non-empty")
 
+// ErrDuplicateJob is returned by Insert, InsertTx, InsertMany, and
+// InsertManyTx when a non-terminal job already occupies the same queue,
+// kind, and unique key. No row is inserted; InsertMany rolls back the
+// whole batch.
+var ErrDuplicateJob = errors.New("drover: job with this unique key already exists")
+
 // ErrNotFound is returned by Inspector methods when the requested job
 // id does not exist.
 var ErrNotFound = errors.New("drover: job not found")

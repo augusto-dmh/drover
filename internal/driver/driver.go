@@ -34,6 +34,10 @@ var (
 	// been done twice, which at-least-once delivery permits, but only the
 	// current holder may record what happened.
 	ErrLeaseLost = errors.New("driver: job reclaimed by another worker")
+
+	// ErrDuplicateJob reports that a non-terminal job with the same
+	// queue, kind, and unique key already exists. No row is inserted.
+	ErrDuplicateJob = errors.New("driver: job with this unique key already exists")
 )
 
 // Lease identifies one claim on a job: the row, and the attempt the
@@ -64,6 +68,11 @@ type InsertParams struct {
 	// letting the caller decide would let a client running fast or slow
 	// record a state its own store disagrees with.
 	ScheduledAt time.Time
+
+	// UniqueKey, when non-empty, occupies a unique slot among
+	// non-terminal jobs of this queue and kind. Empty means the job
+	// does not participate in uniqueness and is stored as NULL.
+	UniqueKey string
 }
 
 // JobRow is the stored representation of a job.
@@ -80,6 +89,7 @@ type JobRow struct {
 	LeasedUntil *time.Time
 	CreatedAt   time.Time
 	FinalizedAt *time.Time
+	UniqueKey   string
 }
 
 // AttemptError is one recorded execution failure, appended to a job's

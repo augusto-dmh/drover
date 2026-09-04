@@ -106,6 +106,29 @@ func ExampleConfig_observability() {
 	}
 }
 
+// ExampleConfig_uniqueAndPeriodic mirrors the README Planned API snippets
+// for InsertOpts.UniqueKey and Config.PeriodicJobs so a rename fails
+// `go test` instead of shipping a non-compiling example again.
+func ExampleConfig_uniqueAndPeriodic() {
+	workers := drover.NewWorkers()
+	_ = drover.Config{
+		Workers:     workers,
+		Concurrency: 8,
+		Queues:      map[string]int{"default": 1, "bulk": 9},
+		PeriodicJobs: []drover.PeriodicJob{{
+			ID:   "digest",
+			Cron: "@every 1h",
+			Args: SendEmail{To: "digest-subscribers@example.com", Template: "digest"},
+			Opts: &drover.InsertOpts{Queue: "bulk"},
+		}},
+	}
+	ctx := context.Background()
+	var client *drover.Client
+	_, _ = client.Insert(ctx, SendEmail{To: "ada@example.com", Template: "welcome"}, &drover.InsertOpts{
+		UniqueKey: "user/ada/welcome",
+	})
+}
+
 // ExampleConfig_notifyWakeup mirrors the README Planned API Config snippet.
 func ExampleConfig_notifyWakeup() {
 	workers := drover.NewWorkers()

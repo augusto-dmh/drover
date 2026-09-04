@@ -67,7 +67,7 @@ type runner struct {
 	stopHeartbeat chan struct{}
 
 	goroutines sync.WaitGroup // fetch loop and workers
-	background sync.WaitGroup // heartbeat, rescuer, stats refresher, optional LISTEN
+	background sync.WaitGroup // heartbeat, rescuer, stats refresher, optional LISTEN, optional scheduler
 
 	shutdown sync.Once
 	done     chan struct{} // closed once the shutdown has finished
@@ -135,6 +135,9 @@ func (r *runner) start(ctx context.Context) {
 	if r.client.notifyWakeup && listen {
 		n++
 	}
+	if len(r.client.periodic) > 0 {
+		n++
+	}
 	r.background.Add(n)
 	go func() {
 		defer r.background.Done()
@@ -152,6 +155,12 @@ func (r *runner) start(ctx context.Context) {
 		go func() {
 			defer r.background.Done()
 			r.listenForWakeups(listener)
+		}()
+	}
+	if len(r.client.periodic) > 0 {
+		go func() {
+			defer r.background.Done()
+			r.schedulePeriodic()
 		}()
 	}
 

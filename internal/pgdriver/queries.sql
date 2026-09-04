@@ -15,14 +15,15 @@
 -- and break the guarantee — being volatile, its two occurrences would
 -- evaluate at different instants and could disagree for real.
 -- name: InsertJob :one
-INSERT INTO drover_jobs (kind, queue, args, scheduled_at, state)
+INSERT INTO drover_jobs (kind, queue, args, scheduled_at, state, unique_key)
 VALUES (
     $1, $2, $3,
     coalesce(sqlc.narg(scheduled_at)::timestamptz, now()),
     CASE WHEN coalesce(sqlc.narg(scheduled_at)::timestamptz, now()) > now()
          THEN 'scheduled'::drover_job_state
          ELSE 'available'::drover_job_state
-    END
+    END,
+    sqlc.narg(unique_key)
 )
 RETURNING *;
 
@@ -30,7 +31,7 @@ RETURNING *;
 -- client's. Rows are taken from the session-temp staging table in the
 -- order CopyFrom loaded them.
 -- name: InsertJobsFromStaging :many
-INSERT INTO drover_jobs (kind, queue, args, scheduled_at, state)
+INSERT INTO drover_jobs (kind, queue, args, scheduled_at, state, unique_key)
 SELECT
     kind,
     queue,
@@ -39,7 +40,8 @@ SELECT
     CASE WHEN coalesce(scheduled_at, now()) > now()
          THEN 'scheduled'::drover_job_state
          ELSE 'available'::drover_job_state
-    END
+    END,
+    unique_key
 FROM drover_insert_batch
 ORDER BY ord
 RETURNING *;

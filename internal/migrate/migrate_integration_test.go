@@ -20,7 +20,7 @@ func TestMain(m *testing.M) { os.Exit(testdb.RunMain(m)) }
 
 // latestVersion is the highest embedded migration; the schema is only
 // correct once every one of them has been applied.
-const latestVersion = 3
+const latestVersion = 4
 
 // indexDefs returns each index on drover_jobs by name, with the
 // definition PostgreSQL reconstructed from the catalog.
@@ -149,6 +149,7 @@ func TestMigrateFreshDatabaseCreatesSchemaAtLatestVersion(t *testing.T) {
 	wantColumns := []string{
 		"args", "attempt", "created_at", "errors", "finalized_at", "id",
 		"kind", "leased_until", "max_attempts", "queue", "scheduled_at", "state",
+		"unique_key",
 	}
 	slices.Sort(columns)
 	if !slices.Equal(columns, wantColumns) {
@@ -241,8 +242,11 @@ func TestMigrateUpgradesDatabaseAlreadyAtPreviousVersion(t *testing.T) {
 	// Wind the schema back to the previous version, leaving the rows in
 	// place, so the next Migrate has to apply the newest migration to a
 	// populated table rather than an empty one.
-	if _, err := pool.Exec(ctx, `DROP INDEX drover_jobs_dead_idx`); err != nil {
-		t.Fatalf("drop dead index: %v", err)
+	if _, err := pool.Exec(ctx, `DROP INDEX drover_jobs_unique_active_idx`); err != nil {
+		t.Fatalf("drop unique-active index: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `ALTER TABLE drover_jobs DROP COLUMN unique_key`); err != nil {
+		t.Fatalf("drop unique_key: %v", err)
 	}
 	if _, err := pool.Exec(ctx,
 		`DELETE FROM drover_schema_version WHERE version = $1`, latestVersion); err != nil {
@@ -261,5 +265,8 @@ func TestMigrateUpgradesDatabaseAlreadyAtPreviousVersion(t *testing.T) {
 	if version != latestVersion {
 		t.Errorf("schema version = %d, want %d", version, latestVersion)
 	}
-	assertDeadIndex(t, pool)
+	defs := indexDefs(t, pool)
+	if _, ok := defs["drover_jobs_unique_active_idx"]; !ok {
+		t.Error("drover_jobs_unique_active_idx missing after upgrade")
+	}
 }

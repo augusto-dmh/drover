@@ -10,9 +10,12 @@ import (
 	"fmt"
 	"math"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/augusto-dmh/drover/internal/dbsqlc"
@@ -20,10 +23,17 @@ import (
 	"github.com/augusto-dmh/drover/internal/migrate"
 )
 
+// AdvisoryLockPeriodic is the session advisory-lock key for the
+// periodic scheduler. "drover" in ASCII, shifted left 8, plus 1.
+const AdvisoryLockPeriodic int64 = 0x64726f7665720001
+
 // Driver implements driver.Driver on a pgx connection pool.
 type Driver struct {
 	pool    *pgxpool.Pool
 	queries *dbsqlc.Queries
+
+	leaderMu   sync.Mutex
+	leaderConn *pgxpool.Conn
 }
 
 // New returns a Driver backed by pool.
@@ -40,7 +50,7 @@ func (d *Driver) Migrate(ctx context.Context) error {
 func (d *Driver) Insert(ctx context.Context, params driver.InsertParams) (*driver.JobRow, error) {
 	job, err := d.queries.InsertJob(ctx, insertParams(params))
 	if err != nil {
-		return nil, fmt.Errorf("insert job kind %q: %w", params.Kind, err)
+		return nil, wrapInsertErr(err, fmt.Sprintf("insert job kind %q", params.Kind))
 	}
 	return rowFromDB(job), nil
 }
@@ -54,7 +64,7 @@ func (d *Driver) InsertTx(ctx context.Context, tx any, params driver.InsertParam
 	}
 	job, err := d.queries.WithTx(pgxTx).InsertJob(ctx, insertParams(params))
 	if err != nil {
-		return nil, fmt.Errorf("insert job kind %q in tx: %w", params.Kind, err)
+		return nil, wrapInsertErr(err, fmt.Sprintf("insert job kind %q in tx", params.Kind))
 	}
 	return rowFromDB(job), nil
 }
@@ -174,13 +184,76 @@ func (d *Driver) ListenWakeups(ctx context.Context, wake chan struct{}) error {
 	}
 }
 
+// TryBecomeLeader acquires a dedicated pool connection and takes the
+// periodic-scheduler session lock. The connection stays checked out
+// until ReleaseLeader — returning it while the lock is held would
+// leak session state onto the next checkout.
+func (d *Driver) TryBecomeLeader(ctx context.Context) (bool, error) {
+	d.leaderMu.Lock()
+	defer d.leaderMu.Unlock()
+
+	if d.leaderConn != nil {
+		if err := d.leaderConn.Ping(ctx); err == nil {
+			return true, nil
+		}
+		d.closeLeaderConnLocked()
+	}
+
+	conn, err := d.pool.Acquire(ctx)
+	if err != nil {
+		if ctx.Err() != nil {
+			return false, nil
+		}
+		return false, fmt.Errorf("acquire leader connection: %w", err)
+	}
+
+	var held bool
+	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, AdvisoryLockPeriodic).Scan(&held); err != nil {
+		closeAcquiredConn(conn)
+		if ctx.Err() != nil {
+			return false, nil
+		}
+		return false, fmt.Errorf("try advisory lock: %w", err)
+	}
+	if !held {
+		conn.Release()
+		return false, nil
+	}
+	d.leaderConn = conn
+	return true, nil
+}
+
+// ReleaseLeader drops the scheduler lock by closing the dedicated
+// connection. The session lock dies with the session.
+func (d *Driver) ReleaseLeader() {
+	d.leaderMu.Lock()
+	defer d.leaderMu.Unlock()
+	d.closeLeaderConnLocked()
+}
+
+func (d *Driver) closeLeaderConnLocked() {
+	if d.leaderConn == nil {
+		return
+	}
+	closeAcquiredConn(d.leaderConn)
+	d.leaderConn = nil
+}
+
+func closeAcquiredConn(conn *pgxpool.Conn) {
+	raw := conn.Hijack()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_ = raw.Close(ctx)
+}
+
 const insertBatchDDL = `
 CREATE TEMP TABLE IF NOT EXISTS drover_insert_batch (
 	ord int NOT NULL,
 	kind text NOT NULL,
 	queue text NOT NULL,
 	args jsonb NOT NULL,
-	scheduled_at timestamptz
+	scheduled_at timestamptz,
+	unique_key text
 ) ON COMMIT DROP`
 
 func (d *Driver) insertMany(ctx context.Context, tx pgx.Tx, batch []driver.InsertParams) ([]*driver.JobRow, error) {
@@ -197,11 +270,15 @@ func (d *Driver) insertMany(ctx context.Context, tx pgx.Tx, batch []driver.Inser
 		if !params.ScheduledAt.IsZero() {
 			scheduledAt = params.ScheduledAt
 		}
-		rows[i] = []any{i, params.Kind, params.Queue, params.Args, scheduledAt}
+		var uniqueKey any
+		if params.UniqueKey != "" {
+			uniqueKey = params.UniqueKey
+		}
+		rows[i] = []any{i, params.Kind, params.Queue, params.Args, scheduledAt, uniqueKey}
 	}
 	if _, err := tx.CopyFrom(ctx,
 		pgx.Identifier{"drover_insert_batch"},
-		[]string{"ord", "kind", "queue", "args", "scheduled_at"},
+		[]string{"ord", "kind", "queue", "args", "scheduled_at", "unique_key"},
 		pgx.CopyFromRows(rows),
 	); err != nil {
 		return nil, fmt.Errorf("copy insert-many batch: %w", err)
@@ -209,7 +286,7 @@ func (d *Driver) insertMany(ctx context.Context, tx pgx.Tx, batch []driver.Inser
 
 	jobs, err := d.queries.WithTx(tx).InsertJobsFromStaging(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("insert many jobs from staging: %w", err)
+		return nil, wrapInsertErr(err, "insert many jobs from staging")
 	}
 	out := make([]*driver.JobRow, len(jobs))
 	for i, job := range jobs {
@@ -562,6 +639,23 @@ func attemptArg(attempt int) int32 {
 	}
 }
 
+const (
+	pgUniqueViolation = "23505"
+	uniqueActiveIndex = "drover_jobs_unique_active_idx"
+)
+
+func wrapInsertErr(err error, op string) error {
+	if isUniqueActiveViolation(err) {
+		return fmt.Errorf("%s: %w", op, driver.ErrDuplicateJob)
+	}
+	return fmt.Errorf("%s: %w", op, err)
+}
+
+func isUniqueActiveViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == pgUniqueViolation && pgErr.ConstraintName == uniqueActiveIndex
+}
+
 func insertParams(params driver.InsertParams) dbsqlc.InsertJobParams {
 	out := dbsqlc.InsertJobParams{Kind: params.Kind, Queue: params.Queue, Args: params.Args}
 	// Left null for the zero time so the statement substitutes now() and
@@ -570,10 +664,17 @@ func insertParams(params driver.InsertParams) dbsqlc.InsertJobParams {
 		at := params.ScheduledAt
 		out.ScheduledAt = &at
 	}
+	if params.UniqueKey != "" {
+		out.UniqueKey = pgtype.Text{String: params.UniqueKey, Valid: true}
+	}
 	return out
 }
 
 func rowFromDB(job dbsqlc.DroverJob) *driver.JobRow {
+	uniqueKey := ""
+	if job.UniqueKey.Valid {
+		uniqueKey = job.UniqueKey.String
+	}
 	return &driver.JobRow{
 		ID:          job.ID,
 		Kind:        job.Kind,
@@ -587,5 +688,6 @@ func rowFromDB(job dbsqlc.DroverJob) *driver.JobRow {
 		LeasedUntil: job.LeasedUntil,
 		CreatedAt:   job.CreatedAt,
 		FinalizedAt: job.FinalizedAt,
+		UniqueKey:   uniqueKey,
 	}
 }

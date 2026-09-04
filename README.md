@@ -54,6 +54,12 @@ client, err := drover.NewClient(pool, drover.Config{
     Queues:       map[string]int{"default": 1, "bulk": 9},
     Middleware:   []drover.Middleware{drover.Timeout(30 * time.Second)},
     NotifyWakeup: false, // opt-in LISTEN/NOTIFY; needs session pooling
+    PeriodicJobs: []drover.PeriodicJob{{
+        ID:   "digest",
+        Cron: "@every 1h",
+        Args: SendEmail{To: "digest-subscribers@example.com", Template: "digest"},
+        Opts: &drover.InsertOpts{Queue: "bulk"},
+    }},
 })
 
 // Enqueue atomically with your own writes
@@ -64,6 +70,12 @@ _, err = client.InsertTx(ctx, tx, SendEmail{To: user.Email, Template: "welcome"}
 _, err = client.Insert(ctx, SendEmail{To: user.Email, Template: "reminder"}, &drover.InsertOpts{
     Queue:       "bulk",
     ScheduledAt: time.Now().Add(24 * time.Hour),
+})
+
+// UniqueKey deduplicates among non-terminal jobs on the same queue and
+// kind. Empty means not unique.
+_, err = client.Insert(ctx, SendEmail{To: user.Email, Template: "welcome"}, &drover.InsertOpts{
+    UniqueKey: "user/" + user.ID + "/welcome",
 })
 
 // Flush many jobs in one write. Postgres uses COPY FROM; each item may
@@ -199,7 +211,7 @@ p99=14.144354657s
 
 ## Roadmap
 
-v0.1.0 = cycles A–G of [RFC-0001](docs/rfc/0001-drover-roadmap.md): walking skeleton → retries/DLQ/rescue → worker pools + graceful shutdown → middleware + scheduled jobs → Prometheus observability → CLI + introspection → **benchmarks with published methodology**. Then: periodic jobs via advisory-lock leader election, and an optional server-rendered status page.
+v0.1.0 = cycles A–H of [RFC-0001](docs/rfc/0001-drover-roadmap.md): walking skeleton → retries/DLQ/rescue → worker pools + graceful shutdown → middleware + scheduled jobs → Prometheus observability → CLI + introspection → **benchmarks with published methodology** → **periodic jobs via advisory-lock leader election**. Then: an optional server-rendered status page.
 
 ## Documentation
 
