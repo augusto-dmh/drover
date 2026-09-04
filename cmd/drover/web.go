@@ -53,14 +53,14 @@ type jobView struct {
 }
 
 type pageData struct {
-	Depths          []drover.QueueDepth
-	Oldest          []drover.QueueAge
-	Jobs            []jobView
-	Filters         filterView
-	RefreshSeconds  int
-	RefreshURL      string
-	Flash           string
-	FlashKind       string
+	Depths         []drover.QueueDepth
+	Oldest         []drover.QueueAge
+	Jobs           []jobView
+	Filters        filterView
+	RefreshSeconds int
+	RefreshURL     string
+	Flash          string
+	FlashKind      string
 }
 
 func parseStatusTemplate() *template.Template {
@@ -107,6 +107,7 @@ func (h *statusHandler) getPage(w http.ResponseWriter, r *http.Request) {
 		RefreshSeconds: refreshSeconds(h.refresh),
 		RefreshURL:     refreshURL(filters),
 	}
+	data.Flash, data.FlashKind = flashFromQuery(r.URL.Query())
 	if stats != nil {
 		data.Depths = stats.Depths
 		data.Oldest = stats.Oldest
@@ -177,6 +178,26 @@ func viewForJob(row *drover.JobRow) jobView {
 		CanRetry:  row.State == drover.StateDead,
 		CanCancel: cancellableState(row.State),
 	}
+}
+
+func flashFromQuery(q url.Values) (text, kind string) {
+	id, err := strconv.ParseInt(q.Get("id"), 10, 64)
+	if err != nil || id <= 0 {
+		return "", ""
+	}
+	switch q.Get("notice") {
+	case "retried":
+		return fmt.Sprintf("redrove job %d", id), "notice"
+	case "cancelled":
+		return fmt.Sprintf("cancelled job %d", id), "notice"
+	}
+	switch q.Get("error") {
+	case "not_found":
+		return fmt.Sprintf("job %d not found", id), "error"
+	case "invalid_transition":
+		return fmt.Sprintf("job %d refused the transition", id), "error"
+	}
+	return "", ""
 }
 
 func refreshSeconds(d time.Duration) int {
