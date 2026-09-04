@@ -99,17 +99,19 @@ Durable, cross-cycle. Architecture-level decisions live in `docs/adr/`; entries 
 | E — Observability | `cycle-e-observability` | #9 | 2026-08-08 |
 | F — CLI + introspection | `cycle-f-cli-introspection` | #11 | 2026-08-08 |
 | G — Benchmark + hardening | `cycle-g-benchmark-hardening` | #13 | 2026-08-28 |
+| H — Periodic jobs | `cycle-h-periodic-jobs` | #15 | 2026-09-04 |
+| H — Scheduler failover hardening (from #15 review) | — | #16 | 2026-09-04 |
 
 ## Handoff
 
-- **Feature**: `cycle-h-periodic-jobs`
-- **Phase / Task**: Execute complete; Verifier PASS; publishing
-- **Last shipped**: Cycle G (#13)
-- **Completed this cycle**: unique jobs + periodic scheduler; README/Example; validation.md
-- **Next step**: publish PR; independent review
+- **Feature**: next is Cycle I — optional status page (`drover web`, server-rendered `html/template`, retry/cancel, no SPA)
+- **Phase / Task**: not started
+- **Last shipped**: Cycle H (#15, review follow-up #16)
+- **Completed last cycle**: unique jobs; cron + advisory-lock periodic scheduler; leadership watermark so failover does not replay completed ticks; nanosecond unique keys
+- **Next step**: run the ship cycle for Cycle I
 - **Blockers**: none
-- **Branch**: `feat/unique-jobs-periodic-scheduler`
-- **What review should look at**: unique index predicate; advisory lock not on pool connections; scheduler stop vs next-fire
+- **Branch**: `main`
+- **What review should look at**: n/a (I not started)
 - **Known weak sensors** (carried forward): neither database-clock property — lease deadlines, nor a delayed job's dueness — can be falsified while the test container and the client share a host clock
 - **Follow-up work carried forward** (recorded, not scheduled): terminal-state retention/pruning; list-query index-friendly variants; `testing/synctest` where viable; constructor panic-vs-error consistency before 1.0; deferred observability niceties from cycle E; batch completer; `go test -bench` CI job; UniqueOpts.ByArgs/Period; RunOnStart; CLI `--unique-key`
 - **Next after this cycle**: Cycle I — optional status page (`drover web`, server-rendered)
