@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"embed"
+	"errors"
 	"fmt"
 	"html/template"
 	"net/http"
@@ -75,7 +77,63 @@ func newStatusHandler(in inspector, refresh time.Duration) http.Handler {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", h.getPage)
+	mux.HandleFunc("POST /jobs/{id}/retry", h.postRetry)
+	mux.HandleFunc("POST /jobs/{id}/cancel", h.postCancel)
 	return mux
+}
+
+func (h *statusHandler) postRetry(w http.ResponseWriter, r *http.Request) {
+	h.postMutation(w, r, "retried", h.inspector.RetryJob)
+}
+
+func (h *statusHandler) postCancel(w http.ResponseWriter, r *http.Request) {
+	h.postMutation(w, r, "cancelled", h.inspector.CancelJob)
+}
+
+func (h *statusHandler) postMutation(
+	w http.ResponseWriter,
+	r *http.Request,
+	notice string,
+	mutate func(context.Context, int64) (*drover.JobRow, error),
+) {
+	id, err := parseJobID(r.PathValue("id"))
+	if err != nil {
+		h.writeHTML(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		h.writeHTML(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	_, err = mutate(r.Context(), id)
+	if err != nil && !errors.Is(err, drover.ErrNotFound) && !errors.Is(err, drover.ErrInvalidTransition) {
+		h.writeHTML(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	http.Redirect(w, r, mutationRedirect(r.Form, notice, err, id), http.StatusSeeOther)
+}
+
+func mutationRedirect(form url.Values, notice string, mutErr error, id int64) string {
+	v := url.Values{}
+	if q := form.Get("queue"); q != "" {
+		v.Set("queue", q)
+	}
+	if s := form.Get("state"); s != "" {
+		v.Set("state", s)
+	}
+	if lim := form.Get("limit"); lim != "" {
+		v.Set("limit", lim)
+	}
+	v.Set("id", strconv.FormatInt(id, 10))
+	switch {
+	case mutErr == nil:
+		v.Set("notice", notice)
+	case errors.Is(mutErr, drover.ErrNotFound):
+		v.Set("error", "not_found")
+	case errors.Is(mutErr, drover.ErrInvalidTransition):
+		v.Set("error", "invalid_transition")
+	}
+	return "/?" + v.Encode()
 }
 
 func (h *statusHandler) getPage(w http.ResponseWriter, r *http.Request) {

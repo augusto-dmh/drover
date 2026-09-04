@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"testing"
@@ -285,4 +286,112 @@ func TestGETStatusPageFlash(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPOSTRetrySuccess(t *testing.T) {
+	t.Parallel()
+	fake := &fakeInspector{
+		stats:    &drover.QueueStats{},
+		retryJob: &drover.JobRow{ID: 9, State: drover.StateAvailable},
+	}
+	rec := postStatus(newStatusHandler(fake, 0), "/jobs/9/retry", "queue=mail&state=dead&limit=50")
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("status %d body=%s", rec.Code, rec.Body.String())
+	}
+	if fake.retryID != 9 {
+		t.Fatalf("retry id=%d", fake.retryID)
+	}
+	got := locationQuery(t, rec)
+	if got.Get("notice") != "retried" || got.Get("id") != "9" || got.Get("queue") != "mail" || got.Get("state") != "dead" || got.Get("limit") != "50" {
+		t.Fatalf("Location query %v", got)
+	}
+}
+
+func TestPOSTCancelSuccess(t *testing.T) {
+	t.Parallel()
+	fake := &fakeInspector{
+		stats:     &drover.QueueStats{},
+		cancelJob: &drover.JobRow{ID: 4, State: drover.StateCancelled},
+	}
+	rec := postStatus(newStatusHandler(fake, 0), "/jobs/4/cancel", "state=all")
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("status %d", rec.Code)
+	}
+	if fake.cancelID != 4 {
+		t.Fatalf("cancel id=%d", fake.cancelID)
+	}
+	got := locationQuery(t, rec)
+	if got.Get("notice") != "cancelled" || got.Get("id") != "4" || got.Get("state") != "all" {
+		t.Fatalf("Location query %v", got)
+	}
+}
+
+func TestPOSTRetryNotFoundFlash(t *testing.T) {
+	t.Parallel()
+	fake := &fakeInspector{retryErr: drover.ErrNotFound}
+	rec := postStatus(newStatusHandler(fake, 0), "/jobs/99/retry", "")
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("status %d", rec.Code)
+	}
+	got := locationQuery(t, rec)
+	if got.Get("error") != "not_found" || got.Get("id") != "99" || got.Get("notice") != "" {
+		t.Fatalf("Location query %v", got)
+	}
+}
+
+func TestPOSTCancelInvalidTransitionFlash(t *testing.T) {
+	t.Parallel()
+	fake := &fakeInspector{cancelErr: drover.ErrInvalidTransition}
+	rec := postStatus(newStatusHandler(fake, 0), "/jobs/5/cancel", "")
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("status %d", rec.Code)
+	}
+	got := locationQuery(t, rec)
+	if got.Get("error") != "invalid_transition" || got.Get("id") != "5" {
+		t.Fatalf("Location query %v", got)
+	}
+}
+
+func TestPOSTRetryUnexpectedError500(t *testing.T) {
+	t.Parallel()
+	fake := &fakeInspector{retryErr: errors.New("db down")}
+	rec := postStatus(newStatusHandler(fake, 0), "/jobs/1/retry", "")
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status %d", rec.Code)
+	}
+}
+
+func TestGETPageRetryFormPostsHiddenFilters(t *testing.T) {
+	t.Parallel()
+	fake := &fakeInspector{
+		stats: &drover.QueueStats{},
+		jobs: []*drover.JobRow{
+			{ID: 9, Kind: "email", Queue: "mail", State: drover.StateDead, Args: json.RawMessage(`{}`)},
+		},
+	}
+	rec := httptest.NewRecorder()
+	newStatusHandler(fake, 0).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/?queue=mail&state=dead&limit=25", nil))
+	body := rec.Body.String()
+	if !strings.Contains(body, `name="queue" value="mail"`) || !strings.Contains(body, `name="limit" value="25"`) {
+		t.Fatalf("hidden filters missing: %s", body)
+	}
+}
+
+func postStatus(h http.Handler, path, body string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", "http://"+req.Host)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+func locationQuery(t *testing.T, rec *httptest.ResponseRecorder) url.Values {
+	t.Helper()
+	loc := rec.Header().Get("Location")
+	u, err := url.Parse(loc)
+	if err != nil {
+		t.Fatalf("Location %q: %v", loc, err)
+	}
+	return u.Query()
 }
