@@ -112,13 +112,13 @@ Durable, cross-cycle. Architecture-level decisions live in `docs/adr/`; entries 
 ## Handoff
 
 - **Feature**: Cycle I — `cycle-i-status-page` (`drover web`)
-- **Phase / Task**: Execute starting at T1
+- **Phase / Task**: Verifier PASS; publishing PR
 - **Last shipped**: Cycle H (#15, review follow-up #16)
 - **Completed last cycle**: unique jobs; cron + advisory-lock periodic scheduler; leadership watermark so failover does not replay completed ticks; nanosecond unique keys
-- **Next step**: implement T1 (GET `/` status page)
+- **Next step**: publish the status-page PR
 - **Blockers**: none
-- **Branch**: `feat/status-page` (to be created)
-- **What review should look at**: CSRF Origin/Referer; default-dead vs `state=all`; no JS; Inspector-only mutations
+- **Branch**: `feat/status-page`
+- **What review should look at**: CSRF Origin/Referer; default-dead vs `state=all`; no JS; Inspector-only mutations; loopback default
 - **Known weak sensors** (carried forward): neither database-clock property — lease deadlines, nor a delayed job's dueness — can be falsified while the test container and the client share a host clock
 - **Follow-up work carried forward** (recorded, not scheduled): terminal-state retention/pruning; list-query index-friendly variants; `testing/synctest` where viable; constructor panic-vs-error consistency before 1.0; deferred observability niceties from cycle E; batch completer; `go test -bench` CI job; UniqueOpts.ByArgs/Period; RunOnStart; CLI `--unique-key`
 - **Next after this cycle**: (none on the RFC table — I is the last cycle)

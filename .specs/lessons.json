@@ -3,7 +3,7 @@
   "promote_threshold": 2,
   "window_days": 45,
   "quarantine_threshold": 2,
-  "next_id": 18,
+  "next_id": 19,
   "lessons": [
     {
       "id": "L-001",
@@ -310,6 +310,24 @@
       ],
       "created": "2026-08-16T02:34:40Z",
       "last_seen": "2026-08-16T02:34:40Z"
+    },
+    {
+      "id": "L-018",
+      "key": "ac_gap::assert operator html filter controls by method and field names on the document not only that the handler parses equivalent query parameters",
+      "text": "Assert operator HTML filter controls by method and field names on the document, not only that the handler parses equivalent query parameters",
+      "signal": "ac_gap",
+      "scope": "cmd/drover",
+      "status": "candidate",
+      "features": [
+        "cycle-i-status-page"
+      ],
+      "recurrence": 1,
+      "harmful": 0,
+      "evidence": [
+        "P2 AC1 spec.md GET form queue/state/limit; no file:line in validation.md (cmd/drover)"
+      ],
+      "created": "2026-09-04T21:10:38Z",
+      "last_seen": "2026-09-04T21:10:38Z"
     }
   ]
 }

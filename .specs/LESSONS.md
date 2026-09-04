@@ -116,6 +116,12 @@ Seen once or not yet corroborated. Tracked, not trusted.
 - evidence: edge: InsertMany fails after validation (COPY or INSERT error) (insert)
 - last seen: 2026-08-16T02:34:40Z
 
+### L-018 — Assert operator HTML filter controls by method and field names on the document, not only that the handler parses equivalent query parameters
+- signal: `ac_gap` · recurrence: 1 feature(s) · scope: `cmd/drover` · harmful: 0
+- features: cycle-i-status-page
+- evidence: P2 AC1 spec.md GET form queue/state/limit; no file:line in validation.md (cmd/drover)
+- last seen: 2026-09-04T21:10:38Z
+
 ## Quarantined (failed when applied — ignore)
 
 A confirmed lesson that recurred alongside failure. Kept for the maintainer to review.

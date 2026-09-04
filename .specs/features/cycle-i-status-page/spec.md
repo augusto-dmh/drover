@@ -243,18 +243,18 @@ the command.
 
 | Requirement ID | Story | Phase | Status |
 | --- | --- | --- | --- |
-| WEB-01 | P1: Serve page (bind + URL) | T5 | In Tasks |
-| WEB-02 | P1: Serve page (GET HTML + Stats) | T1 | In Tasks |
-| WEB-03 | P1: Serve page (default dead list + filters) | T1, T2 | In Tasks |
-| WEB-04 | P1: Serve page (meta refresh) | T2 | In Tasks |
-| WEB-05 | P1: Serve page (Stats/List 500) | T1 | In Tasks |
-| WEB-06 | P1: Retry/cancel buttons by state | T1 | In Tasks |
-| WEB-07 | P1: POST retry/cancel PRG | T3 | In Tasks |
-| WEB-08 | P1: Flash codes + refresh strips flash | T2, T3 | In Tasks |
-| WEB-09 | P1: Flags, --json, bind fail, shutdown | T5 | In Tasks |
-| WEB-10 | P2: Filter form + state=all + 400s | T2 | In Tasks |
-| WEB-11 | Edge: HTML escape Args/Errors | T1 | In Tasks |
-| WEB-12 | Edge: CSRF 403, bad id 400, GET 405, 404 | T4 | In Tasks |
+| WEB-01 | P1: Serve page (bind + URL) | T5 | Verified |
+| WEB-02 | P1: Serve page (GET HTML + Stats) | T1 | Verified |
+| WEB-03 | P1: Serve page (default dead list + filters) | T1, T2 | Verified |
+| WEB-04 | P1: Serve page (meta refresh) | T2 | Verified |
+| WEB-05 | P1: Serve page (Stats/List 500) | T1 | Verified |
+| WEB-06 | P1: Retry/cancel buttons by state | T1 | Verified |
+| WEB-07 | P1: POST retry/cancel PRG | T3 | Verified |
+| WEB-08 | P1: Flash codes + refresh strips flash | T2, T3 | Verified |
+| WEB-09 | P1: Flags, --json, bind fail, shutdown | T5 | Verified |
+| WEB-10 | P2: Filter form + state=all + 400s | T2 | Verified |
+| WEB-11 | Edge: HTML escape Args/Errors | T1 | Verified |
+| WEB-12 | Edge: CSRF 403, bad id 400, GET 405, 404 | T4 | Verified |
 
 **Coverage:** 12 total, 12 mapped to tasks, 0 unmapped.
 
