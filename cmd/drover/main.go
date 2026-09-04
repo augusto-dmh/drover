@@ -5,7 +5,9 @@ import (
 	"context"
 	"io"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 )
 
 // version is set at link time by GoReleaser (-X main.version=…).
@@ -71,6 +73,16 @@ func run(args []string, stdout, stderr io.Writer, getenv func(string) string, op
 		return withInspector(ctx, cfg, getenv, open, stderr, func(in inspector) int {
 			return runEnqueue(ctx, in, rest[1:], cfg.json, stdout, stderr)
 		})
+	case "web":
+		if cfg.json {
+			cliPrintf(stderr, "drover: --json is not valid with web\n")
+			return 2
+		}
+		webCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		return withInspector(webCtx, cfg, getenv, open, stderr, func(in inspector) int {
+			return runWeb(webCtx, in, rest[1:], stdout, stderr)
+		})
 	default:
 		cliPrintf(stderr, "drover: unknown command %q\n\n", rest[0])
 		printUsage(stderr)
@@ -119,6 +131,7 @@ Commands:
   retry <id>         Redrive a dead job to available
   cancel <id>        Cancel a waiting or dead job
   enqueue            Insert a job (--kind required; --queue, --args optional)
+  web                Serve a server-rendered status page (retry/cancel)
   version            Print the drover version
 
 Global flags:
