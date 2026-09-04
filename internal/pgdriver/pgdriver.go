@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"slices"
 	"sync"
@@ -243,7 +244,9 @@ func closeAcquiredConn(conn *pgxpool.Conn) {
 	raw := conn.Hijack()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	_ = raw.Close(ctx)
+	if err := raw.Close(ctx); err != nil {
+		slog.Error("drover: close periodic scheduler lock connection", "error", err)
+	}
 }
 
 const insertBatchDDL = `
