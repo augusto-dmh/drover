@@ -6,7 +6,7 @@ import (
 )
 
 func periodicUniqueKey(id string, fire time.Time) string {
-	return id + "/" + fire.UTC().Format(time.RFC3339)
+	return id + "/" + fire.UTC().Format(time.RFC3339Nano)
 }
 
 // schedulePeriodic enqueues due periodic ticks while this client is
@@ -18,7 +18,6 @@ func (r *runner) schedulePeriodic() {
 		defer locker.ReleaseLeader()
 	}
 
-	startedAt := time.Now()
 	lastFire := make([]time.Time, len(r.client.periodic))
 	wasLeader := false
 
@@ -61,28 +60,40 @@ func (r *runner) schedulePeriodic() {
 		if !wasLeader {
 			r.client.logger.Info("drover: became periodic scheduler leader")
 			wasLeader = true
+			// First fire is strictly after this process gained the lock,
+			// not after it started. Replaying from Start would re-insert
+			// ticks a previous leader already ran to completion — unique
+			// keys only occupy non-terminal rows.
+			now := time.Now()
+			for i := range lastFire {
+				lastFire[i] = now
+			}
 		}
 
 		now := time.Now()
-		wait := r.enqueueDuePeriodic(now, startedAt, lastFire)
+		wait := r.enqueueDuePeriodic(now, lastFire)
 		if !r.waitFetch(wait) {
 			return
 		}
 	}
 }
 
-func (r *runner) enqueueDuePeriodic(now, startedAt time.Time, lastFire []time.Time) time.Duration {
+func (r *runner) enqueueDuePeriodic(now time.Time, lastFire []time.Time) time.Duration {
 	var soonest time.Time
 	for i, entry := range r.client.periodic {
-		from := startedAt
-		if !lastFire[i].IsZero() {
-			from = lastFire[i]
-		}
-		fire := entry.schedule.Next(from)
-		for !fire.After(now) {
-			r.insertPeriodicTick(entry, fire)
+		fire := entry.schedule.Next(lastFire[i])
+		for !fire.IsZero() && !fire.After(now) {
+			if r.fetchCtx.Err() != nil {
+				return 0
+			}
+			if !r.insertPeriodicTick(entry, fire) {
+				break
+			}
 			lastFire[i] = fire
 			fire = entry.schedule.Next(fire)
+		}
+		if fire.IsZero() {
+			continue
 		}
 		if soonest.IsZero() || fire.Before(soonest) {
 			soonest = fire
@@ -94,7 +105,10 @@ func (r *runner) enqueueDuePeriodic(now, startedAt time.Time, lastFire []time.Ti
 	return soonest.Sub(now)
 }
 
-func (r *runner) insertPeriodicTick(entry periodicEntry, fire time.Time) {
+// insertPeriodicTick reports whether the watermark should advance:
+// a successful insert or a duplicate (already enqueued). A store error
+// leaves the fire for the next turn.
+func (r *runner) insertPeriodicTick(entry periodicEntry, fire time.Time) bool {
 	opts := InsertOpts{}
 	if entry.job.Opts != nil {
 		opts = *entry.job.Opts
@@ -103,16 +117,20 @@ func (r *runner) insertPeriodicTick(entry periodicEntry, fire time.Time) {
 	opts.UniqueKey = periodicUniqueKey(entry.job.ID, fire)
 
 	_, err := r.client.Insert(r.fetchCtx, entry.job.Args, &opts)
-	if err == nil || r.fetchCtx.Err() != nil {
-		return
+	if err == nil {
+		return true
+	}
+	if r.fetchCtx.Err() != nil {
+		return false
 	}
 	if errors.Is(err, ErrDuplicateJob) {
 		r.client.logger.Debug("drover: skipped duplicate periodic tick",
 			"periodic_id", entry.job.ID, "fire_time", fire)
-		return
+		return true
 	}
 	r.client.logger.Error("drover: enqueue periodic job",
 		"periodic_id", entry.job.ID, "error", err)
+	return false
 }
 
 func (r *runner) waitFetch(d time.Duration) bool {

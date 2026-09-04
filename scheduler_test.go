@@ -3,6 +3,7 @@ package drover
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -37,6 +38,17 @@ func (failingLocker) TryBecomeLeader(context.Context) (bool, error) {
 }
 
 func (failingLocker) ReleaseLeader() {}
+
+type delayedLocker struct {
+	driver.Driver
+	ready time.Time
+}
+
+func (l *delayedLocker) TryBecomeLeader(context.Context) (bool, error) {
+	return !time.Now().Before(l.ready), nil
+}
+
+func (l *delayedLocker) ReleaseLeader() {}
 
 func quietPeriodicConfig(jobs []PeriodicJob) Config {
 	return Config{
@@ -88,6 +100,10 @@ func TestPeriodicLeaderEnqueuesOneJobPerTick(t *testing.T) {
 			Opts: &InsertOpts{UniqueKey: "caller-must-not-win", Queue: "periodic"},
 		}}))
 
+		sched, err := cron.Parse("@every 1s")
+		if err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
 		started := time.Now()
 		if err := c.Start(context.Background()); err != nil {
 			t.Fatalf("Start: %v", err)
@@ -100,11 +116,15 @@ func TestPeriodicLeaderEnqueuesOneJobPerTick(t *testing.T) {
 		if len(rows) != 1 {
 			t.Fatalf("after 1s: %d jobs, want 1", len(rows))
 		}
+		wantFire := sched.Next(started)
 		fire := rows[0].ScheduledAt
+		if !fire.Equal(wantFire) {
+			t.Errorf("ScheduledAt = %v, want %v (Next independently of the stored row)", fire, wantFire)
+		}
 		if !fire.After(started) {
 			t.Errorf("first fire %v is not strictly after Start %v", fire, started)
 		}
-		wantKey := periodicUniqueKey("tick", fire)
+		wantKey := periodicUniqueKey("tick", wantFire)
 		if rows[0].UniqueKey != wantKey {
 			t.Errorf("UniqueKey = %q, want %q", rows[0].UniqueKey, wantKey)
 		}
@@ -132,6 +152,80 @@ func TestPeriodicLeaderEnqueuesOneJobPerTick(t *testing.T) {
 	})
 }
 
+func TestPeriodicLeaderEnqueuesEachRegisteredJob(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	synctest.Test(t, func(t *testing.T) {
+		mem := memdriver.New()
+		c := newClient(mem, quietPeriodicConfig([]PeriodicJob{
+			{ID: "fast", Cron: "@every 1s", Args: pingArgs{}},
+			{ID: "slow", Cron: "@every 2s", Args: pingArgs{}},
+		}))
+		if err := c.Start(context.Background()); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+
+		time.Sleep(2 * time.Second)
+		synctest.Wait()
+
+		rows := listMemJobs(t, mem)
+		fast, slow := 0, 0
+		for _, row := range rows {
+			switch {
+			case strings.HasPrefix(row.UniqueKey, "fast/"):
+				fast++
+			case strings.HasPrefix(row.UniqueKey, "slow/"):
+				slow++
+			default:
+				t.Errorf("unexpected UniqueKey %q", row.UniqueKey)
+			}
+		}
+		if fast != 2 || slow != 1 {
+			t.Fatalf("fast=%d slow=%d (%d jobs), want 2 and 1", fast, slow, len(rows))
+		}
+
+		if err := c.Stop(context.Background()); err != nil {
+			t.Fatalf("Stop: %v", err)
+		}
+	})
+}
+
+func TestPeriodicLeadershipDoesNotReplayTicksFromBeforeTheLock(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	synctest.Test(t, func(t *testing.T) {
+		mem := memdriver.New()
+		cfg := quietPeriodicConfig([]PeriodicJob{{
+			ID:   "tick",
+			Cron: "@every 1s",
+			Args: pingArgs{},
+		}})
+		cfg.PollInterval = 100 * time.Millisecond
+		locker := &delayedLocker{Driver: mem, ready: time.Now().Add(3 * time.Second)}
+		c := newClient(locker, cfg)
+
+		if err := c.Start(context.Background()); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+
+		time.Sleep(3 * time.Second)
+		synctest.Wait()
+		if n := countMemJobs(t, mem); n != 0 {
+			t.Fatalf("jobs while waiting for the lock = %d, want 0", n)
+		}
+
+		time.Sleep(time.Second)
+		synctest.Wait()
+		if n := countMemJobs(t, mem); n != 1 {
+			t.Fatalf("jobs after one period of leadership = %d, want 1 (not a replay from process start)", n)
+		}
+
+		if err := c.Stop(context.Background()); err != nil {
+			t.Fatalf("Stop: %v", err)
+		}
+	})
+}
+
 func TestPeriodicDuplicateTickIsNotAHandlerFailure(t *testing.T) {
 	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 
@@ -151,7 +245,7 @@ func TestPeriodicDuplicateTickIsNotAHandlerFailure(t *testing.T) {
 			Cron: "@every 1s",
 			Args: pingArgs{},
 		}})
-		cfg.Logger = newTestLogger(logs)
+		cfg.Logger = slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 		c := newClient(mem, cfg)
 
 		if _, err := c.Insert(context.Background(), pingArgs{}, &InsertOpts{
@@ -171,6 +265,12 @@ func TestPeriodicDuplicateTickIsNotAHandlerFailure(t *testing.T) {
 			t.Fatalf("jobs = %d, want 1 (duplicate tick must not insert)", n)
 		}
 		out := logs.String()
+		if !strings.Contains(out, "skipped duplicate periodic tick") {
+			t.Errorf("duplicate tick did not log a skip:\n%s", out)
+		}
+		if strings.Contains(out, "enqueue periodic job") {
+			t.Errorf("duplicate tick logged as an enqueue error:\n%s", out)
+		}
 		if strings.Contains(out, "job failed") || strings.Contains(out, "job execution failed") {
 			t.Errorf("duplicate tick logged as a handler failure:\n%s", out)
 		}
@@ -222,5 +322,27 @@ func TestPeriodicStopDoesNotWaitForNextFire(t *testing.T) {
 	const max = 2 * time.Second
 	if elapsed >= max {
 		t.Fatalf("Stop took %v, want well under the next-fire wait (<%v)", elapsed, max)
+	}
+}
+
+func TestPeriodicUnsatisfiableScheduleDoesNotHangStop(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	c := newClient(memdriver.New(), quietPeriodicConfig([]PeriodicJob{{
+		ID:   "never",
+		Cron: "0 0 31 2 *",
+		Args: pingArgs{},
+	}}))
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	begin := time.Now()
+	if err := c.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	elapsed := time.Since(begin)
+	const max = 2 * time.Second
+	if elapsed >= max {
+		t.Fatalf("Stop took %v, want well under %v for a schedule with no next fire", elapsed, max)
 	}
 }

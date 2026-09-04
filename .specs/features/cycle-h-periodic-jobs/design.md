@@ -18,7 +18,7 @@ cron, and so a lock split-brain cannot create duplicate ticks:
 2. **Leader-elected scheduler** — clients with a non-empty
    `Config.PeriodicJobs` compete for a session advisory lock on a
    dedicated connection. The holder computes the next fire in-process
-   and `Insert`s with `UniqueKey = id + "/" + fireRFC3339UTC`. Duplicate
+   and `Insert`s with `UniqueKey = id + "/" + fireRFC3339NanoUTC`. Duplicate
    is tick success.
 
 ```mermaid
@@ -209,8 +209,10 @@ Loop (sketch of behaviour, not the required structure):
 - On `fetchCtx` done: `ReleaseLeader()`, return. Sleep must not wait
   out the timer (select on ctx).
 
-First fire strictly after Start: `Next(time.Now())` at loop entry, never
-`Insert` for a fire `<= startedAt`.
+First fire strictly after leadership: on becoming leader, watermark
+each job at `time.Now()` and take `Next` of that, never `Insert` for a
+fire from before the lock was held. Late ticks while still leader still
+catch up. `Next` returning zero is treated as no next fire.
 
 Logging: INFO on becoming / losing leader; ERROR on lock acquire
 failure; DEBUG or INFO on skip-duplicate.

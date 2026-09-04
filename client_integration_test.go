@@ -515,11 +515,17 @@ func TestPeriodicTwoClientsElectOneLeaderAndFailover(t *testing.T) {
 	if holders := advisoryLockHolders(t, pool); holders != 1 {
 		t.Fatalf("lock holders with two clients = %d, want 1", holders)
 	}
+	if n := countDroverJobs(t, pool); n != 1 {
+		t.Fatalf("jobs while both clients run = %d, want 1", n)
+	}
 
 	if err := leader.Stop(ctx); err != nil {
 		t.Fatalf("leader Stop: %v", err)
 	}
 	waitForJobCount(t, pool, 2)
+	if n := countDroverJobs(t, pool); n != 2 {
+		t.Fatalf("after failover: %d jobs, want 2", n)
+	}
 	if holders := advisoryLockHolders(t, pool); holders != 1 {
 		t.Fatalf("lock holders after failover = %d, want 1", holders)
 	}

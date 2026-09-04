@@ -54,8 +54,8 @@ Every ambiguity is resolved or recorded here — nothing is left silently unclea
 | ASM-05 — Registration | `Config.PeriodicJobs []PeriodicJob` at construction; duplicate or empty IDs panic; invalid cron panics | AD-037 structural errors panic; every potential leader must carry the same list | y |
 | ASM-06 — Leader lock | Session `pg_try_advisory_lock` on a dedicated connection; documented int64 key; only clients with a non-empty `PeriodicJobs` participate | Session lock dies with the connection (crash path); LISTEN already taught us not to take session state from the pool | y |
 | ASM-07 — memdriver leadership | Always leader when `PeriodicJobs` is non-empty | Unit suite stays Docker-free | y |
-| ASM-08 — Periodic unique key | `id + "/" + fireTime.UTC().Format(time.RFC3339)` | Belt-and-suspenders with the lock; fire time is the period bucket | y |
-| ASM-09 — First tick | Strictly after Start; no `RunOnStart` | Smaller surface; failover does not stampede | y |
+| ASM-08 — Periodic unique key | `id + "/" + fireTime.UTC().Format(time.RFC3339Nano)` | Belt-and-suspenders with the lock; fire time is the period bucket. Seconds-only RFC3339 collapsed sub-second `@every` ticks | y |
+| ASM-09 — First tick | Strictly after this client becomes leader (Start, for the first leader); no `RunOnStart`; ticks missed while not leader are skipped | Smaller surface; failover does not stampede completed ticks | y |
 | ASM-10 — Next-run clock | Leader uses `time.Now()` in the job's location; `Insert` still uses the database clock for available vs scheduled (AD-035) | Cron next-time in SQL is unexplainable; skew is bounded by poll | y |
 | ASM-11 — `@every` alignment | Next instant after `t` aligned to Unix-epoch multiples of the duration (`Truncate` then add) | Failover-stable buckets; unique key still collapses doubles | y |
 | ASM-12 — Lock/connect failure | Log and retry; `Start` still succeeds; workers keep processing | Contrast AD-043: a worker that cannot elect is still a correct worker | y |
@@ -150,7 +150,7 @@ schedule.
    the system SHALL insert a job for a schedule whose next fire has
    arrived, with `ScheduledAt` equal to that fire time, `Args`/`Queue`
    from the `PeriodicJob`, and `UniqueKey` equal to
-   `id + "/" + fireTime.UTC().Format(time.RFC3339)`.
+   `id + "/" + fireTime.UTC().Format(time.RFC3339Nano)`.
 3. WHEN a second client is configured with the same `PeriodicJobs` THEN
    at most one of the two SHALL hold the lock at a time, and a tick
    SHALL produce one row even if both attempt to enqueue (unique key).
@@ -159,8 +159,9 @@ schedule.
 5. WHEN `Insert` for a tick returns `ErrDuplicateJob` THEN the scheduler
    SHALL treat that tick as done (not a failure) and SHALL NOT retry it
    as a handler failure.
-6. WHEN `Start` is called THEN the first enqueue for each job SHALL be
-   the first fire strictly after Start, not an immediate run.
+6. WHEN a client becomes leader THEN the first enqueue for each job SHALL be
+   the first fire strictly after leadership, not an immediate run and not a
+   replay of ticks from before the lock was held.
 7. WHEN a `PeriodicJob` has an empty `ID`, a duplicate `ID` in the
    slice, empty `Args`, or an unparseable `Cron` THEN constructing the
    client SHALL panic.
