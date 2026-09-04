@@ -108,17 +108,18 @@ Durable, cross-cycle. Architecture-level decisions live in `docs/adr/`; entries 
 | G — Benchmark + hardening | `cycle-g-benchmark-hardening` | #13 | 2026-08-28 |
 | H — Periodic jobs | `cycle-h-periodic-jobs` | #15 | 2026-09-04 |
 | H — Scheduler failover hardening (from #15 review) | — | #16 | 2026-09-04 |
+| I — Status page | `cycle-i-status-page` | #18 | 2026-09-04 |
 
 ## Handoff
 
-- **Feature**: Cycle I — `cycle-i-status-page` (`drover web`)
-- **Phase / Task**: Verifier PASS; publishing PR
-- **Last shipped**: Cycle H (#15, review follow-up #16)
-- **Completed last cycle**: unique jobs; cron + advisory-lock periodic scheduler; leadership watermark so failover does not replay completed ticks; nanosecond unique keys
-- **Next step**: publish the status-page PR
+- **Feature**: RFC-0001 roadmap table is complete (A–I)
+- **Phase / Task**: none
+- **Last shipped**: Status page (`drover web`) #18
+- **Completed last cycle**: `drover web` — one server-rendered auto-refreshing page; retry/cancel; loopback default; Origin/Referer CSRF
+- **Next step**: no further RFC cycle; pick from follow-up work if continuing
 - **Blockers**: none
-- **Branch**: `feat/status-page`
-- **What review should look at**: CSRF Origin/Referer; default-dead vs `state=all`; no JS; Inspector-only mutations; loopback default
+- **Branch**: `main`
+- **What review should look at**: n/a
 - **Known weak sensors** (carried forward): neither database-clock property — lease deadlines, nor a delayed job's dueness — can be falsified while the test container and the client share a host clock
 - **Follow-up work carried forward** (recorded, not scheduled): terminal-state retention/pruning; list-query index-friendly variants; `testing/synctest` where viable; constructor panic-vs-error consistency before 1.0; deferred observability niceties from cycle E; batch completer; `go test -bench` CI job; UniqueOpts.ByArgs/Period; RunOnStart; CLI `--unique-key`
-- **Next after this cycle**: (none on the RFC table — I is the last cycle)
+- **Next after this cycle**: none — RFC-0001 ends at the status page
