@@ -395,3 +395,95 @@ func locationQuery(t *testing.T, rec *httptest.ResponseRecorder) url.Values {
 	}
 	return u.Query()
 }
+
+func TestPOSTCSRFRequiresSameOrigin(t *testing.T) {
+	t.Parallel()
+
+	t.Run("no origin or referer", func(t *testing.T) {
+		t.Parallel()
+		fake := &fakeInspector{retryJob: &drover.JobRow{ID: 1}}
+		req := httptest.NewRequest(http.MethodPost, "/jobs/1/retry", nil)
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rec := httptest.NewRecorder()
+		newStatusHandler(fake, 0).ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("status %d", rec.Code)
+		}
+		if fake.retryID != 0 {
+			t.Fatalf("Inspector called, id=%d", fake.retryID)
+		}
+	})
+
+	t.Run("origin host mismatch", func(t *testing.T) {
+		t.Parallel()
+		fake := &fakeInspector{retryJob: &drover.JobRow{ID: 1}}
+		req := httptest.NewRequest(http.MethodPost, "/jobs/1/retry", nil)
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("Origin", "http://evil.test")
+		rec := httptest.NewRecorder()
+		newStatusHandler(fake, 0).ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("status %d", rec.Code)
+		}
+		if fake.retryID != 0 {
+			t.Fatalf("Inspector called, id=%d", fake.retryID)
+		}
+	})
+
+	t.Run("matching referer only", func(t *testing.T) {
+		t.Parallel()
+		fake := &fakeInspector{retryJob: &drover.JobRow{ID: 7, State: drover.StateAvailable}}
+		req := httptest.NewRequest(http.MethodPost, "/jobs/7/retry", nil)
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("Referer", "http://"+req.Host+"/")
+		rec := httptest.NewRecorder()
+		newStatusHandler(fake, 0).ServeHTTP(rec, req)
+		if rec.Code != http.StatusSeeOther {
+			t.Fatalf("status %d body=%s", rec.Code, rec.Body.String())
+		}
+		if fake.retryID != 7 {
+			t.Fatalf("retry id=%d", fake.retryID)
+		}
+	})
+}
+
+func TestPOSTInvalidJobID400(t *testing.T) {
+	t.Parallel()
+	for _, path := range []string{"/jobs/0/retry", "/jobs/foo/retry", "/jobs/-1/cancel"} {
+		t.Run(path, func(t *testing.T) {
+			t.Parallel()
+			fake := &fakeInspector{retryJob: &drover.JobRow{ID: 1}, cancelJob: &drover.JobRow{ID: 1}}
+			rec := postStatus(newStatusHandler(fake, 0), path, "")
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status %d", rec.Code)
+			}
+			if fake.retryID != 0 || fake.cancelID != 0 {
+				t.Fatalf("Inspector called retry=%d cancel=%d", fake.retryID, fake.cancelID)
+			}
+		})
+	}
+}
+
+func TestGETMutationMethodNotAllowed(t *testing.T) {
+	t.Parallel()
+	h := newStatusHandler(&fakeInspector{}, 0)
+	for _, path := range []string{"/jobs/1/retry", "/jobs/1/cancel"} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("%s status %d want 405", path, rec.Code)
+		}
+	}
+}
+
+func TestUnknownPath404(t *testing.T) {
+	t.Parallel()
+	rec := httptest.NewRecorder()
+	newStatusHandler(&fakeInspector{}, 0).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/nope", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status %d", rec.Code)
+	}
+	if rec.Header().Get("Content-Type") != htmlContentType {
+		t.Fatalf("Content-Type %q", rec.Header().Get("Content-Type"))
+	}
+}

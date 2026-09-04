@@ -76,10 +76,22 @@ func newStatusHandler(in inspector, refresh time.Duration) http.Handler {
 		tmpl:      parseStatusTemplate(),
 	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /", h.getPage)
+	mux.HandleFunc("GET /{$}", h.getPage)
+	mux.HandleFunc("GET /jobs/{id}/retry", h.methodNotAllowed)
+	mux.HandleFunc("GET /jobs/{id}/cancel", h.methodNotAllowed)
 	mux.HandleFunc("POST /jobs/{id}/retry", h.postRetry)
 	mux.HandleFunc("POST /jobs/{id}/cancel", h.postCancel)
+	mux.HandleFunc("/", h.notFound)
 	return mux
+}
+
+func (h *statusHandler) methodNotAllowed(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Allow", http.MethodPost)
+	h.writeHTML(w, http.StatusMethodNotAllowed, "method not allowed")
+}
+
+func (h *statusHandler) notFound(w http.ResponseWriter, r *http.Request) {
+	h.writeHTML(w, http.StatusNotFound, "not found")
 }
 
 func (h *statusHandler) postRetry(w http.ResponseWriter, r *http.Request) {
@@ -96,6 +108,10 @@ func (h *statusHandler) postMutation(
 	notice string,
 	mutate func(context.Context, int64) (*drover.JobRow, error),
 ) {
+	if !sameOrigin(r) {
+		h.writeHTML(w, http.StatusForbidden, "cross-origin request refused")
+		return
+	}
 	id, err := parseJobID(r.PathValue("id"))
 	if err != nil {
 		h.writeHTML(w, http.StatusBadRequest, err.Error())
@@ -136,11 +152,20 @@ func mutationRedirect(form url.Values, notice string, mutErr error, id int64) st
 	return "/?" + v.Encode()
 }
 
-func (h *statusHandler) getPage(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
-		http.NotFound(w, r)
-		return
+func sameOrigin(r *http.Request) bool {
+	if o := r.Header.Get("Origin"); o != "" {
+		u, err := url.Parse(o)
+		return err == nil && u.Host == r.Host
 	}
+	ref := r.Header.Get("Referer")
+	if ref == "" {
+		return false
+	}
+	u, err := url.Parse(ref)
+	return err == nil && u.Host == r.Host
+}
+
+func (h *statusHandler) getPage(w http.ResponseWriter, r *http.Request) {
 	filters, err := parsePageFilters(r.URL.Query())
 	if err != nil {
 		h.writeHTML(w, http.StatusBadRequest, err.Error())
